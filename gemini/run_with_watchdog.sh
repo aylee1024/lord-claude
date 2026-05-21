@@ -130,7 +130,20 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 write_status "starting"
-log_wd "start: run_dir=$RUN_DIR model=$GEMINI_MODEL resume_uuid=${RESUME_UUID:-none} cwd=${GEMINI_WATCHDOG_CWD:-$PWD}"
+
+# Resolve WORK_DIR up-front. Gemini's "project" is the nearest .git-containing
+# ancestor of cwd (bundle line 51491-51514), and `gemini --list-sessions` only
+# returns sessions for the current project. If GEMINI_WATCHDOG_CWD differs from
+# bash's actual $PWD at watchdog launch, the resume-lookup (list-sessions) and
+# the actual gemini launch would see different projects and the UUID would
+# fail to resolve. Lock both operations to WORK_DIR.
+WORK_DIR="${GEMINI_WATCHDOG_CWD:-$PWD}"
+if [ ! -d "$WORK_DIR" ]; then
+    log_wd "cwd not found, falling back to current dir: $WORK_DIR"
+    WORK_DIR="$PWD"
+fi
+
+log_wd "start: run_dir=$RUN_DIR model=$GEMINI_MODEL resume_uuid=${RESUME_UUID:-none} work_dir=$WORK_DIR bash_pwd=$PWD"
 
 mkdir -p /tmp/gemini_runs
 ln -sfn "$RUN_DIR" /tmp/gemini_runs/latest 2>/dev/null || true
@@ -138,28 +151,30 @@ ln -sfn "$RUN_DIR" /tmp/gemini_runs/latest 2>/dev/null || true
 # If caller asked for resume by UUID/index/literal-latest, look up gemini's index.
 # `gemini --list-sessions` formats one line per session as:
 #   N. <summary> (<time>) [<uuid>]
-# We grep for the UUID and pluck the leading integer index.
+# We grep for the UUID and pluck the leading integer index. The list-sessions
+# call MUST run inside WORK_DIR (not bash's $PWD) so it sees the same project
+# the subsequent gemini launch will use.
 if [ -n "$RESUME_UUID" ]; then
     if printf '%s' "$RESUME_UUID" | grep -qE '^[0-9]+$'; then
-        # Caller passed a raw index — use it as-is.
+        # Caller passed a raw index; use it as-is.
         RESUME_INDEX="$RESUME_UUID"
         log_wd "resume by raw index: $RESUME_INDEX"
     elif [ "$RESUME_UUID" = "latest" ]; then
         RESUME_INDEX="latest"
         log_wd "resume by literal latest"
     else
-        list_out=$(gemini --list-sessions 2>&1)
+        list_out=$(cd "$WORK_DIR" && gemini --list-sessions 2>&1)
         RESUME_INDEX=$(printf '%s\n' "$list_out" | grep -F "[$RESUME_UUID]" | head -1 | sed -nE 's/^[[:space:]]*([0-9]+)\..*/\1/p')
         if [ -z "$RESUME_INDEX" ]; then
-            log_wd "resume lookup FAILED: uuid=$RESUME_UUID not found in --list-sessions"
+            log_wd "resume lookup FAILED: uuid=$RESUME_UUID not found in --list-sessions (work_dir=$WORK_DIR)"
             printf '%s\n' "$list_out" | head -20 >> "$WATCHDOG_FILE"
             write_status "failed"
             trap - EXIT
-            echo "[watchdog] ERROR: no session matches UUID $RESUME_UUID" >&2
-            echo "[watchdog] run \`gemini --list-sessions\` to inspect." >&2
+            echo "[watchdog] ERROR: no session matches UUID $RESUME_UUID in project rooted at $WORK_DIR" >&2
+            echo "[watchdog] run \`(cd $WORK_DIR && gemini --list-sessions)\` to inspect." >&2
             exit 1
         fi
-        log_wd "resume uuid=$RESUME_UUID -> index=$RESUME_INDEX"
+        log_wd "resume uuid=$RESUME_UUID -> index=$RESUME_INDEX (work_dir=$WORK_DIR)"
     fi
 fi
 
@@ -169,14 +184,6 @@ NEW_SESSION_UUID=""
 if [ -z "$RESUME_INDEX" ]; then
     NEW_SESSION_UUID=$(uuidgen | tr 'A-Z' 'a-z')
     log_wd "fresh session uuid=$NEW_SESSION_UUID"
-fi
-
-# Working directory: if GEMINI_WATCHDOG_CWD is set (e.g., from a --full-auto
-# invocation), chdir into it before launching. Gemini has no `-C` flag.
-WORK_DIR="${GEMINI_WATCHDOG_CWD:-$PWD}"
-if [ ! -d "$WORK_DIR" ]; then
-    log_wd "cwd not found, falling back to current dir: $WORK_DIR"
-    WORK_DIR="$PWD"
 fi
 
 # Known-bad startup signatures (stderr-only grep, case-insensitive). Either
