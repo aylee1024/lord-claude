@@ -12,6 +12,26 @@ Delegate a sub-task to a Gemini agent via `gemini -p ""` (headless / non-interac
 
 Every invocation goes through `~/.claude/skills/gemini/run_with_watchdog.sh`. The watchdog runs gemini with `stream-json` output, separates the three output streams into per-run files, exposes a status primitive, and retries with stricter isolation on hang. After successful completion the watchdog post-processes `events.jsonl` into a clean `output.md` by concatenating assistant message deltas (gemini-cli has no `-o <file>` analog of codex's final-message capture).
 
+## Subscription-Only Guarantee
+
+The skill is designed to use your Gemini subscription via OAuth, never the metered API. Two independent defenses enforce this:
+
+1. **`~/.gemini/settings.json`** should set `security.auth.enforcedType = "oauth-personal"` (alongside `selectedType`). If any code path tries to use a different auth method (API key, Vertex AI, GCA), gemini hard-fails with a clear error before issuing a billable request.
+2. **The watchdog subshell** unsets `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GOOGLE_GENAI_USE_VERTEXAI`, and `GOOGLE_GENAI_USE_GCA` before launching gemini. These are the four env vars gemini-cli recognizes as auth overrides (see bundle line 15315). The unset is scoped to the per-call subshell; the parent environment keeps the variables for other tools.
+
+Either defense alone would suffice; the pair guarantees subscription billing even if `selectedType` is ever wiped from settings.json or a future gemini-cli release reorders the auth-precedence rule at bundle line 15308. Recommended `~/.gemini/settings.json`:
+
+```json
+{
+  "security": {
+    "auth": {
+      "selectedType": "oauth-personal",
+      "enforcedType": "oauth-personal"
+    }
+  }
+}
+```
+
 ## Invocation Rules
 
 These are non-negotiable. Violating any of them causes silent failures.
