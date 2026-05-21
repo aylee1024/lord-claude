@@ -230,10 +230,22 @@ while true; do
 
     # exec inside the subshell so the subshell process IS gemini (no orphaning
     # if we have to kill -9 later). PID stored in PID_FILE is gemini's PID.
-    ( cd "$WORK_DIR" && exec "${CMD[@]}" \
-        < "$PROMPT_FILE" \
-        > "$EVENTS_FILE" \
-        2> "$STDERR_FILE" ) &
+    #
+    # Subscription guarantee: unset every env var the gemini CLI accepts as an
+    # auth-override (GEMINI_API_KEY, GOOGLE_API_KEY, GOOGLE_GENAI_USE_VERTEXAI,
+    # GOOGLE_GENAI_USE_GCA — see bundle line 15315). settings.json's
+    # selectedType=oauth-personal already wins by precedence (bundle line
+    # 15308: `configuredAuthType || getAuthTypeFromEnv()`), but this is
+    # defense-in-depth: if selectedType ever becomes empty (corrupted config,
+    # future schema change, accidental edit), the CLI would silently fall
+    # through to GEMINI_API_KEY and start billing per call. Unsetting inside
+    # the subshell affects only this call; the parent environment is unchanged.
+    ( cd "$WORK_DIR" \
+        && unset GEMINI_API_KEY GOOGLE_API_KEY GOOGLE_GENAI_USE_VERTEXAI GOOGLE_GENAI_USE_GCA \
+        && exec "${CMD[@]}" \
+            < "$PROMPT_FILE" \
+            > "$EVENTS_FILE" \
+            2> "$STDERR_FILE" ) &
     PID=$!
     echo "$PID" > "$PID_FILE"
     write_status "running"
