@@ -2,7 +2,7 @@
 
 # `Lord` **Claude**
 
-### *Two Claude Code skills for vassaling sub-tasks out to lieutenant LLMs. Watchdog-supervised, parallelizable, and resilient against the failure modes that bite bare CLI invocations.*
+### *Claude Code skills that makes Codex and Gemini behave exactly like Claude subagents. Watchdog-supervised, parallelizable, and resilient against the failure modes.*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![codex-cli ≥ 0.125](https://img.shields.io/badge/codex--cli-%E2%89%A50.125-1f6feb)](https://github.com/openai/codex)
