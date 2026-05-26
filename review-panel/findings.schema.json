@@ -1,0 +1,33 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "review-panel reviewer findings",
+  "description": "Structured findings one reviewer emits. The adjudicator gates HIGH+ findings empirically before any of them can block.",
+  "type": "object",
+  "required": ["reviewer_role", "verdict", "findings"],
+  "additionalProperties": false,
+  "properties": {
+    "reviewer_role": { "type": "string", "description": "codex-domain | codex-integration | gemini | opus-skeptic" },
+    "verdict": { "type": "string", "enum": ["approve", "approve_with_fixes", "block"] },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["severity", "file", "claim", "evidence_kind", "confidence"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "description": "stable short id, e.g. codex-domain-1" },
+          "severity": { "type": "string", "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW"] },
+          "file": { "type": "string" },
+          "line": { "type": ["integer", "null"] },
+          "claim": { "type": "string", "description": "one line: what is wrong" },
+          "mechanism": { "type": "string", "description": "why it is wrong, step by step" },
+          "evidence_kind": { "type": "string", "enum": ["reproduced", "static_proof", "not_reproducible"] },
+          "repro_command": { "type": ["string", "null"], "description": "shell run from repo root in the adjudication worktree; exits with expected_exit iff the finding holds. For a fix proposal: 'git apply PATCH && <gate>' asserting the gate now passes." },
+          "expected_exit": { "type": ["integer", "null"], "description": "exit code that CONFIRMS the finding (a test that SHOULD fail => non-zero; a fix that SHOULD make the gate pass => 0)" },
+          "observed_result": { "type": ["string", "null"], "description": "what the reviewer saw when IT ran repro_command; null if it did not run it" },
+          "confidence": { "type": "string", "enum": ["high", "medium", "low"] }
+        }
+      }
+    }
+  }
+}
