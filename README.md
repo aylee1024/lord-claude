@@ -2,7 +2,7 @@
 
 # `Lord` **Claude**
 
-### *Claude Code skills that make Codex and Gemini behave exactly like Claude subagents. Watchdog-supervised, parallelizable, and resilient against the failure modes. You can use your Codex/Gemini subscription or API calls.*
+### *Claude Code skills that make Codex and Gemini behave exactly like Claude subagents. Watchdog-supervised, parallelizable, and resilient against the failure modes. You can use your Codex/Gemini subscription or API calls — plus an empirically-gated review panel that commands all three at once.*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![codex-cli ≥ 0.125](https://img.shields.io/badge/codex--cli-%E2%89%A50.125-1f6feb)](https://github.com/openai/codex)
@@ -18,7 +18,13 @@
    │   Lord  Claude   │               └────────────────────────────────┘
    │   main session   │
    │                  │               ┌────────────────────────────────┐
-   └──────────────────┘ ── /gemini ─▶ │ Gemini CLI · gemini-3.1-pro    │
+   │                  │ ── /gemini ─▶ │ Gemini CLI · gemini-3.1-pro    │
+   │                  │               └────────────────────────────────┘
+   │                  │
+   │                  │               ┌────────────────────────────────┐
+   └──────────────────┘ ─/review- ──▶ │ 2×Codex + Gemini + Opus, then  │
+                         panel        │ an adjudicator re-runs every   │
+                                      │ HIGH+ finding to gate the diff │
                                       └────────────────────────────────┘
                 supervised by per-skill run_with_watchdog.sh
                 (per-run-dir · status file · auth fast-fail · retry)
@@ -28,7 +34,7 @@
 
 ## TL;DR
 
-Two slash-commands you install into Claude Code: `/codex` and `/gemini`. Each delegates a sub-task to a different CLI agent, supervised by an identical watchdog architecture.
+Two vassal slash-commands you install into Claude Code — `/codex` and `/gemini` — plus `/review-panel`, which commands both at once. Each vassal delegates a sub-task to a different CLI agent, supervised by an identical watchdog architecture.
 
 When you type `/codex <prompt>` or `/gemini <prompt>`, the active skill:
 
@@ -85,22 +91,36 @@ done
 chmod +x *.sh
 ```
 
-### Or clone and symlink both
+### Review panel (requires both vassals)
+
+```bash
+mkdir -p ~/.claude/skills/review-panel/tests
+cd ~/.claude/skills/review-panel
+for f in SKILL.md adjudicate.sh findings.schema.json; do
+    curl -fsSL "https://raw.githubusercontent.com/aylee1024/lord-claude/main/review-panel/$f" -o "$f"
+done
+curl -fsSL "https://raw.githubusercontent.com/aylee1024/lord-claude/main/review-panel/tests/test_adjudicate.sh" -o tests/test_adjudicate.sh
+chmod +x adjudicate.sh tests/test_adjudicate.sh
+```
+
+### Or clone and symlink all three
 
 ```bash
 git clone https://github.com/aylee1024/lord-claude.git
 mkdir -p ~/.claude/skills
-ln -s "$PWD/lord-claude/codex"  ~/.claude/skills/codex
-ln -s "$PWD/lord-claude/gemini" ~/.claude/skills/gemini
+ln -s "$PWD/lord-claude/codex"        ~/.claude/skills/codex
+ln -s "$PWD/lord-claude/gemini"       ~/.claude/skills/gemini
+ln -s "$PWD/lord-claude/review-panel" ~/.claude/skills/review-panel
 ```
 
 ### Prerequisites
 
 | Skill | Prereq |
 |---|---|
-| Both | **Claude Code** (any recent version with skill support), **macOS or Linux** with `bash`, `mktemp`, `ps`, `grep`, `python3`, `uuidgen` |
+| All | **Claude Code** (any recent version with skill support), **macOS or Linux** with `bash`, `mktemp`, `ps`, `grep`, `python3`, `uuidgen` |
 | `/codex` | **OpenAI Codex CLI** ≥ 0.125, signed in via `codex login` (uses your ChatGPT subscription) |
 | `/gemini` | **Google Gemini CLI** ≥ 0.42, signed in via `gemini` interactive auth (uses your Google/Gemini subscription) |
+| `/review-panel` | Both vassal skills installed, plus `git` (the adjudicator re-runs findings in a throwaway worktree) |
 
 ---
 
@@ -168,6 +188,16 @@ session: 019dd654-d2ff-76c3-b500-6565445043fd
 
 Resumes from `/tmp/<skill>_runs/latest/session.txt`. For specific prior runs, pass `--run-id <name>`. Internally codex uses its thread_id directly; gemini translates UUID → session-index via `gemini --list-sessions`.
 
+### Review a diff with the full panel
+
+```
+/review-panel main..HEAD --repo . --gate 'npm run typecheck && npx vitest run'
+```
+
+Spawns four reviewers in parallel — two Codex (one Domain, one Integration), one Gemini, one Opus skeptic — each emitting **structured JSON findings** (not prose) against the diff. An adjudicator then re-runs every HIGH+ finding in a throwaway `git worktree` and blocks the commit **only on findings it can reproduce**, never on model text. The diversity invariant (Codex + Gemini + Opus, three different model families) is load-bearing: each family catches failure modes the others miss.
+
+Use it before committing a substantive code wave (correctness/multi-file/architecture). For comment-only or doc changes, a single `/codex` pass is enough.
+
 ### Cleanup
 
 ```bash
@@ -187,11 +217,16 @@ lord-claude/
 │   ├── run_with_watchdog.sh  supervises one `codex exec` call
 │   ├── status.sh             liveness + recent activity for a codex run
 │   └── prune_old_runs.sh     reaps old /tmp/codex_runs/* dirs
-└── gemini/
-    ├── SKILL.md              instructions Claude Code follows for /gemini
-    ├── run_with_watchdog.sh  supervises one `gemini -p ""` call
-    ├── status.sh             liveness + recent activity for a gemini run
-    └── prune_old_runs.sh     reaps old /tmp/gemini_runs/* dirs
+├── gemini/
+│   ├── SKILL.md              instructions Claude Code follows for /gemini
+│   ├── run_with_watchdog.sh  supervises one `gemini -p ""` call
+│   ├── status.sh             liveness + recent activity for a gemini run
+│   └── prune_old_runs.sh     reaps old /tmp/gemini_runs/* dirs
+└── review-panel/
+    ├── SKILL.md              orchestration: 2×Codex + Gemini + Opus, then adjudicate
+    ├── adjudicate.sh         re-runs every HIGH+ finding; blocks only on reproductions
+    ├── findings.schema.json  structured-findings contract every reviewer must emit
+    └── tests/                adjudicator self-test (false-positive refutation, gating)
 ```
 
 ---

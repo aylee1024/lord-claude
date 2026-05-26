@@ -33,9 +33,11 @@ Extract from `$ARGUMENTS`:
 | `--resume` | Resume the latest codex session. Reads thread_id from `/tmp/codex_runs/latest/session.txt` (or `/tmp/codex_runs/<run-id>/session.txt` if `--run-id` is given). |
 | `--full-auto` | Workspace writes (`--sandbox workspace-write -c approval_policy=never`). Combine with `-C <project_dir>` to set codex's working directory. |
 | `--schema <file>` | Pass `--output-schema <file>` to codex for structured output. |
-| `--with-user-config` | Load `~/.codex/config.toml` (default: ignored). Use only when codex needs MCP servers (figma/notion/linear). |
+| `--with-user-config` | Load `~/.codex/config.toml` (default: ignored). Use only when codex needs your configured MCP servers. |
 | `--run-id <name>` | Override default run_id. Run dir becomes `/tmp/codex_runs/<name>`. Useful for parallel-batch subject ids and for `--resume` targeting a specific prior run. |
 | Everything else | The prompt. |
+
+> Verified on codex-cli 0.133.0: `--full-auto` is NOT listed in `codex exec --help`. It is an undocumented alias that still works and maps to `--sandbox workspace-write -c approval_policy=never`. New code should prefer the explicit form rather than depend on the alias. Separately: `--ignore-user-config` (the watchdog default) is belt-and-suspenders against MCP servers that hang on expired OAuth at startup; if your `~/.codex/config.toml` has no such servers it is harmless either way.
 
 Do not auto-infer `--full-auto` from prompt content. If the user did not pass it explicitly and the task seems to need writes, ask before launching.
 
