@@ -10,8 +10,8 @@ if [ -n "${PID:-}" ] && kill -0 "$PID" 2>/dev/null; then
     ps -p "$PID" -o pid,pcpu,pmem,etime,command 2>/dev/null
 fi
 [ -s "$RUN_DIR/session.txt" ] && echo "session: $(cat "$RUN_DIR/session.txt")"
-echo "--- last 5 events ---"
-tail -5 "$RUN_DIR/events.jsonl" 2>/dev/null
+echo "--- output.md tail ---"
+tail -5 "$RUN_DIR/output.md" 2>/dev/null
 echo "--- last 3 stderr ---"
 tail -3 "$RUN_DIR/stderr.log" 2>/dev/null
 echo "--- last 5 watchdog ---"
