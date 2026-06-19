@@ -2,11 +2,11 @@
 
 # `Lord` **Claude**
 
-### *Claude Code skills that make Codex and Gemini behave exactly like Claude subagents. Watchdog-supervised, parallelizable, and resilient against the failure modes. You can use your Codex/Gemini subscription or API calls — plus an empirically-gated review panel that commands all three at once.*
+### *Claude Code skills that make Codex and Gemini behave exactly like Claude subagents. Watchdog-supervised, parallelizable, and resilient against the failure modes — plus an empirically-gated review panel that commands all three at once.*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![codex-cli ≥ 0.125](https://img.shields.io/badge/codex--cli-%E2%89%A50.125-1f6feb)](https://github.com/openai/codex)
-[![gemini-cli ≥ 0.42](https://img.shields.io/badge/gemini--cli-%E2%89%A50.42-4285f4)](https://github.com/google-gemini/gemini-cli)
+[![Antigravity agy ≥ 1.0](https://img.shields.io/badge/Antigravity%20agy-%E2%89%A51.0-4285f4)](https://antigravity.google)
 [![Claude Code skill](https://img.shields.io/badge/Claude%20Code-skill-d97706)](https://docs.claude.com/en/docs/claude-code/skills)
 [![Shell: bash](https://img.shields.io/badge/shell-bash-4eaa25)](https://www.gnu.org/software/bash/)
 
@@ -18,7 +18,7 @@
    │   Lord  Claude   │               └────────────────────────────────┘
    │   main session   │
    │                  │               ┌────────────────────────────────┐
-   │                  │ ── /gemini ─▶ │ Gemini CLI · gemini-3.1-pro    │
+   │                  │ ── /gemini ─▶ │ Antigravity agy · Gemini Flash │
    │                  │               └────────────────────────────────┘
    │                  │
    │                  │               ┌────────────────────────────────┐
@@ -30,36 +30,37 @@
                 (per-run-dir · status file · auth fast-fail · retry)
 ```
 
+> **2026-06-18 — the Gemini vassal now drives [Antigravity](https://antigravity.google) `agy`.** Google retired Gemini CLI / Gemini Code Assist for individuals on 2026-06-18 (its OAuth tier returns `IneligibleTierError`). The `/gemini` skill keeps its name, run-dir contract, and `GEMINI_MODEL` knob, but the engine underneath is now `agy --print`, serving the same Google Gemini models. Callers — including `/review-panel` — need no changes.
+
 ---
 
 ## TL;DR
 
-Two vassal slash-commands you install into Claude Code — `/codex` and `/gemini` — plus `/review-panel`, which commands both at once. Each vassal delegates a sub-task to a different CLI agent, supervised by an identical watchdog architecture.
+Two vassal slash-commands you install into Claude Code — `/codex` and `/gemini` — plus `/review-panel`, which commands both at once. Each vassal delegates a sub-task to a different CLI agent, supervised by a shared watchdog architecture.
 
 When you type `/codex <prompt>` or `/gemini <prompt>`, the active skill:
 
 1. Allocates a per-run directory under `/tmp/<skill>_runs/`.
-2. Spawns the underlying CLI with sane defaults (`gpt-5.5`+`xhigh` for codex; `gemini-3.1-pro-preview` with stream-json output for gemini).
-3. Watches the process for hangs: auth/MCP startup stalls, OAuth failures, `tools/list` timeouts.
-4. Captures the event stream, stderr, and a clean final-message `output.md` into separate files.
+2. Spawns the underlying CLI with sane defaults (`gpt-5.5`+`xhigh` for codex; `Gemini 3.5 Flash (High)` via `agy --print` for gemini).
+3. Watches the process for hangs and auth/quota failures.
+4. Captures stderr and the final `output.md` into separate files (codex: an event stream too; gemini: agy prints plain text straight to `output.md`).
 5. Writes a status file you can poll (`starting → running → done | failed | hung_killed | aborted`).
 6. Hands the result back to Claude Code, which reads `output.md`.
 
-No more lost notifications. No more shell-`&` orphans. No more agents hanging silently because some MCP server's OAuth token expired.
+No more lost notifications. No more shell-`&` orphans. No more agents hanging silently because some backend stopped answering.
 
 ---
 
 ## Why this exists
 
-Bare `codex exec` and bare `gemini -p` each have sharp edges. The two watchdogs defend against the same failure classes:
+Bare `codex exec` and bare `agy --print` each have sharp edges. The two watchdogs defend against the same failure classes:
 
 | Problem | Watchdog defense |
 |---|---|
-| MCP servers can hang the CLI for minutes on expired OAuth or `tools/list` timeouts | stderr-pattern fast-fail (`AuthRequired`, `tools/list timeout`, `invalid_token`); kill within one poll cycle, retry with stricter isolation |
-| CLIs default-model can drift when user-config is bypassed (codex falls back to `gpt-5.4`; gemini reads `~/.gemini/settings.json`) | Watchdog plumbs the intended model explicitly (`-m gpt-5.5` / `-m gemini-3.1-pro-preview`) |
-| `cmd &` (shell backgrounding) detaches the process from Claude Code's harness; main session never learns when the agent finishes | Watchdog supervises the CLI as a foreground child of itself (codex: subprocess; gemini: `exec` inside subshell). Claude Code's `run_in_background: true` flag fires its completion notification correctly |
+| The CLI can hang at startup on expired auth, MCP `tools/list` timeouts, or a wedged backend | stderr-pattern fast-fail (codex: `AuthRequired`, `tools/list timeout`; gemini/agy: `IneligibleTier`, `UNSUPPORTED_CLIENT`, `RESOURCE_EXHAUSTED`); kill within one poll cycle, retry |
+| A CLI's default model can drift across versions/config | Watchdog plumbs the intended model explicitly (`-m gpt-5.5` for codex; `--model "Gemini 3.5 Flash (High)"` for gemini, validated against `agy models` and remapped if stale) |
+| `cmd &` (shell backgrounding) detaches the process from Claude Code's harness; the main session never learns when the agent finishes | Watchdog supervises the CLI as a foreground child of itself (`exec` inside a subshell). Claude Code's `run_in_background: true` flag then fires its completion notification correctly |
 | Parallel batches sharing a single output file collide | Each run gets its own `/tmp/<skill>_runs/<id>/` directory |
-| Streaming output formats differ across CLIs and across versions | Watchdog reads the documented event stream (`thread.started` / `init`) and reconstructs `output.md` after exit |
 
 Both skills turn "the CLI usually works" into "the CLI always works the same way."
 
@@ -117,9 +118,9 @@ ln -s "$PWD/lord-claude/review-panel" ~/.claude/skills/review-panel
 
 | Skill | Prereq |
 |---|---|
-| All | **Claude Code** (any recent version with skill support), **macOS or Linux** with `bash`, `mktemp`, `ps`, `grep`, `python3`, `uuidgen` |
+| All | **Claude Code** (any recent version with skill support), **macOS or Linux** with `bash`, `mktemp`, `ps`, `grep` |
 | `/codex` | **OpenAI Codex CLI** ≥ 0.125, signed in via `codex login` (uses your ChatGPT subscription) |
-| `/gemini` | **Google Gemini CLI** ≥ 0.42, signed in via `gemini` interactive auth (uses your Google/Gemini subscription) |
+| `/gemini` | **Antigravity CLI** (`agy`) ≥ 1.0, signed in to your Antigravity account (run `agy` once and complete the device-code login; `agy --print "ok"` should print `ok`) |
 | `/review-panel` | Both vassal skills installed, plus `git` (the adjudicator re-runs findings in a throwaway worktree) |
 
 ---
@@ -166,19 +167,6 @@ Claude Code emits one completion notification per agent. Main session reacts inc
 ~/.claude/skills/codex/status.sh /tmp/codex_runs/codex_X  # specific run
 ```
 
-Output:
-
-```
-run_dir: /tmp/codex_runs/codex_subject_a
-status:  running
-  PID  %CPU %MEM   ELAPSED COMMAND
-12345   0.8  0.4     01:23  codex exec --ignore-user-config -m gpt-5.5 ...
-session: 019dd654-d2ff-76c3-b500-6565445043fd
---- last 5 events ---
-{"type":"item.started","item":{"type":"command_execution",...}}
-...
-```
-
 ### Resume a prior session
 
 ```
@@ -186,7 +174,7 @@ session: 019dd654-d2ff-76c3-b500-6565445043fd
 /gemini --resume Continue analysis from where you left off.
 ```
 
-Resumes from `/tmp/<skill>_runs/latest/session.txt`. For specific prior runs, pass `--run-id <name>`. Internally codex uses its thread_id directly; gemini translates UUID → session-index via `gemini --list-sessions`.
+Codex resumes from its `thread_id`. Gemini resumes the most recent agy conversation (`agy --continue`) — agy's print mode does not emit a per-conversation id, so `--resume` targets the latest conversation rather than an arbitrary one.
 
 ### Review a diff with the full panel
 
@@ -194,7 +182,7 @@ Resumes from `/tmp/<skill>_runs/latest/session.txt`. For specific prior runs, pa
 /review-panel main..HEAD --repo . --gate 'npm run typecheck && npx vitest run'
 ```
 
-Spawns four reviewers in parallel — two Codex (one Domain, one Integration), one Gemini, one Opus skeptic — each emitting **structured JSON findings** (not prose) against the diff. An adjudicator then re-runs every HIGH+ finding in a throwaway `git worktree` and blocks the commit **only on findings it can reproduce**, never on model text. The diversity invariant (Codex + Gemini + Opus, three different model families) is load-bearing: each family catches failure modes the others miss.
+Spawns four reviewers in parallel — two Codex (one Domain, one Integration), one Gemini, one Opus skeptic — each emitting **structured JSON findings** (not prose) against the diff. An adjudicator then re-runs every HIGH+ finding in a throwaway `git worktree` and blocks the commit **only on findings it can reproduce**, never on model text. The diversity invariant (Codex + Gemini + Opus, three different model families) is load-bearing: each family catches failure modes the others miss. The Gemini seat is a Google-family model served through `agy`; it is not swapped for agy's Claude/GPT-OSS models, which would collapse the invariant.
 
 Use it before committing a substantive code wave (correctness/multi-file/architecture). For comment-only or doc changes, a single `/codex` pass is enough.
 
@@ -219,7 +207,7 @@ lord-claude/
 │   └── prune_old_runs.sh     reaps old /tmp/codex_runs/* dirs
 ├── gemini/
 │   ├── SKILL.md              instructions Claude Code follows for /gemini
-│   ├── run_with_watchdog.sh  supervises one `gemini -p ""` call
+│   ├── run_with_watchdog.sh  supervises one `agy --print` call
 │   ├── status.sh             liveness + recent activity for a gemini run
 │   └── prune_old_runs.sh     reaps old /tmp/gemini_runs/* dirs
 └── review-panel/
@@ -238,30 +226,32 @@ Per-run directory model. Every invocation produces:
 ```
 /tmp/<skill>_runs/<run_id>/
 ├── prompt.txt        ← input prompt
-├── output.md         ← final agent message (codex: written by -o; gemini: reconstructed from stream-json deltas)
-├── events.jsonl      ← CLI event stream (stdout)
+├── output.md         ← final agent message (codex: written by -o; gemini: agy's plain-text stdout)
+├── events.jsonl      ← codex event stream (stdout); gemini/agy has no event stream
 ├── stderr.log        ← CLI stderr
 ├── watchdog.log      ← supervision events
-├── session.txt       ← session identifier (thread_id for codex; UUID for gemini)
+├── session.txt       ← session identifier (thread_id for codex; a marker for gemini — agy print-mode has no id)
 ├── status            ← starting | running | retrying | done | failed | hung_killed | aborted
 └── pid               ← CLI PID while running
 ```
 
-Hang detection uses two thresholds in both watchdogs:
+**Codex hang detection** uses two thresholds:
 
-- **`STARTUP_GRACE_SEC=60`** (default): no startup event (`thread.started` for codex, `init` for gemini) by then → kill, retry once with stricter isolation, then give up.
-- **`NO_PROGRESS_SEC=0`** (default, **disabled**): post-startup steady-state monitoring is opt-in. The model can think silently between tool calls for many minutes at high reasoning effort. Event-stream growth is not a reliable liveness signal once the CLI is alive. Opt in with `NO_PROGRESS_SEC=600` per call when you want tight monitoring.
+- **`STARTUP_GRACE_SEC=60`** (default): no `thread.started` event by then → kill, retry once with stricter isolation, then give up.
+- **`NO_PROGRESS_SEC=0`** (default, **disabled**): post-startup steady-state monitoring is opt-in. The model can think silently between tool calls for many minutes at high reasoning effort, so event-stream growth is not a reliable liveness signal. Opt in with `NO_PROGRESS_SEC=600` per call.
 
-Pattern-based fast-fail in **stderr only** (case-insensitive). The grep deliberately excludes `events.jsonl` because the JSON event stream carries model output that often discusses these words in legitimate contexts.
+**Gemini (agy) hang detection** is simpler because `agy --print` has no event stream to watch: the watchdog relies on agy's own **`--print-timeout`** (25m default) plus a wall-clock backstop **`HANG_SEC`** (1500s default); on expiry it kills and retries once. The Bash tool's own timeout is the ultimate backstop.
+
+Pattern-based fast-fail in **stderr only** (case-insensitive) — stdout/`output.md` is excluded because model output legitimately discusses these words.
 
 | Skill | Fast-fail patterns |
 |---|---|
 | `/codex` | `AuthRequired`, `invalid_token`, `rmcp::transport::worker.*auth`, `tools/list.*tim(ed?)?[-_ ]?out`, `mcp.*tools/list.*timeout` (see [openai/codex #19556](https://github.com/openai/codex/issues/19556)) |
-| `/gemini` | `FatalAuthenticationError`, `AuthRequired`, `invalid_token`, OAuth failures, `tools/list.*tim(ed?)?[-_ ]?out`, `RESOURCE_EXHAUSTED` |
+| `/gemini` | `IneligibleTier`, `UNSUPPORTED_CLIENT`, `FatalAuthenticationError`, `AuthRequired`, `invalid_token`, `UNAUTHENTICATED`, `PERMISSION_DENIED`, `RESOURCE_EXHAUSTED`, `quota exceeded` |
 
-Matching lines plus context get logged to `watchdog.log` for self-diagnosis.
+Matching lines plus context get logged to `watchdog.log` for self-diagnosis. If `agy` is not installed at all, the gemini watchdog fails loud (`status=failed`, an explanatory `stderr.log`, empty `output.md`) rather than silently.
 
-For full design rationale per skill, read [`codex/SKILL.md`](./codex/SKILL.md) and [`gemini/SKILL.md`](./gemini/SKILL.md). Each documents its CLI-specific divergences (e.g., gemini-cli has no `-c reasoning_effort` or `--output-schema` equivalents).
+For full design rationale per skill, read [`codex/SKILL.md`](./codex/SKILL.md) and [`gemini/SKILL.md`](./gemini/SKILL.md). Each documents its CLI-specific divergences — e.g. agy bakes the reasoning tier into the model name (`Gemini 3.5 Flash (High)` vs `Gemini 3.1 Pro (Low)`), so there is no `-c reasoning_effort` flag, and print mode has no `--output-schema`.
 
 ---
 
@@ -270,17 +260,17 @@ For full design rationale per skill, read [`codex/SKILL.md`](./codex/SKILL.md) a
 | Skill | Verified against |
 |---|---|
 | `/codex` | codex-cli 0.125 on macOS (Apple Silicon) |
-| `/gemini` | gemini-cli 0.42 on macOS (Apple Silicon) |
+| `/gemini` | Antigravity `agy` 1.0.9 on macOS (Apple Silicon) |
 
-Should work on Linux. Both watchdogs use POSIX `bash` 3.2+ idioms (no negative array indexing, no `${@: -1}` only where actually supported), BSD-compatible `ps` flags, and inline `python3` for one JSON-parse step.
+Should work on Linux. Both watchdogs use POSIX `bash` 3.2+ idioms and BSD-compatible `ps` flags.
 
-If either CLI ships breaking changes to its event stream or flag set, the watchdog reports via `watchdog.log` and `stderr.log`. Neither skill pins a specific CLI version internally; both rely on the documented surface.
+If either CLI ships breaking changes to its flags or output, the watchdog reports via `watchdog.log` and `stderr.log`. Neither skill pins a specific CLI version internally; both rely on the documented surface. The gemini watchdog additionally validates `GEMINI_MODEL` against `agy models` at launch, so a renamed or retired model id degrades to the default instead of erroring.
 
 ---
 
 ## Contributing
 
-Issues and PRs welcome. Both skills are opinionated about defaults but flexible via env vars: `STARTUP_GRACE_SEC`, `NO_PROGRESS_SEC`, `MAX_RETRIES`, `POLL_INTERVAL_SEC`, plus `CODEX_MODEL`/`CODEX_REASONING` for codex and `GEMINI_MODEL` for gemini.
+Issues and PRs welcome. Both skills are opinionated about defaults but flexible via env vars: `MAX_RETRIES`, `POLL_INTERVAL_SEC`, plus `CODEX_MODEL`/`CODEX_REASONING` and `STARTUP_GRACE_SEC`/`NO_PROGRESS_SEC` for codex, and `GEMINI_MODEL`/`AGY_PRINT_TIMEOUT`/`HANG_SEC` for gemini.
 
 If you hit a new failure mode, open an issue with a reproducer (a `/tmp/<skill>_runs/<id>/` directory after the failure is ideal).
 
