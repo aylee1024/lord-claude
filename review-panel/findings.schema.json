@@ -6,7 +6,7 @@
   "required": ["reviewer_role", "verdict", "findings"],
   "additionalProperties": false,
   "properties": {
-    "reviewer_role": { "type": "string", "description": "codex-domain | codex-integration | gemini | opus-skeptic" },
+    "reviewer_role": { "type": "string", "description": "codex-domain | codex-integration | gemini | grok | composer | opus-skeptic" },
     "verdict": { "type": "string", "enum": ["approve", "approve_with_fixes", "block"] },
     "findings": {
       "type": "array",

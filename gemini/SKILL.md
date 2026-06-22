@@ -16,7 +16,7 @@ Every invocation goes through `~/.claude/skills/gemini/run_with_watchdog.sh`. Th
 
 ## Auth model
 
-`agy` authenticates with your **Antigravity** account (Google OAuth, device-code flow), with the token held in the macOS Keychain under "Antigravity Safe Storage". There is no per-call API-key path in this skill, so there is no metered-billing footgun to defend against (unlike the old gemini-cli OAuth-vs-API-key precedence). If auth lapses, `agy` errors loudly and the watchdog fast-fails — it never silently bills or hangs. To (re)authenticate, run `agy` interactively once and complete the device-code login.
+`agy` authenticates with your **Antigravity** account (Google OAuth, device-code flow). The credentials live in the macOS Keychain ("Antigravity Safe Storage") **and** in `~/.gemini/oauth_creds.json` (access + refresh token + `expiry_date`); `agy` **auto-refreshes** the access token, so an expired `access_token` is not by itself fatal. There is no per-call API-key path in this skill, so there is no metered-billing footgun to defend against (unlike the old gemini-cli OAuth-vs-API-key precedence). On a genuine auth rejection the watchdog classifies it as `auth` and **fails immediately** (no pointless retry, exit 1) with a re-login hint — it never silently bills or hangs. To re-authenticate, run `agy` interactively once and complete the device-code login.
 
 ## Invocation Rules
 
@@ -24,7 +24,7 @@ These are non-negotiable. Violating any of them causes silent failures.
 
 1. **NEVER pipe the watchdog's stdout** (`| head`, `| jq`). The result is in `$RUN_DIR/output.md`; piping risks SIGPIPE on long outputs and reads are racy. Read the file after the watchdog exits.
 2. **ALWAYS allocate a unique run_dir** via `mktemp -d /tmp/gemini_runs/gemini.XXXXXX`, or pass `--run-id <name>` for meaningful subject ids in batches. Never reuse a run_dir.
-3. **ALWAYS set `timeout: 1800000`** (30 minutes) on the Bash call. Complex tasks take several minutes; agy's own `--print-timeout` (25m default) fires first, the Bash timeout is the backstop.
+3. **Foreground calls now self-cap.** The watchdog kills a wedged agy at `HANG_SEC` (default **9m**, deliberately under the ~10m foreground Bash ceiling) and writes a clean `hung_killed` — so it no longer matters whether a larger Bash `timeout` is honored at its full value. Set a generous `timeout` (e.g. `600000`) and let the watchdog win the race. A hang is terminal (no retry). For tasks that genuinely need longer than ~9m, **use `--bg`** (background runs are not bounded by the foreground ceiling) and raise the caps: `HANG_SEC=1800 AGY_PRINT_TIMEOUT=25m`.
 4. **ALWAYS read `$RUN_DIR/status` before reading `$RUN_DIR/output.md`.** Status `done` means output is valid. Other states (`hung_killed`, `failed`, `aborted`) mean output may be empty or partial; show diagnostics, don't present output as the answer.
 
 ## Instructions for Claude (Main Session)
@@ -38,6 +38,7 @@ Extract from `$ARGUMENTS`:
 | `--bg` | Run watchdog in background (`run_in_background: true`). Main session continues; reads result on completion notification. |
 | `--resume` | Continue the most recent agy conversation (`agy --continue`). Pass `resume latest` to the watchdog. agy print-mode cannot emit a conversation id, so resume targets the most recent conversation, not an arbitrary one. |
 | `--full-auto` | Workspace writes: maps to agy `--dangerously-skip-permissions --add-dir <project_dir>`. Combine with a target project dir; the watchdog `cd`s into it via `GEMINI_WATCHDOG_CWD`. |
+| `--isolate` | Run agy in a throwaway `git worktree` at HEAD of the work dir, with the worktree as cwd, so cwd-relative git ops (the `reset --hard` incident class) hit the worktree, not your live tree. **Honest scope:** this is cwd + workspace scoping, NOT an OS write-sandbox by default — agy under `--dangerously-skip-permissions` can still write ABSOLUTE live paths. Set `GEMINI_ISOLATE_SANDBOX=1` to add agy's `--sandbox` for OS confinement (VERIFY on a live run that it confines writes AND doesn't break worktree writes). For OS-enforced isolation today, prefer codex `--isolate` (workspace-write sandbox). The watchdog symlinks `.venv` (SHARED — a build that rewrites it affects the live env), strips caller `--add-dir`, and leaves the worktree (note in `$RUN_DIR/isolate_result`) if agy changed/committed, else removes it. FAILS CLOSED if no worktree can be made or a prior run left unmerged work. Opt-in — see "When to isolate". |
 | `--run-id <name>` | Override default run_id. Run dir becomes `/tmp/gemini_runs/<name>`. Useful for parallel-batch subject ids and for `--resume` targeting a specific prior run. |
 | Everything else | The prompt. |
 
@@ -79,9 +80,11 @@ GEMINI_WATCHDOG_CWD=<project_dir> \
     --dangerously-skip-permissions --add-dir <project_dir>
 ```
 
-Bash call settings: `timeout: 1800000` (always); `run_in_background: true` (only if `--bg`).
+Bash call settings: a generous `timeout` (the watchdog self-caps foreground runs at `HANG_SEC=9m`, so the exact value is not load-bearing); `run_in_background: true` only if `--bg` — required for tasks >~9m, which also pass `HANG_SEC=1800 AGY_PRINT_TIMEOUT=25m`.
 
-The watchdog already plumbs `--print --model "$GEMINI_MODEL" --print-timeout 25m`. Do not pass these yourself.
+For a write task, decide whether to **isolate** (`--isolate`): turn it ON when the work dir holds uncommitted/unrelated work you can't lose, or the task touches git behavior (`reset --hard`/checkout/branch/merge), or you're unsure; leave it OFF for a clean tree and a low-risk edit. `--isolate` checks out HEAD, so the worktree does NOT contain uncommitted changes — commit anything agy must see first.
+
+The watchdog already plumbs `--print --model "$GEMINI_MODEL" --print-timeout` (default 8m). Do not pass these yourself.
 
 #### 4b. Resume
 
@@ -100,9 +103,14 @@ if [ "$STATUS" != "done" ]; then
     echo "--- watchdog log ---" >&2; cat "$RUN_DIR/watchdog.log" >&2
     echo "--- last stderr ---" >&2; tail -20 "$RUN_DIR/stderr.log" >&2
 fi
+# Surface a degraded-but-successful answer (model downgrade or quota fallback)
+# EVEN when status=done — otherwise the degradation is silent.
+if [ -f "$RUN_DIR/degraded" ]; then
+    echo "GEMINI DEGRADED: $(cat "$RUN_DIR/degraded")" >&2
+fi
 ```
 
-If status is not `done`: show diagnostics. Don't present `output.md` as the answer.
+If status is not `done`: show diagnostics. Don't present `output.md` as the answer. If `$RUN_DIR/degraded` exists (even on `done`), tell the user the answer is degraded and how (e.g. the requested Pro tier hit quota and a Flash fallback answered) — for a high-stakes review wave, consider re-running on the intended tier.
 
 ### 6. Present Results
 
@@ -176,7 +184,7 @@ wait
 
 Every invocation MUST go through `~/.claude/skills/gemini/run_with_watchdog.sh`. Calling `agy --print` directly skips four defenses:
 
-1. **No fast-fail on auth/quota errors.** The watchdog greps stderr for `IneligibleTier`, `UNSUPPORTED_CLIENT`, `RESOURCE_EXHAUSTED`, etc., and kills+retries within seconds.
+1. **No fast-fail on auth/quota errors.** The watchdog greps stderr for `IneligibleTier`, `UNSUPPORTED_CLIENT`, `RESOURCE_EXHAUSTED`, etc., kills within seconds, and classifies the failure — auth fails immediately (no pointless retry), quota loud-fails with a tier hint.
 2. **No model validation/remap.** The watchdog validates `GEMINI_MODEL` against `agy models` and remaps any stale/legacy id (e.g. a gemini-cli `gemini-2.5-pro`) to the default, so a frozen caller still runs.
 3. **No status primitive.** Bare invocations don't write `$RUN_DIR/status`, so the main session can't tell `done` from `hung_killed` from `failed`.
 4. **Lost harness notifications when shell-backgrounded.** `agy --print ... &` detaches agy from the Bash subprocess; the watchdog runs agy as a foreground child in its own subshell so `run_in_background: true` fires its completion correctly.
@@ -205,9 +213,16 @@ Possible status values: `starting`, `running`, `retrying`, `done`, `failed`, `hu
 
 ## Hang Recovery
 
-The watchdog fast-fails on known auth/quota signatures in **stderr only** (case-insensitive): `IneligibleTier`, `UNSUPPORTED_CLIENT`, `FatalAuthenticationError`, `AuthRequired`, `invalid_token`, `UNAUTHENTICATED`, `PERMISSION_DENIED`, `RESOURCE_EXHAUSTED`, `quota exceeded`. Match → kill within one poll cycle (≤5s); the matching line + context goes to `$RUN_DIR/watchdog.log`.
+The watchdog classifies failures from **stderr only** (case-insensitive) into three classes, each handled differently:
+- **auth** (`IneligibleTier`, `UNSUPPORTED_CLIENT`, `FatalAuthenticationError`, `AuthRequired`, `invalid_token`, `UNAUTHENTICATED`, `PERMISSION_DENIED`) → permanent; **fails immediately, no retry**, with a re-login hint (retrying never helps).
+- **quota** (`RESOURCE_EXHAUSTED`, `quota exceeded`) → **loud-fail**; every event is appended to `/tmp/gemini_runs/.quota_events.log`, and the give-up message captures the `resets in Xh` window. Antigravity quota is **account-wide** (verified 2026-06-21: Flash and Pro exhausted within the same second), so switching tier (Flash↔Pro) does NOT help — wait for the reset or run a 3-family panel with the Gemini seat noted down. The opt-in `GEMINI_QUOTA_FALLBACK=1` Pro→Flash downgrade is therefore mostly futile and stays OFF by default.
+- **transient** (any other non-zero exit, or an exit-0 **empty** answer) → retried once after a short backoff; a persistent empty answer fails loudly rather than being presented as the result.
 
-Backstop: `HANG_SEC` (default 1800 = 30m, a margin over `AGY_PRINT_TIMEOUT`) wall-clock since spawn → kill+retry once, then give up with `status=hung_killed`. agy's own `--print-timeout` (25m default) fires first; the Bash tool's 30-min timeout is the ultimate backstop. (An auth/quota fast-fail is reported as `status=failed`, exit 1 — distinct from a hang.)
+The hang-prone `agy models` preflight is wall-clock-capped (`AGY_MODELS_TIMEOUT`, default 20s) and its result cached (`AGY_MODELS_TTL`, default 600s), so it can never wedge a run; leaked `agy models` processes are reaped at startup.
+
+Backstop: `HANG_SEC` (default **540 = 9m**, deliberately LOWER than the ~10m outer foreground Bash ceiling so the watchdog WINS the race) wall-clock since spawn → kill and give up with `status=hung_killed`. A hang is **terminal — no retry** (a retry would re-cross the outer ceiling and re-zombie); transient/empty failures still retry once. agy's own `--print-timeout` (default **8m**) fires first. For heavy work, `--bg` + `HANG_SEC=1800 AGY_PRINT_TIMEOUT=25m` (background is unbounded); the `hung_killed` message says exactly this. (An auth/quota fast-fail is `status=failed`, exit 1 — distinct from a hang.)
+
+**Zombie self-heal + heartbeat (this is what serves open sessions).** Every run heartbeats `elapsed/cpu/rss` to `watchdog.log` every `HEARTBEAT_SEC` (30s). If the outer call bound SIGKILLs the watchdog mid-run, it leaves a non-terminal status with an orphaned agy; at startup the next watchdog **sweeps** any run dir in the same cohort that is non-terminal AND has a dead/absent pid AND a `watchdog.log` older than `STALE_SEC` (90s), marking it `aborted`. `status.sh` flags the same condition loudly (`WARN STALE … externally killed`). So an open session polling a killed run sees the truth, not eternal `running`. (A live run heartbeats well within 90s, so it is never falsely swept.)
 
 Override per call:
 
@@ -217,6 +232,14 @@ HANG_SEC=300 ~/.claude/skills/gemini/run_with_watchdog.sh "$RUN_DIR"
 
 # Longer agy print timeout for a heavy task:
 AGY_PRINT_TIMEOUT=40m ~/.claude/skills/gemini/run_with_watchdog.sh "$RUN_DIR"
+
+# Keep the panel seat alive under quota: one Gemini-only Pro->Flash downgrade,
+# loudly marked via $RUN_DIR/degraded (pick the fallback tier explicitly if needed):
+GEMINI_QUOTA_FALLBACK=1 GEMINI_FALLBACK_MODEL="Gemini 3.5 Flash (High)" \
+    ~/.claude/skills/gemini/run_with_watchdog.sh "$RUN_DIR"
+
+# Tighter cap on the (hang-prone) models preflight, rarely needed:
+AGY_MODELS_TIMEOUT=10 ~/.claude/skills/gemini/run_with_watchdog.sh "$RUN_DIR"
 ```
 
 Override model (Gemini family only — routing the /gemini skill to Claude/GPT-OSS would collapse the panel's diversity invariant):

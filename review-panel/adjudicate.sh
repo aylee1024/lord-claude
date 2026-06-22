@@ -13,15 +13,21 @@
 #
 # Usage:
 #   adjudicate.sh --findings <merged.json> --repo <path> [--ref <ref>] \
-#                 --out <results.json> [--scratch <dir>]
+#                 --out <results.json> [--scratch <dir>] \
+#                 [--families <csv>] [--min-families <N>]
 #
-#   --findings  JSON: {"findings":[...]} or a bare [...]; per findings.schema.json
-#   --repo      target git repo
-#   --ref       git ref to adjudicate at (default: the repo's current HEAD)
-#   --out       where to write the adjudicated results JSON
-#   --scratch   writable scratch for caches/TMPDIR (default: mktemp -d)
+#   --findings      JSON: {"findings":[...]} or a bare [...]; per findings.schema.json
+#   --repo          target git repo
+#   --ref           git ref to adjudicate at (default: the repo's current HEAD)
+#   --out           where to write the adjudicated results JSON
+#   --scratch       writable scratch for caches/TMPDIR (default: mktemp -d)
+#   --families      CSV of distinct model families that produced VALID output this panel
+#                   (e.g. "codex,gemini,anthropic"). Enables the diversity preflight (1a/1d):
+#                   fewer than --min-families => decision PROVISIONAL, not PASS. Omit to skip.
+#   --min-families  diversity threshold (default 3 = codex + gemini + anthropic).
 #
-# Exit: 0 if no reproduced/justified blockers; 1 if blockers exist; 2 on bad args.
+# Exit: 0 PASS (no blockers, diversity ok); 1 BLOCK (a reproduced/justified blocker);
+#       3 PROVISIONAL (no blockers but < min families produced valid output); 2 on bad args.
 #
 # HARDENING
 #   - ONE worktree; `git reset --hard <ref> && git clean -fdx-excluding-node_modules`
@@ -39,7 +45,7 @@
 
 set -u
 
-FINDINGS="" ; REPO="" ; REF="" ; OUT="" ; SCRATCH=""
+FINDINGS="" ; REPO="" ; REF="" ; OUT="" ; SCRATCH="" ; FAMILIES="" ; FAMILIES_SET="0" ; MIN_FAMILIES="3"
 while [ $# -gt 0 ]; do
   case "$1" in
     --findings) FINDINGS="$2"; shift 2;;
@@ -47,15 +53,19 @@ while [ $# -gt 0 ]; do
     --ref)      REF="$2"; shift 2;;
     --out)      OUT="$2"; shift 2;;
     --scratch)  SCRATCH="$2"; shift 2;;
+    --families)     FAMILIES="$2"; FAMILIES_SET="1"; shift 2;;   # CSV of distinct families with VALID output (audit 1a/1d); PRESENCE (even empty=0 families) enforces the diversity gate
+    --min-families) MIN_FAMILIES="$2"; shift 2;;
     *) echo "[adjudicate] unknown arg: $1" >&2; exit 2;;
   esac
 done
 [ -s "$FINDINGS" ] || { echo "[adjudicate] --findings missing/empty" >&2; exit 2; }
 [ -d "$REPO/.git" ] || git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || { echo "[adjudicate] --repo is not a git repo: $REPO" >&2; exit 2; }
 [ -n "$OUT" ] || { echo "[adjudicate] --out required" >&2; exit 2; }
+REPO="$(cd "$REPO" && pwd)"
 REF="${REF:-$(git -C "$REPO" rev-parse HEAD)}"
 if [ -n "$SCRATCH" ]; then AUTO_SCRATCH=0; else SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/adjudicate.XXXXXX")"; AUTO_SCRATCH=1; fi
 mkdir -p "$SCRATCH/cache" "$SCRATCH/tmp"
+SCRATCH="$(cd "$SCRATCH" && pwd)"
 
 WORKTREE="$SCRATCH/worktree"
 NODE_MODULES_SRC="$REPO/node_modules"
@@ -111,7 +121,7 @@ if [ -n "$ROWS" ]; then
     cmd=$(printf '%s' "$cmd_b64" | base64 --decode)
     # clean diff state for this finding (keep the symlinked node_modules)
     git -C "$WORKTREE" reset --hard --quiet "$REF"
-    git -C "$WORKTREE" clean -fdq -e node_modules
+    git -C "$WORKTREE" clean -fdqx -e node_modules   # -x: also remove IGNORED artifacts so a prior repro's cache/coverage cannot contaminate the next finding
     log "$id: running repro (expected_exit=${ee:-0})"
     (
       cd "$WORKTREE" || exit 99
@@ -161,21 +171,42 @@ node -e '
     if (v === "reproduced" || v === "not_run_justified") blockers.push(f);
     else nits.push(f);   // refuted, not_run (no justification), or model-text-only
   }
+  // Panel-family preflight (audit 1a/1d). The diversity invariant needs >= minFamilies
+  // distinct model families with VALID output. If --families was passed and the count is
+  // short, the result is PROVISIONAL (not gate-eligible) even with zero blockers, until a
+  // full-diversity panel re-clears it. Omitting --families skips the check (legacy behavior).
+  const familiesRaw = (process.argv[5] || "").trim();
+  const minFamilies = parseInt(process.argv[6] || "3", 10);
+  // PRESENCE of --families (argv[7]==="1"), not non-emptiness, enables the gate: an explicit
+  // empty set means 0 valid families (a total panel failure) and MUST be PROVISIONAL, not PASS.
+  const familiesProvided = (process.argv[7] === "1");
+  const families = familiesProvided
+    ? [...new Set(familiesRaw.split(",").map(s => s.trim().toLowerCase()).filter(Boolean))]
+    : [];
+  const diversityOk = familiesProvided ? (families.length >= minFamilies) : true;
+  // Precedence: a reproduced bug blocks regardless; otherwise an incomplete panel is
+  // PROVISIONAL (a clean bill of health from < 3 families is not trustworthy); else PASS.
+  const decision = blockers.length > 0 ? "BLOCK" : (!diversityOk ? "PROVISIONAL" : "PASS");
   const out = {
     summary: {
       total: findings.length,
       blockers: blockers.length,
       nits: nits.length,
       node_modules_mutated: nmDirty,
-      decision: blockers.length > 0 ? "BLOCK" : "PASS"
+      families_present: families,
+      families_count: families.length,
+      min_families: minFamilies,
+      diversity_ok: diversityOk,
+      decision: decision
     },
     blockers, nits
   };
   fs.writeFileSync(process.argv[4], JSON.stringify(out, null, 2));
-  process.stderr.write("[adjudicate] decision=" + out.summary.decision +
+  process.stderr.write("[adjudicate] decision=" + decision +
     " blockers=" + blockers.length + " nits=" + nits.length +
+    " families=" + families.length + "/" + minFamilies + " diversity_ok=" + diversityOk +
     " node_modules_mutated=" + nmDirty + "\n");
-' "$FINDINGS" "$RESULTS_TSV" "$NM_DIRTY" "$OUT"
+' "$FINDINGS" "$RESULTS_TSV" "$NM_DIRTY" "$OUT" "$FAMILIES" "$MIN_FAMILIES" "$FAMILIES_SET"
 
 # Exit reflects the gate decision (block iff a reproduced/justified blocker exists).
-node -e 'const o=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); process.exit(o.summary.decision==="BLOCK"?1:0)' "$OUT"
+node -e 'const o=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); const d=o.summary.decision; process.exit(d==="BLOCK"?1:(d==="PROVISIONAL"?3:0))' "$OUT"
