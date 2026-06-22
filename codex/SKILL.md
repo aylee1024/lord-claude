@@ -10,7 +10,7 @@ argument-hint: "[--bg] [--resume] [--full-auto] [--schema <file>] [--with-user-c
 
 Delegate a sub-task to a Codex agent via `codex exec`. The main session allocates a per-run directory, writes the prompt, invokes the watchdog wrapper, waits for the result (or backgrounds it), and reads the agent's output. Uses ChatGPT subscription auth.
 
-Every invocation goes through `~/.claude/skills/codex/run_with_watchdog.sh`. The watchdog runs codex with `--ignore-user-config` by default (any MCP servers in `~/.codex/config.toml` with expired OAuth tokens would otherwise hang fresh codex starts indefinitely), separates the three output streams into per-run files, exposes a status primitive, and retries with stricter isolation on hang.
+Every invocation goes through `~/.claude/skills/codex/run_with_watchdog.sh`. The watchdog runs codex with `--ignore-user-config` by default (Andrew's `~/.codex/config.toml` has broken-OAuth MCP servers that hang fresh starts), separates the three output streams into per-run files, exposes a status primitive, and retries with stricter isolation on hang.
 
 ## Invocation Rules
 
@@ -32,16 +32,25 @@ Extract from `$ARGUMENTS`:
 | `--bg` | Run watchdog in background (`run_in_background: true`). Main session continues; reads result on completion notification. |
 | `--resume` | Resume the latest codex session. Reads thread_id from `/tmp/codex_runs/latest/session.txt` (or `/tmp/codex_runs/<run-id>/session.txt` if `--run-id` is given). |
 | `--full-auto` | Workspace writes (`--sandbox workspace-write -c approval_policy=never`). Combine with `-C <project_dir>` to set codex's working directory. |
+| `--isolate` | Run codex inside a throwaway `git worktree` at HEAD of the target repo, so a `--full-auto` builder cannot reach your live uncommitted source (the `git reset --hard` data-loss class). Pair with `--full-auto -C <repo>`. The watchdog symlinks `.venv` + sets `PYTHONPATH` (the `.venv` is SHARED — a build that rewrites it affects the live env, the gitignored/reconstructable tradeoff); on completion it leaves the worktree (review/merge note in `$RUN_DIR/isolate_result`) if codex changed anything OR committed, else removes it. If a worktree can't be created (unborn HEAD, non-git, reused stale path), OR a prior isolated run left unmerged work at the run-dir's worktree, OR a sandbox-modifying flag is present — `--dangerously-bypass-approvals-and-sandbox`, `-s danger-full-access`, or ANY `-c`/`--config` or `-p`/`--profile` (these can set/widen the sandbox; codex parses `-c` as TOML so it can't be safely allowlisted) — it FAILS CLOSED (refuses, exit 1) — never runs in the live tree. Under `--isolate` pass model/reasoning via `CODEX_MODEL`/`CODEX_REASONING` env and the write mode via `--full-auto`, not explicit `-c`/`-s`/`-p`. Caller `--add-dir` is also stripped under `--isolate`. Codex's workspace-write sandbox makes this OS-enforced isolation — caveat: workspace-write also grants `/tmp` + `$TMPDIR` writable by default, so a repo located UNDER `/tmp`/`$TMPDIR` is NOT fully confined (keep repos in your home tree). Opt-in — see "When to isolate". |
 | `--schema <file>` | Pass `--output-schema <file>` to codex for structured output. |
-| `--with-user-config` | Load `~/.codex/config.toml` (default: ignored). Use only when codex needs your configured MCP servers. |
+| `--with-user-config` | Load `~/.codex/config.toml` (default: ignored). Use only when codex needs the configured MCP servers (github, semantic-scholar, playwright). |
 | `--run-id <name>` | Override default run_id. Run dir becomes `/tmp/codex_runs/<name>`. Useful for parallel-batch subject ids and for `--resume` targeting a specific prior run. |
 | Everything else | The prompt. |
 
-> Verified on codex-cli 0.133.0: `--full-auto` is NOT listed in `codex exec --help`. It is an undocumented alias that still works and maps to `--sandbox workspace-write -c approval_policy=never`. New code should prefer the explicit form rather than depend on the alias. Separately: `--ignore-user-config` (the watchdog default) is belt-and-suspenders against MCP servers that hang on expired OAuth at startup; if your `~/.codex/config.toml` has no such servers it is harmless either way.
+> Verified on codex-cli 0.133.0 (2026-05-25): `--full-auto` is NOT listed in `codex exec --help`. It is an undocumented alias that still works today and maps to `--sandbox workspace-write -c approval_policy=never`. It functions, but new code (e.g. the review-panel adjudicator) should prefer the explicit `--sandbox workspace-write -c approval_policy=never` form rather than depend on the alias. Separately: the broken figma/notion/linear MCP servers were removed from `~/.codex/config.toml` on 2026-05-25, so bare `codex` no longer hangs at startup; `--ignore-user-config` (the watchdog default) is now belt-and-suspenders, not load-bearing.
 
 Do not auto-infer `--full-auto` from prompt content. If the user did not pass it explicitly and the task seems to need writes, ask before launching.
 
 If the user passes `--bg --full-auto` together, ask before running. Claude Code's permission layer may block `workspace-write + background` as bypassing approval gates.
+
+#### When to isolate (`--isolate`) — decide per task
+`--isolate` is OFF by default (codex writes directly in the repo, as today). Turn it ON when:
+- the working repo holds **uncommitted or unrelated work you can't afford to lose**, OR
+- the task involves **git-behavior testing** or anything that might run `git reset --hard` / checkout / branch / merge / stash, OR
+- you're **unsure** of the blast radius.
+
+Leave it OFF for a clean tree and a low-risk, well-scoped edit. NOTE: `--isolate` checks out **HEAD**, so the worktree does NOT contain your uncommitted changes — commit anything codex must see first, or don't isolate. The prompt-forbiddance ("do all git-behavior testing in a throwaway /tmp repo; NEVER `git reset --hard` in the working repo") and a post-run `git status`/reflog check stay as complementary defenses, not the only ones.
 
 ### 2. Allocate Run Directory
 
@@ -213,7 +222,7 @@ Every codex invocation MUST go through `~/.claude/skills/codex/run_with_watchdog
 ### Wrong shape
 
 ```bash
-# DO NOT WRITE THIS — bypasses every defense the watchdog provides
+# DO NOT WRITE THIS — even though MEMORY.md older entries may suggest it
 cat > /tmp/codex_prompt.txt <<'PROMPT'
 {prompt}
 PROMPT
@@ -267,6 +276,8 @@ Two thresholds:
 - `STARTUP_GRACE_SEC` (default 60): no `thread.started` event by then → kill, retry with `--ephemeral` once, then give up with `status=hung_killed`. Catches MCP-OAuth hangs and codex CLI startup failures.
 - `NO_PROGRESS_SEC` (default **0 = disabled**): once `thread.started` has fired, the watchdog does NOT enforce a steady-state liveness threshold by default. xhigh reasoning streams tokens with long inter-token gaps (3-15 minutes is normal for deep architectural debates or design tasks), and event-stream growth is not a reliable liveness signal once codex is alive. The Bash tool's 30-min timeout is the ultimate backstop. Opt in by setting `NO_PROGRESS_SEC=600` (or similar) when you want tight steady-state monitoring for a specific call.
 
+**Empty-output gate (audit 2e):** a codex run that exits 0 but writes nothing (or only whitespace) to `output.md` is treated as a FAILED attempt — retried once, then `status=failed` with exit 1. The watchdog never reports `done` with a blank answer.
+
 Override per call:
 
 ```bash
@@ -283,6 +294,11 @@ Override model:
 CODEX_MODEL=gpt-5.6 CODEX_REASONING=xhigh \
     ~/.claude/skills/codex/run_with_watchdog.sh "$RUN_DIR" ...
 ```
+
+## Verifying codex's work (audit 2b/2c/2d)
+- **Green unit tests are not proof the production path works (2b).** Codex's tests can pass under a `python -m` / cwd setup the real entry point lacks — a script run has a different `sys.path[0]`, so `python -m unittest` from the repo root can import a module the launchd/script invocation cannot. Run the REAL entry point on-machine, not just the unit suite; guarantee script-vs-module parity with `pip install -e .` or a `conftest.py` sys.path bootstrap.
+- **Codex reasons within the spec it was given (2c).** It builds faithfully but may not notice that new wiring changes the cost/failure model (e.g. a one-shot validation becoming a per-fire cost that blows a deadline as data grows). In the spec, explicitly call out "this changes X from one-shot to per-fire; reason about the new cost/failure model." The diverse review panel is load-bearing on top of codex for exactly these deployment-context regressions.
+- **Codex sandbox false-failures (2d) are NOT real.** The sandbox blocks Metal/MLX, launchd, and localhost socket bind; codex reports these as failures. Re-verify anything touching GPU/launchd/networking on-machine; never block on "MLX unavailable / PortAllocation / No adapter".
 
 ## Cleanup
 
@@ -318,7 +334,7 @@ CODEX_MODEL=gpt-5.6 CODEX_REASONING=xhigh \
 
 ### Long-running background sessions
 
-Pattern for a persistent codex session (long-running background agent, multi-turn architectural debate, etc.). Uses the raw watchdog directly so the run_dir paths are explicit and recoverable across main-session compaction:
+Pattern for a persistent codex session (paper-trader trader-loop, multi-turn architectural debate, etc.). Uses the raw watchdog directly so the run_dir paths are explicit and recoverable across main-session compaction:
 
 ```bash
 # Turn 1: fresh session, fixed run_dir name so future turns can resume it by path.

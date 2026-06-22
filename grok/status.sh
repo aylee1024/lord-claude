@@ -1,7 +1,7 @@
 #!/bin/bash
-# Print status, liveness, and recent activity for a gemini run.
-# Usage: status.sh [run_dir]   (default: /tmp/gemini_runs/latest)
-RUN_DIR="${1:-/tmp/gemini_runs/latest}"
+# Print status, liveness, and recent activity for a grok run.
+# Usage: status.sh [run_dir]   (default: /tmp/grok_runs/latest)
+RUN_DIR="${1:-/tmp/grok_runs/latest}"
 [ -d "$RUN_DIR" ] || { echo "no run dir: $RUN_DIR" >&2; exit 1; }
 echo "run_dir: $RUN_DIR"
 STATUS=$(cat "$RUN_DIR/status" 2>/dev/null || echo unknown)
@@ -10,10 +10,10 @@ PID=$(cat "$RUN_DIR/pid" 2>/dev/null)
 if [ -n "${PID:-}" ] && kill -0 "$PID" 2>/dev/null; then
     ps -p "$PID" -o pid,pcpu,pmem,etime,command 2>/dev/null
 fi
-# Zombie / dead-watchdog check, INDEPENDENT of the agy pid (an orphaned agy can outlive a
+# Zombie / dead-watchdog check, INDEPENDENT of the grok pid (an orphaned grok can outlive a
 # SIGKILLed watchdog). A live watchdog heartbeats, so a stale watchdog.log => the watchdog is
 # dead. Mirror sweep_stale_runs: for a wd_pid run a stale log alone means dead; for a
-# pre-heartbeat run, only warn if the agy pid is also gone.
+# pre-heartbeat run, only warn if the grok pid is also gone.
 case "$STATUS" in
     starting|running|retrying)
         _logf="$RUN_DIR/watchdog.log"
