@@ -42,7 +42,8 @@ model=""
 while [ "$#" -gt 0 ]; do case "$1" in --model) model="${2:-}"; shift 2 ;; *) shift ;; esac; done
 if [ -n "${STUB_STDIN_FILE:-}" ]; then cat > "$STUB_STDIN_FILE" 2>/dev/null || true; else cat >/dev/null 2>&1 || true; fi
 case "${STUB_PRINT:-ok}" in
-    ok)    printf 'STUB ANSWER for %s\n' "$model"; exit 0 ;;
+    ok)    if [ -n "${AGY_CONV_DIR:-}" ]; then for _d in "$AGY_CONV_DIR"/*.db; do [ -e "$_d" ] && touch "$_d"; done; fi
+           printf 'STUB ANSWER for %s\n' "$model"; exit 0 ;;
     empty) printf '\n\n'; exit 0 ;;
     narration) printf 'I will view this file. I will run pytest to check it. I will wait for the background command to finish and notify us.\n'; exit 0 ;;
     review_bg) printf '### Findings\n* Bug: the async handler is wrong; it would wait for the background command to finish and then notify the caller, dropping the result.\n'; exit 0 ;;
@@ -431,6 +432,15 @@ echo "== T32 GEMINI_NO_DIRECTIVE=1 disables the narration gate too (opt out enti
 d=$(newrun t32)
 base AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models STUB_PRINT=narration GEMINI_NO_DIRECTIVE=1 "$WD" "$d" >/dev/null 2>&1
 chk "status done (gate disabled under opt-out)" "$(cat "$d/status")" done
+
+echo "== T33 Tier-1: session.txt captures newest conversation .db uuid (resume-by-id) =="
+d=$(newrun t33); CONVD="$TMP/conv33"; mkdir -p "$CONVD"
+: > "$CONVD/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.db"
+base AGY_CONV_DIR="$CONVD" AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models STUB_PRINT=ok "$WD" "$d" >/dev/null 2>&1
+chk "session.txt == newest db uuid" "$(cat "$d/session.txt")" "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+d=$(newrun t33b); CONVE="$TMP/conv33b"; mkdir -p "$CONVE"
+base AGY_CONV_DIR="$CONVE" AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models STUB_PRINT=ok "$WD" "$d" >/dev/null 2>&1
+chk "session.txt empty when no db (resume->--continue)" "$(cat "$d/session.txt")" ""
 
 echo
 echo "==================  $PASS passed, $FAIL failed  =================="

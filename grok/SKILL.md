@@ -80,3 +80,7 @@ GROK_WATCHDOG_CWD=<same project_dir as the original run> \
 
 ## Tests
 `bash ~/.claude/skills/grok/test_watchdog.sh` — regression suite (mocks `grok`): JSON-result parsing, empty-output gate, structured-error auth/quota classification, model fallback, sandbox-flag selection by mode, bad-args, resume arg mapping.
+
+## Live session (Tier 2 — warm, multi-turn)
+For an ongoing conversation where the agent stays warm in memory and remembers the whole exchange (via `grok agent stdio` / ACP), use the unified dispatcher or this skill's shim:
+`~/.claude/skills/grok/session.sh start --handle H --cwd "$REPO"` → `session.sh send --to H "..."` → `session.sh stop --to H`. Read-only by default; `--full-auto` grants file-write + a terminal bridge. Full docs: `skills/_session/SKILL.md`.

@@ -293,6 +293,10 @@ Available models (from `agy models`, 2026-06-18): `Gemini 3.5 Flash (Low|Medium|
 
 ## Notes / known limitations
 
-- **Resume is most-recent-only** until agy emits per-conversation ids in print mode (upstream gap). For strict multi-thread resume, run agy interactively.
+- **Resume is by conversation id.** The watchdog records this run's conversation — the newest `~/.gemini/antigravity-cli/conversations/<uuid>.db` — into `session.txt`, so `resume <uuid>` maps to `--conversation <uuid>` (exact) and `resume latest`/empty maps to `--continue`. For a warm in-memory multi-turn session, see *Live session* below.
 - **No MCP allowlist knob.** The old gemini-cli `--allowed-mcp-server-names` isolation is gone; agy manages its own tools. The retry path simply re-runs.
 - **Legacy `GEMINI_MODEL` ids self-heal.** Any value not in `agy models` (including every gemini-cli id) is remapped to the default and logged in `watchdog.log` — this is what lets already-running sessions adopt agy without an edit.
+
+## Live session (Tier 2 — warm, multi-turn)
+For an ongoing conversation where gemini stays warm in memory and remembers the whole exchange, use the unified dispatcher or this skill's shim:
+`~/.claude/skills/gemini/session.sh start --handle H --cwd "$REPO"` → `session.sh send --to H "..."` → `session.sh stop --to H`. It keeps `agy -i` alive under a pseudo-terminal and reads each turn's end + reply from the conversation's SQLite store. **Not write-sandboxed** (Antigravity has no enforceable read-only mode): default sessions chat/reason; `--full-auto` lets the agent act. Full docs: `skills/_session/SKILL.md`.

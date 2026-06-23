@@ -368,3 +368,7 @@ After main-session compaction the run_dir paths are still on disk; `cat /tmp/cod
 - Old watchdog signature `(prompt_file, output_log, ...args)` exits 2 with a clear error pointing at the new `(run_dir, ...args)` signature.
 - `/tmp/codex_session.txt` is dual-written for one transition release. Prefer `$RUN_DIR/session.txt`.
 - Old `/tmp/codex_output.md` / `/tmp/codex_events.jsonl` / `/tmp/codex_stderr.log` are no longer written. The new `CODEX_RUN_DIR` is printed at launch so recovery is grep-able.
+
+## Live session (Tier 2 — warm, multi-turn)
+For an ongoing conversation where codex stays warm in memory and remembers the whole exchange (via `codex mcp-server` → `codex-reply`), use the unified dispatcher or this skill's shim:
+`~/.claude/skills/codex/session.sh start --handle H --cwd "$REPO"` → `session.sh send --to H "..."` → `session.sh stop --to H`. Read-only is OS-enforced (`sandbox=read-only`); `--full-auto` switches to `workspace-write`. Full docs: `skills/_session/SKILL.md`.

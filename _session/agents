@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""
+agents — unified dispatcher for LIVE agent sessions (grok, composer, codex, gemini).
+
+Addresses any engine by a stable handle, the way Claude Code messages a named subagent:
+
+  agents start  <engine> --handle H [--model M] [--cwd DIR] [--full-auto]
+  agents send   --to H [--bg] [<text> | -]      # text arg or stdin; foreground blocks until turn-end
+  agents read   --to H [--turn N]
+  agents status --to H
+  agents list
+  agents stop   --to H
+  agents gc     [--days N]
+
+Sessions live under /tmp/agent_sessions/<handle>/ (own namespace; one-shot /tmp/<skill>_runs untouched).
+Control channel: the daemon's unix socket, with an inbox/ file-drop fallback.
+"""
+import argparse, json, os, shutil, socket, subprocess, sys, time
+
+BASE_DIR = os.environ.get("AGENT_SESSIONS_DIR", "/tmp/agent_sessions")
+DAEMON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "session_daemon.py")
+STARTUP_TIMEOUT = int(os.environ.get("SESSION_STARTUP_TIMEOUT", "180"))
+STALE_SEC = int(os.environ.get("SESSION_STALE_SEC", "90"))
+LIVE_STATES = ("starting", "idle", "busy")
+DEFAULT_MODEL = {"grok": "grok-build", "composer": "grok-composer-2.5-fast",
+                 "codex": "gpt-5.5", "gemini": "Gemini 3.5 Flash (High)"}
+
+
+def sdir(handle):
+    return os.path.join(BASE_DIR, handle)
+
+
+def read_file(p, default=""):
+    try:
+        with open(p) as f:
+            return f.read().strip()
+    except Exception:
+        return default
+
+
+def pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except Exception:
+        return False
+
+
+def session_status(d):
+    """Return (status, stale_bool). Mirrors the watchdog stale-sweep: a LIVE status whose daemon.log
+    is older than STALE_SEC AND whose wd_pid is dead == a zombie."""
+    st = read_file(os.path.join(d, "status"), "unknown")
+    if st in LIVE_STATES:
+        log = os.path.join(d, "daemon.log")
+        wd = read_file(os.path.join(d, "wd_pid"))
+        try:
+            age = time.time() - os.path.getmtime(log)
+        except OSError:
+            age = 1e9
+        if age > STALE_SEC and (not wd or not pid_alive(wd)):
+            return st, True
+    return st, False
+
+
+# --------------------------------------------------------------------------- control channel
+class _ConnectError(Exception):
+    """Connect-stage failure: the request was NEVER sent, so the inbox fallback is safe (no dup turn)."""
+
+
+def _sock_request(d, req, timeout):
+    sp = os.path.join(d, "control.sock")
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(sp)
+    except OSError as e:
+        s.close()
+        raise _ConnectError(str(e))
+    # connected: from here we do NOT auto-retry — the daemon may have received the request, and an
+    # inbox replay would run the turn twice.
+    try:
+        s.sendall((json.dumps(req) + "\n").encode())
+        data = b""
+        while b"\n" not in data:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        s.close()
+    if not data or b"\n" not in data:
+        raise RuntimeError("daemon closed the control socket without a full response (turn state unknown)")
+    return json.loads(data.decode().splitlines()[0])
+
+
+def _inbox_request(d, req, timeout):
+    """Fallback used ONLY when the socket isn't listening yet (startup race): atomic drop, poll reply,
+    and bail if the daemon's wd_pid dies."""
+    inbox = os.path.join(d, "inbox")
+    os.makedirs(inbox, exist_ok=True)
+    name = f"req-{int(time.time()*1000)}-{os.getpid()}"
+    tmp = os.path.join(inbox, name + ".json.tmp")
+    with open(tmp, "w") as f:
+        json.dump(req, f)
+    os.replace(tmp, os.path.join(inbox, name + ".json"))   # atomic: daemon never sees a partial file
+    reply = os.path.join(inbox, name + ".reply")
+    wd = read_file(os.path.join(d, "wd_pid"))
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if os.path.exists(reply):
+            with open(reply) as f:
+                r = json.load(f)
+            try:
+                os.unlink(reply)
+            except Exception:
+                pass
+            return r
+        if wd and not pid_alive(wd):
+            raise ConnectionError("daemon is not running")
+        time.sleep(0.3)
+    raise TimeoutError("inbox request timed out")
+
+
+def control(d, req, timeout=920):
+    try:
+        return _sock_request(d, req, timeout)
+    except _ConnectError:
+        return _inbox_request(d, req, timeout)
+
+
+# --------------------------------------------------------------------------- commands
+def cmd_start(a):
+    d = sdir(a.handle)
+    if os.path.isdir(d):
+        st, stale = session_status(d)
+        if st in LIVE_STATES and not stale:
+            print(f"handle '{a.handle}' already live (status={st}) at {d}", file=sys.stderr)
+            return 2
+        # dead or stale handle: clear the old session dir so the name can be reused
+        shutil.rmtree(d, ignore_errors=True)
+    os.makedirs(d, exist_ok=True)
+    model = a.model or DEFAULT_MODEL.get(a.engine, "")
+    argv = [sys.executable, DAEMON, d, "--engine", a.engine, "--model", model, "--cwd", os.path.abspath(a.cwd)]
+    if a.full_auto:
+        argv.append("--full-auto")
+    launch_log = open(os.path.join(d, "launch.log"), "ab")
+    try:
+        subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=launch_log, stderr=launch_log,
+                         start_new_session=True, close_fds=True)
+    finally:
+        launch_log.close()
+    # wait for the daemon to leave 'starting'
+    deadline = time.time() + STARTUP_TIMEOUT
+    while time.time() < deadline:
+        st = read_file(os.path.join(d, "status"), "starting")
+        if st == "idle":
+            print(json.dumps({"handle": a.handle, "engine": a.engine, "model": model,
+                              "status": "idle", "session_dir": d,
+                              "session_id": read_file(os.path.join(d, "session.txt"))}))
+            return 0
+        if st in ("failed", "aborted", "stopped", "done"):
+            print(f"session failed to start (status={st}). See {d}/daemon.log + {d}/stderr.log", file=sys.stderr)
+            return 1
+        time.sleep(0.4)
+    print(f"timed out waiting for session to become ready (last status={st})", file=sys.stderr)
+    return 1
+
+
+def _resolve_text(a):
+    if a.text == "-" or a.text is None:
+        return sys.stdin.read()
+    return a.text
+
+
+def cmd_send(a):
+    d = sdir(a.to)
+    if not os.path.isdir(d):
+        print(f"no such session '{a.to}'", file=sys.stderr)
+        return 2
+    st, stale = session_status(d)
+    wd = read_file(os.path.join(d, "wd_pid"))
+    if stale or st in ("done", "failed", "hung_killed", "aborted", "stopped") or (wd and not pid_alive(wd)):
+        print(f"session '{a.to}' is not live (status={st}{', stale' if stale else ''})", file=sys.stderr)
+        return 1
+    text = _resolve_text(a)
+    try:
+        resp = control(d, {"op": "send", "text": text, "bg": bool(a.bg)})
+    except Exception as e:
+        print(f"send failed: {e}", file=sys.stderr)
+        return 1
+    if not resp.get("ok"):
+        print(f"send failed: {resp.get('error')}", file=sys.stderr)
+        return 1
+    if a.bg:
+        print(json.dumps({"handle": a.to, "turn": resp.get("turn"), "status": resp.get("status")}))
+        return 0
+    sys.stdout.write(resp.get("reply") or "")
+    if not (resp.get("reply") or "").endswith("\n"):
+        sys.stdout.write("\n")
+    return 0
+
+
+def cmd_read(a):
+    d = sdir(a.to)
+    if not os.path.isdir(d):
+        print(f"no such session '{a.to}'", file=sys.stderr)
+        return 2
+    if a.turn:
+        f = os.path.join(d, "outbox", f"{a.turn}.md")
+    else:
+        outdir = os.path.join(d, "outbox")
+        outs = sorted(int(n[:-3]) for n in os.listdir(outdir) if n.endswith(".md")) if os.path.isdir(outdir) else []
+        if not outs:
+            print("(no turns yet)", file=sys.stderr)
+            return 1
+        f = os.path.join(d, "outbox", f"{outs[-1]}.md")
+    sys.stdout.write(read_file(f) + "\n")
+    return 0
+
+
+def cmd_status(a):
+    d = sdir(a.to)
+    if not os.path.isdir(d):
+        print(f"no such session '{a.to}'", file=sys.stderr)
+        return 2
+    st, stale = session_status(d)
+    meta = {}
+    try:
+        meta = json.loads(read_file(os.path.join(d, "meta.json"), "{}"))
+    except Exception:
+        pass
+    print(json.dumps({
+        "handle": a.to, "status": st + (" (stale)" if stale else ""),
+        "engine": meta.get("engine"), "model": meta.get("model"), "kind": meta.get("kind"),
+        "session_id": read_file(os.path.join(d, "session.txt")),
+        "turns": sum(1 for _ in open(os.path.join(d, "turns.jsonl"))) if os.path.exists(os.path.join(d, "turns.jsonl")) else 0,
+        "session_dir": d,
+    }, indent=2))
+    return 0
+
+
+def cmd_list(a):
+    if not os.path.isdir(BASE_DIR):
+        print("(no sessions)")
+        return 0
+    rows = []
+    for h in sorted(os.listdir(BASE_DIR)):
+        d = sdir(h)
+        if not os.path.isdir(d):
+            continue
+        st, stale = session_status(d)
+        meta = {}
+        try:
+            meta = json.loads(read_file(os.path.join(d, "meta.json"), "{}"))
+        except Exception:
+            pass
+        rows.append((h, meta.get("engine", "?"), st + (" (stale)" if stale else "")))
+    if not rows:
+        print("(no sessions)")
+        return 0
+    w = max(len(r[0]) for r in rows)
+    for h, eng, st in rows:
+        print(f"  {h:<{w}}  {eng:<9}  {st}")
+    return 0
+
+
+def cmd_stop(a):
+    d = sdir(a.to)
+    if not os.path.isdir(d):
+        print(f"no such session '{a.to}'", file=sys.stderr)
+        return 2
+    st, stale = session_status(d)
+    if stale or st not in LIVE_STATES:
+        # already dead; just report
+        print(f"session '{a.to}' not live (status={st})")
+        return 0
+    try:
+        control(d, {"op": "stop"}, timeout=15)
+    except Exception as e:
+        print(f"stop signal failed ({e}); session may already be exiting", file=sys.stderr)
+    print(f"stopped '{a.to}'")
+    return 0
+
+
+def cmd_gc(a):
+    if not os.path.isdir(BASE_DIR):
+        return 0
+    cutoff = time.time() - a.days * 86400
+    removed = 0
+    import shutil
+    for h in os.listdir(BASE_DIR):
+        d = sdir(h)
+        if not os.path.isdir(d):
+            continue
+        st, stale = session_status(d)
+        dead = stale or st in ("done", "failed", "hung_killed", "aborted", "stopped")
+        try:
+            old = os.path.getmtime(os.path.join(d, "daemon.log")) < cutoff
+        except OSError:
+            old = True
+        if dead and old:
+            shutil.rmtree(d, ignore_errors=True)
+            removed += 1
+    print(f"gc: removed {removed} dead/old session(s)")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="agents")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("start"); p.add_argument("engine", choices=["grok", "composer", "codex", "gemini"])
+    p.add_argument("--handle", required=True); p.add_argument("--model", default="")
+    p.add_argument("--cwd", default=os.getcwd()); p.add_argument("--full-auto", action="store_true")
+    p.set_defaults(fn=cmd_start)
+
+    p = sub.add_parser("send"); p.add_argument("--to", required=True)
+    p.add_argument("text", nargs="?", default=None); p.add_argument("--bg", action="store_true")
+    p.set_defaults(fn=cmd_send)
+
+    p = sub.add_parser("read"); p.add_argument("--to", required=True); p.add_argument("--turn", type=int)
+    p.set_defaults(fn=cmd_read)
+
+    p = sub.add_parser("status"); p.add_argument("--to", required=True); p.set_defaults(fn=cmd_status)
+    p = sub.add_parser("list"); p.set_defaults(fn=cmd_list)
+    p = sub.add_parser("stop"); p.add_argument("--to", required=True); p.set_defaults(fn=cmd_stop)
+    p = sub.add_parser("gc"); p.add_argument("--days", type=int, default=7); p.set_defaults(fn=cmd_gc)
+
+    a = ap.parse_args()
+    return a.fn(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

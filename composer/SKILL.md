@@ -32,3 +32,7 @@ GROK_MODEL=grok-composer-2.5-fast ~/.claude/skills/grok/run_with_watchdog.sh "$R
 
 ## Flags, model, files, status, tests
 Identical to `/grok` (this skill only changes the default `GROK_MODEL`). See `skills/grok/SKILL.md`. The grok regression suite (`bash ~/.claude/skills/grok/test_watchdog.sh`) covers this watchdog; it includes a case asserting `GROK_MODEL=grok-composer-2.5-fast` is accepted and passed through.
+
+## Live session (Tier 2 — warm, multi-turn)
+Composer rides the same `grok agent stdio` ACP server (model `grok-composer-2.5-fast`):
+`~/.claude/skills/composer/session.sh start --handle H --cwd "$REPO"` → `session.sh send --to H "..."` → `session.sh stop --to H`. Read-only by default; `--full-auto` grants file-write + a terminal bridge. Full docs: `skills/_session/SKILL.md`.
