@@ -40,10 +40,15 @@ fi
 [ -n "${STUB_ARGV_FILE:-}" ] && printf '%s\n' "$@" > "$STUB_ARGV_FILE" 2>/dev/null   # record exact argv agy received
 model=""
 while [ "$#" -gt 0 ]; do case "$1" in --model) model="${2:-}"; shift 2 ;; *) shift ;; esac; done
-cat >/dev/null 2>&1 || true
+if [ -n "${STUB_STDIN_FILE:-}" ]; then cat > "$STUB_STDIN_FILE" 2>/dev/null || true; else cat >/dev/null 2>&1 || true; fi
 case "${STUB_PRINT:-ok}" in
     ok)    printf 'STUB ANSWER for %s\n' "$model"; exit 0 ;;
     empty) printf '\n\n'; exit 0 ;;
+    narration) printf 'I will view this file. I will run pytest to check it. I will wait for the background command to finish and notify us.\n'; exit 0 ;;
+    review_bg) printf '### Findings\n* Bug: the async handler is wrong; it would wait for the background command to finish and then notify the caller, dropping the result.\n'; exit 0 ;;
+    narr_then_ok)
+        n=1; [ -n "${STUB_ATTEMPT_FILE:-}" ] && { echo x >> "$STUB_ATTEMPT_FILE"; n=$(wc -l < "$STUB_ATTEMPT_FILE" | tr -d ' '); }
+        if [ "$n" -lt 2 ]; then printf 'I will view the file and I will run the tests. I will wait for the background command to finish and notify us.\n'; else printf 'The bug: add() returns a-b; it should return a+b.\n'; fi; exit 0 ;;
     auth)  echo "FatalAuthenticationError: invalid_token (UNAUTHENTICATED)" >&2; exit 1 ;;
     quota) echo "RESOURCE_EXHAUSTED: quota exceeded; resets in 6h" >&2; exit 1 ;;
     transient)
@@ -381,6 +386,51 @@ d=$(newrun t25)
 base AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models STUB_PRINT=ok STUB_ARGV_FILE="$d/argv" GEMINI_ISOLATE_SANDBOX=1 \
     GEMINI_WATCHDOG_CWD="$SBR" "$WD" "$d" --isolate --add-dir "$SBR" --dangerously-skip-permissions >/dev/null 2>&1
 if grep -qxF -- "--sandbox" "$d/argv"; then ok "agy --sandbox injected under GEMINI_ISOLATE_SANDBOX=1"; else bad "no --sandbox injected"; fi
+
+echo "== T26 default mode: single-response directive (reads allowed, no writes/commands) is prepended =="
+d=$(newrun t26)
+base AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models STUB_PRINT=ok STUB_STDIN_FILE="$d/stdin" "$WD" "$d" >/dev/null 2>&1
+chk "status done" "$(cat "$d/status")" done
+has "forbids shell commands" "do NOT run shell commands" "$d/stdin"
+has "allows reads (documented /gemini ./FILE usage)" "MAY read files" "$d/stdin"
+has "original prompt preserved" "say hi" "$d/stdin"
+
+echo "== T27 write mode (--dangerously-skip-permissions): lighter directive, does NOT forbid commands =="
+d=$(newrun t27)
+base AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models STUB_PRINT=ok STUB_STDIN_FILE="$d/stdin" "$WD" "$d" --dangerously-skip-permissions >/dev/null 2>&1
+has "write directive present" "Complete the task FULLY" "$d/stdin"
+if grep -q "do NOT run shell commands" "$d/stdin"; then bad "write mode wrongly forbids commands"; else ok "write mode keeps commands available"; fi
+
+echo "== T28 GEMINI_NO_DIRECTIVE=1: raw prompt fed, no directive =="
+d=$(newrun t28)
+base AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models STUB_PRINT=ok STUB_STDIN_FILE="$d/stdin" GEMINI_NO_DIRECTIVE=1 "$WD" "$d" >/dev/null 2>&1
+if grep -q "single-response" "$d/stdin"; then bad "directive leaked despite opt-out"; else ok "no directive under GEMINI_NO_DIRECTIVE=1"; fi
+has "raw prompt fed" "say hi" "$d/stdin"
+
+echo "== T29 narration gate: agentic narration-without-answer -> failed, not done =="
+d=$(newrun t29)
+base AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models STUB_PRINT=narration "$WD" "$d" >/dev/null 2>&1; rc=$?
+chk "exit 1 (not success)" "$rc" 1
+chk "status failed (not done)" "$(cat "$d/status")" failed
+has "degraded marker explains narration" "narrated" "$d/degraded"
+
+echo "== T30 narration gate does NOT flag a real review that DESCRIBES background behavior (FP guard) =="
+d=$(newrun t30)
+base AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models STUB_PRINT=review_bg "$WD" "$d" >/dev/null 2>&1; rc=$?
+chk "exit 0" "$rc" 0; chk "status done (real review kept)" "$(cat "$d/status")" done
+nofile "no degraded marker on a real review" "$d/degraded"
+
+echo "== T31 narration on attempt 0 then success on retry -> done, NO stale degraded =="
+d=$(newrun t31)
+base AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models STUB_PRINT=narr_then_ok STUB_ATTEMPT_FILE="$d/att" "$WD" "$d" >/dev/null 2>&1
+chk "status done after recovery" "$(cat "$d/status")" done
+has "recovered answer captured" "should return a+b" "$d/output.md"
+nofile "no stale degraded after narration-then-success" "$d/degraded"
+
+echo "== T32 GEMINI_NO_DIRECTIVE=1 disables the narration gate too (opt out entirely) =="
+d=$(newrun t32)
+base AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models STUB_PRINT=narration GEMINI_NO_DIRECTIVE=1 "$WD" "$d" >/dev/null 2>&1
+chk "status done (gate disabled under opt-out)" "$(cat "$d/status")" done
 
 echo
 echo "==================  $PASS passed, $FAIL failed  =================="
