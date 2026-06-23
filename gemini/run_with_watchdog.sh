@@ -625,6 +625,14 @@ ln -sfn "$RUN_DIR" /tmp/gemini_runs/latest 2>/dev/null || true
 # stderr only — output.md may legitimately discuss these terms.
 AUTH_PATTERN='IneligibleTier|UNSUPPORTED_CLIENT|FatalAuthenticationError|AuthRequired|invalid_token|UNAUTHENTICATED|PERMISSION_DENIED'
 QUOTA_PATTERN='RESOURCE_EXHAUSTED|quota.*exceeded'
+# Narration-stall detector (default-mode backstop). agy self-narration is FIRST-PERSON intent to
+# ACT ("I will view/run/wait…") with no actual answer. The gate fires only when _NARR_INTENT matches
+# the tail AND the full output LACKS substantive review markers (_NARR_SUBSTANCE) — so a THIRD-PERSON
+# review that merely describes background/waiting behavior is NOT flagged (panel finding 2026-06-23:
+# the old unanchored regex flagged a correct review of this very bug). _NARR_INTENT is double-quoted
+# so its apostrophes are literal; _NARR_SUBSTANCE is single-quoted so its backticks are literal.
+_NARR_INTENT="(^|[^[:alpha:]])(i will|i'll|i am going to|i'm going to|i am now|i'll now|let me|i need to|i will now|i'm now)[^.]{0,60}(view|read|open|run|execut|check|inspect|test|verif|wait|continu|look|use the|gather|examine|fetch|list)"
+_NARR_SUBSTANCE='```|(^|[^[:alpha:]])(finding|bug|issue|severity|verdict|recommend|vulnerab|defect)|^#{1,3} '
 
 # SIGTERM (brief grace so agy can flush the stderr line we classify on) then a
 # tree-kill so any tool/helper subprocess agy spawned dies with it (no orphans).
@@ -639,6 +647,47 @@ retry=0
 hung_killed=0
 CUR_MODEL="$MODEL"       # model used this attempt (may switch on opt-in quota fallback)
 fallback_used=0
+
+# --- single-response directive (root cause 2026-06-23) -----------------------------------------
+# agy --print is an AGENTIC loop: it runs tools, edits files, and spawns background commands. On a
+# default analysis/review call that misbehaves — agy tries to ACT (run the gate/tests, spawn a
+# background task) and, when the action outlives the print turn, ENDS the turn narrating intent
+# ("I will wait for the background command…") instead of answering. That narration is non-empty, so
+# it slips past the empty-output gate yet carries no findings. agy exposes NO flag to disable tools,
+# and `agy --sandbox` does NOT confine writes (verified on-machine 2026-06-23), so the working lever
+# is a strict single-response directive prepended to the prompt: told not to use tools, agy answers
+# directly and does not touch files (verified). WRITE mode (--dangerously-skip-permissions, where agy
+# is MEANT to act) gets a lighter directive that only forbids the fatal background-and-wait. Opt out
+# entirely with GEMINI_NO_DIRECTIVE=1.
+WRITE_MODE=0
+for a in ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}; do [ "$a" = "--dangerously-skip-permissions" ] && WRITE_MODE=1; done
+EFFECTIVE_PROMPT="$RUN_DIR/.effective_prompt.txt"
+_DIRECTIVE=""
+if [ "${GEMINI_NO_DIRECTIVE:-0}" = "1" ]; then
+    EFFECTIVE_PROMPT="$PROMPT_FILE"
+else
+    if [ "$WRITE_MODE" -eq 1 ]; then
+        _DIRECTIVE="[non-interactive single-response mode] Complete the task FULLY within this one response. Run any commands synchronously and wait for them inline; do NOT spawn background tasks and end your turn waiting on one — there is no later turn, and a backgrounded task's result is lost. Finish with a complete summary of what you did and changed."
+    else
+        # Default (analysis/review) directive. READS ARE ALLOWED so documented usage like
+        # "/gemini summarize ./DESIGN.md" still works; only the agentic behaviors that caused the
+        # stall are forbidden (writes, command/test execution, background sub-tasks, narration).
+        _DIRECTIVE="[non-interactive single-response mode] Your reply is the ONLY thing captured — there is no later turn. You MAY read files to gather the context you need, but do NOT write or modify files, do NOT run shell commands or tests, and do NOT spawn background tasks or sub-tasks. Do NOT narrate the steps you intend to take and do NOT say you will continue or notify later. Produce your COMPLETE final answer in this single response."
+    fi
+    { printf '%s\n\n' "$_DIRECTIVE"; cat "$PROMPT_FILE"; } > "$EFFECTIVE_PROMPT"
+    # Validate the build actually contains BOTH the directive marker AND the appended prompt (size
+    # strictly greater than the directive alone). On ANY failure, surface it LOUDLY via degraded —
+    # never SILENTLY fall back to the agentic-capable raw prompt (panel finding 2026-06-23).
+    _dlen=$(printf '%s' "$_DIRECTIVE" | wc -c | tr -d ' ')
+    _elen=$(wc -c < "$EFFECTIVE_PROMPT" 2>/dev/null | tr -d ' '); _elen=${_elen:-0}
+    if [ ! -s "$EFFECTIVE_PROMPT" ] || ! grep -q 'single-response mode' "$EFFECTIVE_PROMPT" 2>/dev/null || [ "$_elen" -le "$_dlen" ]; then
+        mark_degraded "directive injection FAILED to build (RUN_DIR not writable?); ran with the RAW prompt — agy may go agentic / narrate. Inspect $RUN_DIR."
+        log_wd "directive: build FAILED (elen=$_elen dlen=$_dlen); falling back to raw PROMPT_FILE (surfaced via degraded)."
+        EFFECTIVE_PROMPT="$PROMPT_FILE"
+    fi
+fi
+log_wd "directive: write_mode=$WRITE_MODE no_directive=${GEMINI_NO_DIRECTIVE:-0} effective_prompt=$EFFECTIVE_PROMPT"
+
 while true; do
     CMD=( "$AGY_BIN"
           --print
@@ -660,7 +709,7 @@ while true; do
     # Prompt via stdin (safe for large diffs); response on stdout -> output.md.
     ( cd "$WORK_DIR" \
         && exec "${CMD[@]}" \
-            < "$PROMPT_FILE" \
+            < "$EFFECTIVE_PROMPT" \
             > "$OUTPUT_FILE" \
             2> "$STDERR_FILE" ) &
     PID=$!
@@ -673,6 +722,7 @@ while true; do
     hung_killed=0
     fast_failed=0
     empty_failed=0
+    narration_failed=0
     fail_kind=""
 
     while kill -0 "$PID" 2>/dev/null; do
@@ -744,7 +794,21 @@ while true; do
         fi
     fi
 
-    if [ "$exit_code" -eq 0 ] && [ "$hung_killed" -eq 0 ] && [ "$fast_failed" -eq 0 ] && [ "$empty_failed" -eq 0 ]; then
+    # Narration gate (default-mode backstop): the directive should prevent it, but if agy still ends
+    # on a FIRST-PERSON plan/narration with no answer, treat the attempt as failed so it retries and
+    # ultimately fails LOUDLY (never reported as done). Fires only on intent (tail) AND no-substance
+    # (full output) — see the _NARR_* patterns — so a third-person review describing background work
+    # is not flagged. Disabled in write mode and under GEMINI_NO_DIRECTIVE=1. The degraded marker is
+    # written only at terminal give-up (below), so a narration-then-retry-success is NOT marked.
+    if [ "$exit_code" -eq 0 ] && [ "$hung_killed" -eq 0 ] && [ "$fast_failed" -eq 0 ] && [ "$empty_failed" -eq 0 ] && [ "$WRITE_MODE" -eq 0 ] && [ "${GEMINI_NO_DIRECTIVE:-0}" != "1" ]; then
+        _otail="$(tail -3 "$OUTPUT_FILE" 2>/dev/null | tr '\n' ' ')"
+        if printf '%s' "$_otail" | grep -Eqi "$_NARR_INTENT" && ! grep -Eqi "$_NARR_SUBSTANCE" "$OUTPUT_FILE" 2>/dev/null; then
+            narration_failed=1
+            log_wd "narration gate: agy ended on a first-person plan/narration with no answer/substance; treating attempt as failed."
+        fi
+    fi
+
+    if [ "$exit_code" -eq 0 ] && [ "$hung_killed" -eq 0 ] && [ "$fast_failed" -eq 0 ] && [ "$empty_failed" -eq 0 ] && [ "$narration_failed" -eq 0 ]; then
         if [ "$fallback_used" -eq 1 ]; then
             mark_degraded "requested '$MODEL' hit quota; answered with Gemini fallback '$CUR_MODEL'"
         fi
@@ -821,6 +885,12 @@ while true; do
             write_status "failed"
             log_wd "giving up (empty output): agy returned no content after $((retry + 1)) attempt(s)"
             exit 1
+        elif [ "${narration_failed:-0}" -eq 1 ]; then
+            write_status "failed"
+            mark_degraded "agy narrated intended actions instead of answering (agentic print-mode stall); output.md is not a usable answer."
+            log_wd "giving up (narration, no answer): agy narrated intended actions / waited on a background task instead of answering, after $((retry + 1)) attempt(s). Agentic print-mode stall on a tool/test-running task; the single-response directive should prevent this — if it persists, simplify the prompt, or run with --full-auto so agy is meant to act."
+            printf 'GEMINI narration: agy returned a plan/narration, not an answer (agentic print-mode stall). See output.md.\n' >> "$STDERR_FILE" 2>/dev/null || true
+            exit 1
         else
             # Normalize any agy failure to exit 1 (the contract's "agy failed"
             # code). agy's raw code is logged; returning it verbatim could be 2
@@ -837,6 +907,6 @@ while true; do
 
     retry=$((retry + 1))
     write_status "retrying"
-    log_wd "retry $retry/$MAX_RETRIES after exit=$exit_code hung=$hung_killed fast=$fast_failed empty=$empty_failed kind=${fail_kind:-none}"
+    log_wd "retry $retry/$MAX_RETRIES after exit=$exit_code hung=$hung_killed fast=$fast_failed empty=$empty_failed narration=$narration_failed kind=${fail_kind:-none}"
     sleep "$RETRY_BACKOFF_SEC"
 done
