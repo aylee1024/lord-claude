@@ -25,7 +25,7 @@
        …all five vassals run under run_with_watchdog.sh — no hangs, no orphans, no excuses.
 ```
 
-Five Claude Code skills that make OpenAI **Codex**, Google **Gemini**, xAI **Grok**, and Cursor **Composer** behave like obedient Claude subagents. You type `/codex`, `/gemini`, `/grok`, or `/composer`; the lord delegates the sub-task, a watchdog stands over the CLI with a whip, and the result comes back clean. `/review-panel` summons a diverse set at once to review your diff — then an adjudicator **re-runs every finding** and blocks the commit only on the ones it can reproduce.
+Five Claude Code skills that make OpenAI **Codex**, Google **Gemini**, xAI **Grok**, and Cursor **Composer** behave like obedient Claude subagents. You type `/codex`, `/gemini`, `/grok`, or `/composer`; the lord delegates the sub-task, a watchdog stands over the CLI with a whip, and the result comes back clean. `/review-panel` summons a diverse set at once to review your diff — then an adjudicator **re-runs every finding** and blocks the commit only on the ones it can reproduce. And when one task isn't enough, [`agents`](#keep-a-vassal-at-your-side-live-sessions) keeps a vassal **warm at your side** — a standing conversation it remembers turn to turn, just like messaging Claude's own subagents.
 
 > Bare `codex exec`, `agy --print`, and `grok -p` have sharp edges: startup auth hangs, silent model-drift across versions, `cmd &` orphans the harness never hears back from, parallel runs clobbering one output file. The whip is `run_with_watchdog.sh` — per-run dir, a status file you can poll, stderr fast-fail, one retry. It turns *"the CLI usually works"* into *"the CLI always works the same way."*
 
@@ -50,7 +50,7 @@ Clone once, symlink all five:
 ```bash
 git clone https://github.com/aylee1024/lord-claude.git
 mkdir -p ~/.claude/skills
-for s in codex gemini grok composer review-panel; do ln -s "$PWD/lord-claude/$s" ~/.claude/skills/$s; done
+for s in codex gemini grok composer review-panel _session; do ln -s "$PWD/lord-claude/$s" ~/.claude/skills/$s; done
 ```
 
 <details><summary>…or <code>curl</code> a single skill into place</summary>
@@ -98,6 +98,30 @@ chmod +x adjudicate.sh tests/test_adjudicate.sh
 Poll a run with `status.sh`, continue one with `/grok --resume …`, and reap old runs with `prune_old_runs.sh`. The anti-pattern to avoid — a single Bash call backgrounding N `nohup` processes — is documented in the SKILL files (the harness sees only one notification and the whip can't supervise them).
 
 > **Worktree isolation.** For risky `--full-auto` builds, add `--isolate`: the vassal runs inside a throwaway `git worktree` so it physically can't touch your live tree (the lord protects the realm). Fails *closed* — if it can't make a clean worktree, it refuses rather than run loose. For `/grok` and `/composer` the confinement is OS-enforced (Seatbelt), and caller flags that would rebind the workspace (`--cwd`/`--sandbox`/`--worktree`) are refused.
+
+## Keep a vassal at your side (live sessions)
+
+The five commands above each send a vassal off to do **one** task and report back. Sometimes you want one to *stay* — a standing conversation it remembers turn to turn, exactly like messaging one of Claude's own subagents. That's `agents`:
+
+```bash
+agents start grok --handle rev1 --cwd .          # summon a warm vassal, give it a name
+agents send  --to rev1 "Review ./auth for bypasses."
+agents send  --to rev1 "Now the token-refresh path — anything there?"   # it remembers the review
+agents list                                      # who's at court
+agents stop  --to rev1
+```
+
+One unified command addresses **any** engine by handle; each stays warm in memory and keeps the whole thread:
+
+| Engine | How it stays warm |
+|---|---|
+| **grok / composer** | `grok agent stdio` — a real ACP session, streaming, its tools run client-side |
+| **codex** | `codex mcp-server` — `codex-reply` continues the same thread |
+| **gemini** | `agy -i` held under a pseudo-terminal; each turn's end **and reply** are read from Antigravity's own SQLite store |
+
+**Read-only by default** — grok/composer get *no write channel at all* (and reads are confined to the session's `--cwd`); codex runs `sandbox=read-only`. `--full-auto` hands over a file-write + terminal bridge (grok/composer) or `workspace-write` (codex). One honest caveat: **gemini has no enforceable read-only mode** — Antigravity simply doesn't offer one — so a gemini session chats and reasons but isn't write-sandboxed; point it at a throwaway `--cwd` if that matters. Live sessions live in their own `/tmp/agent_sessions/<handle>/` and never touch the one-shot machinery or `/review-panel`.
+
+> Each engine speaks a different dialect under the hood — ACP JSON-RPC, MCP, or a terminal plus a database tail — but `agents` makes them one court you address the same way. The daemon supervises each session like the watchdog supervises a one-shot run: atomic status, a heartbeat, zombie-reaping process-group kill. Full docs in [`_session/SKILL.md`](./_session/SKILL.md).
 
 ## Why the vassals never break loose
 

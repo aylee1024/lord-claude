@@ -30,7 +30,7 @@
 #   output.md     agy's response (plain text stdout)
 #   stderr.log    agy stderr
 #   watchdog.log  this wrapper's supervision log
-#   session.txt   conversation marker (best-effort; agy print-mode has no id)
+#   session.txt   conversation id (best-effort: newest .db uuid; agy print-mode emits none directly)
 #   status        starting | running | retrying | done | failed | hung_killed | aborted
 #   pid           agy PID while running; removed on terminal status
 #   degraded      (optional) note when the answer is degraded (model downgrade or
@@ -702,6 +702,7 @@ while true; do
 
     log_wd "attempt $retry argv: ${CMD[*]}"
 
+    _agy_spawn_epoch="$(date +%s)"   # for the post-success conversation-db capture (avoid a concurrent run's db)
     : > "$OUTPUT_FILE"
     : > "$STDERR_FILE"
 
@@ -812,9 +813,23 @@ while true; do
         if [ "$fallback_used" -eq 1 ]; then
             mark_degraded "requested '$MODEL' hit quota; answered with Gemini fallback '$CUR_MODEL'"
         fi
-        # Best-effort conversation marker. agy print-mode does not emit an id;
-        # `resume latest`/--continue is the supported follow-up path.
-        printf 'agy-print (no conversation id; use --resume for --continue)\n' > "$SESSION_FILE"
+        # Capture this run's conversation id so a follow-up `resume <id>` can use --conversation
+        # precisely. agy print-mode emits no id, but it persists the conversation as the newest
+        # ~/.gemini/antigravity-cli/conversations/<uuid>.db; record that uuid (empty => resume --continue).
+        _conv_dir="${AGY_CONV_DIR:-$HOME/.gemini/antigravity-cli/conversations}"
+        # Pick the newest db modified at/after THIS attempt's agy spawn, so a concurrent agy run's
+        # conversation cannot poison this run's resume id (panel finding 2026-06-23).
+        _newest_db=""; _best_m=0
+        for _f in "$_conv_dir"/*.db; do
+            [ -e "$_f" ] || continue
+            _m="$(stat -f %m "$_f" 2>/dev/null || echo 0)"
+            if [ "$_m" -ge "${_agy_spawn_epoch:-0}" ] && [ "$_m" -ge "$_best_m" ]; then _best_m="$_m"; _newest_db="$_f"; fi
+        done
+        if [ -n "$_newest_db" ]; then
+            basename "$_newest_db" .db > "$SESSION_FILE"
+        else
+            : > "$SESSION_FILE"
+        fi
         # Dual-write for parity with codex skill consumers.
         cp "$SESSION_FILE" /tmp/gemini_session.txt 2>/dev/null || true
         write_status "done"
