@@ -29,6 +29,16 @@ Five Claude Code skills that make OpenAI **Codex**, Google **Gemini**, xAI **Gro
 
 > Bare `codex exec`, `agy --print`, and `grok -p` have sharp edges: startup auth hangs, silent model-drift across versions, `cmd &` orphans the harness never hears back from, parallel runs clobbering one output file. The whip is `run_with_watchdog.sh` — per-run dir, a status file you can poll, stderr fast-fail, one retry. It turns *"the CLI usually works"* into *"the CLI always works the same way."*
 
+## ✦ What the court can do
+
+- **🗡 Five rival engines, one harness.** Codex, Gemini, Grok, and Composer (plus an Opus skeptic in panels) all answer to the same supervised contract — so each one *always works the same way*, not "usually."
+- **💬 Message them like Claude's own subagents.** `agents` holds a **warm, multi-turn session** with any engine: address it by handle, it stays alive in memory and remembers the whole thread. One verb-set (`start · send · read · list · stop`) for every model.
+- **⚖ A review court that checks itself.** `/review-panel` runs a diverse set in parallel, then an adjudicator **re-runs every HIGH+ finding in a throwaway `git worktree`** and blocks the commit *only on what it can reproduce* — never on confident prose.
+- **🛡 Read-only by default; real isolation on demand.** A delegated review can't touch your tree — OS-enforced Seatbelt for grok/composer one-shots, capability-gated + cwd-confined for live sessions, `sandbox=read-only` for codex. `--full-auto` to let it act, `--isolate` for a throwaway worktree that **fails closed**.
+- **🐶 No hangs, no orphans, no silent drift.** The watchdog kills a startup-auth hang within one poll cycle, pins the model explicitly so it can't drift across CLI versions, supervises the CLI as a foreground child so completion notifications actually fire, and hands every run its own directory.
+- **🔀 Real model diversity, counted honestly.** Grok + Composer ride one CLI; Gemini rides Antigravity `agy`; the panel's gate counts distinct model *lineages*, not seats — so "diverse" means diverse.
+- **🧪 Hardened in the open.** Every skill ships its own regression suite; the live-session daemon was forged through **two adversarial multi-model panels** and live-verified on all four engines. No fake green.
+
 ## The five vassals
 
 | Command | What it does | Engine under the whip |
