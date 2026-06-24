@@ -67,6 +67,9 @@ for raw in sys.stdin:
             resp = read_one()
             err = (resp or {}).get("error") if resp else None
             reply_turn(mid, "terminal denied" if err else "terminal ok")
+        elif "HANGNOW" in text:
+            __import__("time").sleep(30)        # never reply within HANG_SEC -> a hung turn
+            reply_turn(mid, "late")
         else:
             m = re.search(r'number\s+(\d+)', text, re.I)
             if m and "remember" in text.lower():
@@ -270,6 +273,15 @@ python3 "$AG" start grok --handle "../SENTINEL_KEEP" --cwd "$ROOT" >/dev/null 2>
 chk "traversal handle rejected (exit 2)" "$rc" 2
 chk "sentinel dir survived (no rmtree escape)" "$([ -d "$SENTINEL" ] && echo yes || echo no)" "yes"
 python3 "$AG" start grok --handle "bad/name" --cwd "$ROOT" >/dev/null 2>&1; chk "slash handle rejected" "$?" 2
+
+echo "== hang surfacing: a hung turn -> error to caller + hung_killed + fast-fail follow-ups =="
+SESSION_HANG_SEC=2 python3 "$AG" start grok --handle thang --cwd "$ROOT" >/dev/null 2>&1
+HOUT="$(python3 "$AG" send --to thang "HANGNOW please" 2>&1)"
+has "hung turn returns an error to the caller (not silence)" "$HOUT" "timed out"
+sleep 1
+chk "hung session marked hung_killed" "$(cat "$AGENT_SESSIONS_DIR/thang/status" 2>/dev/null)" "hung_killed"
+FF="$(python3 "$AG" send --to thang "again?" 2>&1)"
+has "follow-up to hung session fast-fails (no infinite wait)" "$FF" "not live"
 
 echo "== gc sweeps non-live (unknown/corrupt) session dirs =="
 Z="$AGENT_SESSIONS_DIR/zombie"; mkdir -p "$Z"; echo unknown > "$Z/status"; echo 999999 > "$Z/wd_pid"

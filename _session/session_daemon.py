@@ -1122,6 +1122,18 @@ class Daemon:
                 self._append_turn(n, text, reply, "done")
                 self.log(f"turn {n} done ({len(reply or '')} chars)")
                 result = {"reply": reply, "reply_file": rf}
+            except TimeoutError as e:
+                # a turn that blows the per-turn HANG budget leaves the backend mid-work in an unknown
+                # state — end the session LOUDLY (hung_killed) rather than limp on idle and risk a
+                # crossed reply on the next turn. The caller still gets the error immediately.
+                self.log(f"turn {n} TIMED OUT -> hung_killed: {e}")
+                try:
+                    self._append_turn(n, text, "", "hung")
+                except Exception:
+                    pass
+                err = f"turn timed out (hung); session ended: {e}"
+                self._terminal_reason = "hung_killed"
+                self._stop.set()
             except Exception as e:
                 self.log(f"turn {n} FAILED: {repr(e)}")
                 try:
