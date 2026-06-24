@@ -41,6 +41,29 @@ agents read  --to rev1 --turn 1
 agents stop  --to rev1
 ```
 
+## Surfacing completion, failure & hangs (don't run long sends blind)
+
+A long `agents send` is a long-running Bash command, and the harness fires a reliable completion
+notification only for a Bash call launched with **`run_in_background: true`** (it gets a registered task
+id). A plain foreground long call can be silently auto-backgrounded by the harness with **no ping** — the
+turn finishes but nothing tells you. So:
+
+- **For a turn that may take a while, launch `agents send` with `run_in_background: true`.** Foreground
+  `send` blocks until the turn reaches a terminal state, then returns the reply (done) or an error
+  (failed/hung) — so the harness pings you exactly when the turn is truly over. This is the surfacing-safe path.
+- **A quick turn** can be a normal foreground call (it returns in seconds; nothing to auto-background).
+- **`--bg` (daemon-side) gives NO ping.** It returns a turn id immediately and the turn runs inside the
+  daemon; use it only when you will poll (`agents status --to H` / `agents read --to H --turn N`).
+- **Never wrap a send in shell `&`/`nohup`** — that detaches it and the harness considers the work done at once.
+
+The daemon makes all three states **pollable no matter what**, so a missed ping degrades to "check the
+file," never to "unknown":
+- **completion** → `status` returns to `idle`, the reply is in `outbox/<n>.md`, `turns.jsonl` logs `done`.
+- **failure** → the `send` returns an error; `turns.jsonl` logs `failed`.
+- **hang** → after `SESSION_HANG_SEC` (default 900s) the turn is abandoned, the `send` returns a timeout
+  error, and the session is marked **`hung_killed`** (terminal) so later sends fast-fail instead of blocking.
+  A daemon that dies entirely shows as `(stale)` in `agents list` and makes `send` fast-fail (dead `wd_pid`).
+
 ## How each engine stays warm (verified on-machine 2026-06-23)
 
 | Engine | Mechanism | Tier-2 reality |
