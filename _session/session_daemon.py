@@ -18,7 +18,7 @@ Live sessions live under their own namespace (default /tmp/agent_sessions/<handl
 Session dir files: status, session.txt, pid, wd_pid, daemon.log, stderr.log, meta.json,
 turns.jsonl, outbox/<n>.md, inbox/, control.sock.
 """
-import argparse, glob, json, os, queue, shutil, signal, socket, sqlite3, subprocess, sys, threading, time, traceback
+import argparse, concurrent.futures, glob, json, os, queue, shutil, signal, socket, sqlite3, subprocess, sys, threading, time, traceback
 
 # ---- timing knobs (mirror run_with_watchdog.sh) ----
 HEARTBEAT_SEC = int(os.environ.get("SESSION_HEARTBEAT_SEC", "30"))
@@ -111,6 +111,10 @@ class JsonRpcStdioClient:
         self._wlock = threading.Lock()    # serialises writes to stdin
         self._plock = threading.Lock()    # guards _id + _pending
         self._pending = {}
+        # bounded pool for server->client requests (fs/terminal) — off the reader thread, but capped so a
+        # full-auto agent spawning many long terminal waits can't create unbounded threads
+        self._srv_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=int(os.environ.get("SESSION_MAX_SERVER_THREADS", "16")), thread_name_prefix="srvreq")
         self._reader = threading.Thread(target=self._read_loop, name="jsonrpc-reader", daemon=True)
         self._reader.start()
 
@@ -144,8 +148,12 @@ class JsonRpcStdioClient:
                 box.set_error(msg["error"]) if "error" in msg else box.set_result(msg.get("result", {}))
             return
         if "method" in msg and "id" in msg:
-            # off-thread so the reader keeps draining stdout while a handler runs
-            threading.Thread(target=self._serve_server_request, args=(msg,), daemon=True).start()
+            # off-thread (pooled) so the reader keeps draining stdout while a handler runs
+            try:
+                self._srv_pool.submit(self._serve_server_request, msg)
+            except RuntimeError:   # pool shut down during teardown
+                self._send_raw_safe({"jsonrpc": "2.0", "id": msg["id"],
+                                     "error": {"code": -32000, "message": "shutting down"}})
             return
         if "method" in msg:
             try:
@@ -201,6 +209,10 @@ class JsonRpcStdioClient:
 
     def stop(self):
         _kill_tree(self.proc.pid, self.log)
+        try:
+            self._srv_pool.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
         for stream in (self.proc.stdin, self.proc.stdout):
             try:
                 stream.close()
@@ -234,9 +246,12 @@ class Backend:
 
 
 def _confine(path, base, what):
-    """Resolve `path` and require it to live under `base` (the session cwd)."""
-    rp = os.path.realpath(path)
+    """Resolve `path` and require it to live under `base` (the session cwd). A relative path is joined
+    to `base`, not the daemon's own cwd."""
     rbase = os.path.realpath(base)
+    if not os.path.isabs(path):
+        path = os.path.join(rbase, path)
+    rp = os.path.realpath(path)
     if rp != rbase and not rp.startswith(rbase + os.sep):
         raise RpcError({"code": -32001, "message": f"{what} denied: '{path}' is outside the session cwd"})
     return rp
@@ -260,6 +275,7 @@ class AcpBackend(Backend):
         self._collector = None
         self._terminals = {}
         self._term_seq = 0
+        self._stopping = False
         self._tlock = threading.Lock()
 
     def _client_capabilities(self):
@@ -337,8 +353,12 @@ class AcpBackend(Backend):
             if isinstance(kv, dict) and "name" in kv:
                 env[kv["name"]] = kv.get("value", "")
         proc = subprocess.Popen(cmd, shell=True, cwd=cwd, env=env, start_new_session=True,
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
         with self._tlock:
+            if self._stopping:
+                # the session is shutting down; don't leave an orphan that survives daemon exit
+                _kill_tree(proc.pid, self.log)
+                raise RpcError({"code": -32002, "message": "session is stopping"})
             self._term_seq += 1
             tid = "t%d" % self._term_seq
             entry = {"proc": proc, "chunks": []}
@@ -346,7 +366,7 @@ class AcpBackend(Backend):
 
         def drain():
             try:
-                for line in proc.stdout:
+                for line in proc.stdout:        # errors="replace" -> non-UTF-8 output can't kill the drain
                     entry["chunks"].append(line)
             except Exception:
                 pass
@@ -369,7 +389,7 @@ class AcpBackend(Backend):
         if not t:
             return {"output": "", "exitStatus": {"exitCode": 127}}
         rc = t["proc"].poll()
-        return {"output": "".join(t["chunks"]),
+        return {"output": "".join(t["chunks"][:]),   # snapshot: drain thread may append concurrently
                 "exitStatus": ({"exitCode": rc} if rc is not None else None)}
 
     def _term_kill(self, params):
@@ -398,6 +418,7 @@ class AcpBackend(Backend):
 
     def stop(self):
         with self._tlock:
+            self._stopping = True
             terms = list(self._terminals.values())
             self._terminals.clear()
         for t in terms:
@@ -569,6 +590,8 @@ def _pb_scan(blob, depth=0, out=None, path=()):
 def _extract_gemini_reply(payload):
     """Assistant reply text is at protobuf path (20,1) of a type-15 step (verified on-machine);
     (20,8) duplicates it, (20,6) is the bot id."""
+    if payload is None:
+        return ""
     strings = _pb_scan(bytes(payload))
     texts = [s for p, s in strings if p == (20, 1)]
     if not texts:
@@ -618,7 +641,13 @@ class PtyDbBackend(Backend):
     def _spawn(self, first_text):
         import pty, fcntl, termios, struct
         # build argv + env in the PARENT; the child does only async-signal-safe syscalls + execve
-        agy_bin = shutil.which("agy") or "agy"
+        agy_bin = shutil.which("agy") or os.path.expanduser("~/.local/bin/agy")
+        if not os.path.exists(agy_bin):
+            raise RuntimeError("agy binary not found (PATH or ~/.local/bin)")
+        # the first prompt rides argv (agy -i requires it); guard against ARG_MAX/E2BIG on huge inputs
+        if len(first_text.encode("utf-8")) > 128 * 1024:
+            raise RuntimeError(f"gemini first message too large for argv ({len(first_text)} chars); "
+                               "send a shorter first message (follow-ups have no limit) or use one-shot /gemini")
         argv = ["agy", "--model", self.model]
         if self.full_auto:
             argv.append("--dangerously-skip-permissions")
@@ -639,10 +668,11 @@ class PtyDbBackend(Backend):
                     fcntl.ioctl(0, termios.TIOCSCTTY, 0)
                 except Exception:
                     pass
+                os.closerange(3, 1024)   # don't leak the daemon's fds (incl. the pty master) into agy
                 try:
                     os.chdir(cwd)
                 except Exception:
-                    pass
+                    os._exit(126)         # confinement depends on cwd — fail rather than run in the wrong place
                 os.execve(agy_bin, argv, child_env)
             except Exception:
                 pass
@@ -675,7 +705,19 @@ class PtyDbBackend(Backend):
     def is_alive(self):
         if not self._started:
             return True
-        return self._pid is not None and _pid_alive(self._pid)
+        if self._pid is None:
+            return False
+        try:
+            r, _ = os.waitpid(self._pid, os.WNOHANG)   # reap a naturally-exited agy zombie
+            if r == self._pid:
+                self._pid = None
+                return False
+        except ChildProcessError:
+            self._pid = None
+            return False
+        except Exception:
+            pass
+        return _pid_alive(self._pid)
 
     def child_pid(self):
         return self._pid
@@ -691,23 +733,45 @@ class PtyDbBackend(Backend):
     def _max_idx(self):
         if not self._conv_db:
             return -1
-        try:
-            rows = self._query("SELECT COALESCE(MAX(idx),-1) FROM steps")
-            return rows[0][0] if rows else -1
-        except Exception:
-            return -1
+        last = None
+        for _ in range(5):
+            try:
+                rows = self._query("SELECT COALESCE(MAX(idx),-1) FROM steps")
+                return rows[0][0] if rows else -1
+            except Exception as e:
+                last = e
+                time.sleep(0.2)
+        # an established db that won't read is a real error — fail the turn loudly rather than return
+        # -1, which would make old rows look fresh and replay a stale reply
+        raise RuntimeError(f"gemini db unreadable: {last}")
 
-    def _wait_new_db(self, timeout=45):
-        """Prefer a brand-new db path (almost certainly this run's); fall back to an mtime-advanced one."""
+    def _db_user_text(self, path):
+        try:
+            con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+            try:
+                rows = con.execute("SELECT step_payload FROM steps WHERE step_type=14").fetchall()
+            finally:
+                con.close()
+            return b" ".join(bytes(r[0]) for r in rows if r[0])
+        except Exception:
+            return b""
+
+    def _wait_new_db(self, prompt, timeout=45):
+        """Return the brand-new db this `agy -i` run creates. We do NOT fall back to an mtime-advanced
+        EXISTING db — that would bind to (and replay) another conversation's rows. If several brand-new
+        dbs appear at once (concurrent agy), pick the one whose user row contains this prompt."""
         deadline = time.time() + timeout
+        snip = prompt.strip()[:32].encode("utf-8", "replace")
         while time.time() < deadline:
             cur = self._db_mtimes()
-            fresh = [p for p in cur if p not in self._pre_snapshot]
-            if fresh:
-                return max(fresh, key=lambda p: cur[p])
-            advanced = [(m, p) for p, m in cur.items() if self._pre_snapshot.get(p, 0) < m]
-            if advanced:
-                return max(advanced)[1]
+            fresh = sorted((p for p in cur if p not in self._pre_snapshot),
+                           key=lambda p: cur[p], reverse=True)
+            if snip:
+                for p in fresh:
+                    if snip in self._db_user_text(p):
+                        return p
+            if len(fresh) == 1:
+                return fresh[0]
             time.sleep(0.5)
         return None
 
@@ -761,13 +825,15 @@ class PtyDbBackend(Backend):
             payload = b"\x1b[200~" + text.encode() + b"\x1b[201~\r"
         else:
             payload = text.encode() + b"\r"
-        os.write(self._master, payload)
+        view = memoryview(payload)
+        while view:                      # os.write may write fewer bytes than requested
+            view = view[os.write(self._master, view):]
 
     def _send(self, text):
         if not self._started:
             self._pre_snapshot = self._db_mtimes()
             self._spawn(text)
-            self._conv_db = self._wait_new_db()
+            self._conv_db = self._wait_new_db(text)
             if not self._conv_db:
                 raise RuntimeError("gemini conversation db did not appear")
             uuid = os.path.splitext(os.path.basename(self._conv_db))[0]
@@ -828,6 +894,7 @@ class Daemon:
         self.turn_q = queue.Queue()
         self.turn_counter = 0
         self._counter_lock = threading.Lock()
+        self._status_lock = threading.Lock()
         self.last_activity = time.time()
         self.active_turn_started = None
         self._stop = threading.Event()
@@ -844,12 +911,17 @@ class Daemon:
         except Exception:
             pass
 
-    def write_status(self, s):
-        self.status = s
-        tmp = self._p("status.tmp")
-        with open(tmp, "w") as f:
-            f.write(s + "\n")
-        os.replace(tmp, self._p("status"))
+    def write_status(self, s, only_if_live=False):
+        # one writer at a time + a unique temp file (concurrent writers sharing status.tmp could race);
+        # only_if_live makes the worker's idle-write lose to a concurrent terminal status atomically.
+        with self._status_lock:
+            if only_if_live and self._stop.is_set():
+                return
+            tmp = self._p(f"status.{os.getpid()}.{threading.get_ident()}.tmp")
+            with open(tmp, "w") as f:
+                f.write(s + "\n")
+            os.replace(tmp, self._p("status"))
+            self.status = s
 
     def _write(self, name, content):
         tmp = self._p(name + ".tmp")
@@ -1008,6 +1080,8 @@ class Daemon:
             f = self._p("outbox", f"{n}.md")
             return {"ok": True, "turn": n, "reply": (open(f).read() if os.path.exists(f) else "")}
         if op == "send":
+            if self._stop.is_set():
+                return {"ok": False, "error": "session is stopping"}
             with self._counter_lock:
                 self.turn_counter += 1
                 n = self.turn_counter
@@ -1032,12 +1106,15 @@ class Daemon:
                 n, text, box = self.turn_q.get(timeout=POLL_SEC)
             except queue.Empty:
                 continue
-            self.active_turn_started = time.time()
-            self.write_status("busy")
-            self.log(f"turn {n} start ({len(text)} chars)")
             result = None
             err = None
             try:
+                # everything that can throw (incl. write_status) is inside the try, so the finally
+                # ALWAYS sets the caller's box — a status-write failure can never silently kill the
+                # worker and wedge the session for HANG_SEC (Opus 2nd-panel finding).
+                self.active_turn_started = time.time()
+                self.write_status("busy")
+                self.log(f"turn {n} start ({len(text)} chars)")
                 reply = self.backend.send(text)
                 rf = self._p("outbox", f"{n}.md")
                 with open(rf, "w") as f:
@@ -1047,15 +1124,20 @@ class Daemon:
                 result = {"reply": reply, "reply_file": rf}
             except Exception as e:
                 self.log(f"turn {n} FAILED: {repr(e)}")
-                self._append_turn(n, text, "", "failed")
-                err = str(e)
+                try:
+                    self._append_turn(n, text, "", "failed")
+                except Exception:
+                    pass
+                err = str(e) or "turn failed"
             finally:
                 self.active_turn_started = None
                 self.last_activity = time.time()
-                if not self._stop.is_set():
-                    self.write_status("idle")
-                # settle the status write BEFORE unblocking the caller, so a stop/idle the caller
-                # triggers next can't race this idle write past the terminal status
+                try:
+                    self.write_status("idle", only_if_live=True)
+                except Exception:
+                    pass
+                # settle status BEFORE unblocking the caller, so a stop/idle it triggers next can't
+                # race this idle write past the terminal status
                 if box:
                     box.set_error(err) if err is not None else box.set_result(result)
 
@@ -1104,6 +1186,14 @@ class Daemon:
             os.unlink(self._p("control.sock"))
         except Exception:
             pass
+        # error any still-queued turns so foreground callers waiting on them unblock immediately
+        while True:
+            try:
+                _, _, box = self.turn_q.get_nowait()
+            except queue.Empty:
+                break
+            if box:
+                box.set_error("session stopped before this turn ran")
         self.write_status(self._terminal_reason if self._terminal_reason in TERMINAL_STATES else "done")
 
 

@@ -264,6 +264,19 @@ sleep 2
 LST3="$(SESSION_STALE_SEC=1 python3 "$AG" list 2>/dev/null)"
 has "killed daemon shows stale" "$LST3" "stale"
 
+echo "== security: handle traversal cannot escape / delete arbitrary dirs =="
+SENTINEL="$ROOT/SENTINEL_KEEP"; mkdir -p "$SENTINEL"
+python3 "$AG" start grok --handle "../SENTINEL_KEEP" --cwd "$ROOT" >/dev/null 2>&1; rc=$?
+chk "traversal handle rejected (exit 2)" "$rc" 2
+chk "sentinel dir survived (no rmtree escape)" "$([ -d "$SENTINEL" ] && echo yes || echo no)" "yes"
+python3 "$AG" start grok --handle "bad/name" --cwd "$ROOT" >/dev/null 2>&1; chk "slash handle rejected" "$?" 2
+
+echo "== gc sweeps non-live (unknown/corrupt) session dirs =="
+Z="$AGENT_SESSIONS_DIR/zombie"; mkdir -p "$Z"; echo unknown > "$Z/status"; echo 999999 > "$Z/wd_pid"
+touch -t 200001010000 "$Z/daemon.log" 2>/dev/null
+python3 "$AG" gc --days 0 >/dev/null 2>&1
+chk "gc removed unknown-status dir" "$([ -d "$Z" ] && echo yes || echo no)" "no"
+
 echo
 echo "==================================="
 echo "PASS=$PASS  FAIL=$FAIL"

@@ -15,7 +15,7 @@ Addresses any engine by a stable handle, the way Claude Code messages a named su
 Sessions live under /tmp/agent_sessions/<handle>/ (own namespace; one-shot /tmp/<skill>_runs untouched).
 Control channel: the daemon's unix socket, with an inbox/ file-drop fallback.
 """
-import argparse, json, os, shutil, socket, subprocess, sys, time
+import argparse, json, os, re, shutil, socket, subprocess, sys, time
 
 BASE_DIR = os.environ.get("AGENT_SESSIONS_DIR", "/tmp/agent_sessions")
 DAEMON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "session_daemon.py")
@@ -26,8 +26,21 @@ DEFAULT_MODEL = {"grok": "grok-build", "composer": "grok-composer-2.5-fast",
                  "codex": "gpt-5.5", "gemini": "Gemini 3.5 Flash (High)"}
 
 
+_HANDLE_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]*$')
+
+
 def sdir(handle):
-    return os.path.join(BASE_DIR, handle)
+    # a handle is a SINGLE path component of safe chars — never a path that could escape BASE_DIR
+    # (a traversal handle would make cmd_start's rmtree delete an arbitrary directory).
+    if not handle or not _HANDLE_RE.match(handle):
+        print(f"invalid handle '{handle}': use letters/digits/_/-/. starting alphanumeric (no '/')",
+              file=sys.stderr)
+        sys.exit(2)
+    d = os.path.join(BASE_DIR, handle)
+    if os.path.dirname(os.path.realpath(d)) != os.path.realpath(BASE_DIR):
+        print(f"handle '{handle}' escapes the sessions dir", file=sys.stderr)
+        sys.exit(2)
+    return d
 
 
 def read_file(p, default=""):
@@ -133,7 +146,9 @@ def cmd_start(a):
     d = sdir(a.handle)
     if os.path.isdir(d):
         st, stale = session_status(d)
-        if st in LIVE_STATES and not stale:
+        wd = read_file(os.path.join(d, "wd_pid"))
+        wd_dead = bool(wd) and not pid_alive(wd)   # a just-killed daemon has a fresh log but a dead pid
+        if st in LIVE_STATES and not stale and not wd_dead:
             print(f"handle '{a.handle}' already live (status={st}) at {d}", file=sys.stderr)
             return 2
         # dead or stale handle: clear the old session dir so the name can be reused
@@ -245,7 +260,7 @@ def cmd_list(a):
         return 0
     rows = []
     for h in sorted(os.listdir(BASE_DIR)):
-        d = sdir(h)
+        d = os.path.join(BASE_DIR, h)   # iterating existing dirs; do not re-validate the name
         if not os.path.isdir(d):
             continue
         st, stale = session_status(d)
@@ -289,11 +304,11 @@ def cmd_gc(a):
     removed = 0
     import shutil
     for h in os.listdir(BASE_DIR):
-        d = sdir(h)
+        d = os.path.join(BASE_DIR, h)   # iterating existing dirs; do not re-validate the name
         if not os.path.isdir(d):
             continue
         st, stale = session_status(d)
-        dead = stale or st in ("done", "failed", "hung_killed", "aborted", "stopped")
+        dead = stale or st not in LIVE_STATES   # also sweeps "unknown"/empty/corrupt status
         try:
             old = os.path.getmtime(os.path.join(d, "daemon.log")) < cutoff
         except OSError:
