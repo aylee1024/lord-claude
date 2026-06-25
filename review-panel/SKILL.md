@@ -76,5 +76,38 @@ It re-runs each HIGH+ `repro_command` in ONE hardened worktree (installs banned,
 - Use the explicit codex sandbox form `--sandbox workspace-write -c approval_policy=never` if a reviewer must execute (prefer it over the undocumented `--full-auto`); but by default reviewers do NOT execute — the adjudicator does.
 - Gemini-via-agy can error on auth/quota (`RESOURCE_EXHAUSTED`, `IneligibleTier`, `UNSUPPORTED_CLIENT`) or time out. When it does, the family preflight in step 5 makes the result **PROVISIONAL automatically** — you no longer rely on remembering to check. To restore full diversity: retry; or note that Antigravity quota is **account-wide** (a Flash↔Pro tier switch will NOT help under quota — wait for reset); or substitute a second Opus pass labelled "standing in for Gemini" — but a substituted same-family pass does NOT restore the 3rd family, so the result stays PROVISIONAL until a real Gemini (or other third family) re-clears it. (The watchdog also self-heals any stale gemini-cli `GEMINI_MODEL` id by remapping it to the agy default.)
 
+## Live multi-round mode (optional; composes the `agents` live-session system)
+
+The one-shot flow above is **unchanged and remains the default.** When a wave needs **re-verification rounds in retained context** — the panel reviews, the adjudicator reproduces, then each seat *revises against its own reproduction result* without re-reading the whole diff — run the panel as warm `agents` sessions instead of one-shot watchdog calls. This composes the live-session features: `--schema` (each seat returns valid findings JSON), fan-out (issue/refresh all seats at once), and `--follow` (watch a slow seat stream). **`adjudicate.sh` and `findings.schema.json` are consumed verbatim — nothing about the gate changes.**
+
+The diversity invariant is identical: the same seats/families, same 3-family floor, same `--families` preflight. The live `agents` system covers the grok/composer/codex/gemini seats; the **opus-skeptic stays on the `Agent` tool** (`model: opus`) exactly as in one-shot — it has no `agents` backend.
+
+**Round 1 — start a warm session per seat, send its role prompt with the findings schema:**
+```bash
+A=~/.claude/skills/_session/agents
+SCH=~/.claude/skills/review-panel/findings.schema.json
+for seat in codex:rp-cdomain codex:rp-cinteg gemini:rp-gemini grok:rp-grok composer:rp-composer; do
+  eng=${seat%%:*}; h=${seat##*:}
+  "$A" start "$eng" --handle "$h" --cwd "$REPO" >/dev/null   # read-only by default (reviewers don't execute)
+done
+# send each seat its role-specialized prompt; --schema forces valid findings JSON (feature 3 retries on miss).
+# run each in the background (run_in_background) so they review in parallel, OR poll with `agents status`.
+"$A" send --to rp-cdomain  --schema "$SCH" "$(grounding)  ROLE=codex-domain: per-deliverable craft/physics. Diff:\n$DIFF"
+"$A" send --to rp-cinteg   --schema "$SCH" "$(grounding)  ROLE=codex-integration: cross-file/build/would-it-work-here. Diff:\n$DIFF"
+"$A" send --to rp-gemini   --schema "$SCH" "$(grounding)  ROLE=gemini: fresh-eye/alternative-mechanism. Diff:\n$DIFF"
+# ... grok + composer likewise; opus-skeptic via Agent(model: opus) as in one-shot.
+```
+With `--schema`, `agents read --to <h>` returns **already-validated findings JSON** (the daemon validated + normalized it) — no fenced-block extraction. Merge the seats' replies into `merged.json` exactly as step 4, then run the **same** `adjudicate.sh` (step 5).
+
+**Round 2+ — re-verify in retained context (what one-shot cannot do):** feed each seat the adjudicator's verdict on *its own* findings; the warm session still holds the diff and its round-1 findings, so the follow-up is cheap and focused:
+```bash
+"$A" send --to rp-cdomain --schema "$SCH" \
+  "The adjudicator REFUTED your finding codex-domain-2 (repro exited 0, not $E). Drop refuted findings; \
+   keep only what still reproduces; add any new HIGH you now see. Re-emit the full findings JSON."
+```
+Re-merge → re-adjudicate. Converge when a round adds no new reproduced blocker (mirror the loop-until-dry discipline). A **common re-verify round** to every seat at once is a fan-out: `agents send --to-all --schema "$SCH" "Re-check your findings against this gate output: …"` (filter with `--engines codex,gemini` to skip the grok-account seats if one is rate-limited). Tear down with `agents stop --to <h>` per seat (or let the 30-min idle timeout reap them).
+
+**Honest limits (unchanged):** reviewers are output-only in both modes, so gemini-not-sandboxed is moot (only the adjudicator executes, in its worktree); codex sessions are OS-sandboxed read-only; grok/composer share one account = one family token. If the gemini seat errors/quota-outs mid-round, the step-5 family preflight still flips the result to PROVISIONAL automatically.
+
 ## Tests
-`bash ~/.claude/skills/review-panel/tests/test_adjudicate.sh` — fixture proves a false-positive HIGH is refuted (nit), a model-text-only HIGH never blocks, a reproduced + a justified-non-reproducible HIGH block, MEDIUM is not gated, node_modules unmutated; plus the family preflight: < 3 families ⇒ PROVISIONAL (exit 3), 3 families ⇒ PASS, no `--families` ⇒ legacy PASS, and a real blocker outranks PROVISIONAL (BLOCK wins).
+`bash ~/.claude/skills/review-panel/tests/test_adjudicate.sh` — fixture proves a false-positive HIGH is refuted (nit), a model-text-only HIGH never blocks, a reproduced + a justified-non-reproducible HIGH block, MEDIUM is not gated, node_modules unmutated; plus the family preflight: < 3 families ⇒ PROVISIONAL (exit 3), 3 families ⇒ PASS, no `--families` ⇒ legacy PASS, and a real blocker outranks PROVISIONAL (BLOCK wins). The live multi-round mode changes no gate code — it reuses `findings.schema.json` + `adjudicate.sh`, so this suite covers it; the `agents` plumbing it relies on is covered by `~/.claude/skills/_session/test_session.sh`.

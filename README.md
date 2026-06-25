@@ -32,7 +32,7 @@ Five Claude Code skills that make OpenAI **Codex**, Google **Gemini**, xAI **Gro
 ## ✦ What the court can do
 
 - **🗡 Five rival engines, one harness.** Codex, Gemini, Grok, and Composer (plus an Opus skeptic in panels) all answer to the same supervised contract — so each one *always works the same way*, not "usually."
-- **💬 Message them like Claude's own subagents.** `agents` holds a **warm, multi-turn session** with any engine: address it by handle, it stays alive in memory and remembers the whole thread. One verb-set (`start · send · read · list · stop`) for every model.
+- **💬 Message them like Claude's own subagents.** `agents` holds a **warm, multi-turn session** with any engine: address it by handle, it stays alive in memory and remembers the whole thread. One verb-set (`start · send · read · cancel · list · stop · board`) for every model — with **live streaming, mid-turn cancel, schema-validated JSON, broadcast, an agent-to-agent blackboard, and reattach-with-memory** all on tap.
 - **⚖ A review court that checks itself.** `/review-panel` runs a diverse set in parallel, then an adjudicator **re-runs every HIGH+ finding in a throwaway `git worktree`** and blocks the commit *only on what it can reproduce* — never on confident prose.
 - **🛡 Read-only by default; real isolation on demand.** A delegated review can't touch your tree — OS-enforced Seatbelt for grok/composer one-shots, capability-gated + cwd-confined for live sessions, `sandbox=read-only` for codex. `--full-auto` to let it act, `--isolate` for a throwaway worktree that **fails closed**.
 - **🐶 No hangs, no orphans, no silent drift.** The watchdog kills a startup-auth hang within one poll cycle, pins the model explicitly so it can't drift across CLI versions, supervises the CLI as a foreground child so completion notifications actually fire, and hands every run its own directory.
@@ -132,6 +132,29 @@ One unified command addresses **any** engine by handle; each stays warm in memor
 **Read-only by default** — grok/composer get *no write channel at all* (and reads are confined to the session's `--cwd`); codex runs `sandbox=read-only`. `--full-auto` hands over a file-write + terminal bridge (grok/composer) or `workspace-write` (codex). One honest caveat: **gemini has no enforceable read-only mode** — Antigravity simply doesn't offer one — so a gemini session chats and reasons but isn't write-sandboxed; point it at a throwaway `--cwd` if that matters. Live sessions live in their own `/tmp/agent_sessions/<handle>/` and never touch the one-shot machinery or `/review-panel`.
 
 > Each engine speaks a different dialect under the hood — ACP JSON-RPC, MCP, or a terminal plus a database tail — but `agents` makes them one court you address the same way. The daemon supervises each session like the watchdog supervises a one-shot run: atomic status, a heartbeat, zombie-reaping process-group kill. Full docs in [`_session/SKILL.md`](./_session/SKILL.md).
+
+### What a standing vassal can do
+
+A warm session isn't just "remembers the thread." The same court now grants six more powers — every one of them spiked against the real CLIs, then hammered by a diverse review panel:
+
+```bash
+agents send  --to rev1 --follow "Audit ./auth and stream your thinking."   # watch the reply as it writes
+agents cancel --to rev1                       # change your mind mid-turn — it stops, stays warm
+agents send  --to rev1 --schema bug.json "Report the worst bug as JSON."   # reply guaranteed to fit your schema
+agents send  --to-all "Status?"               # one decree, every live vassal answers (in parallel)
+agents board post --topic plan --from rev1 "auth.ts line 88 looks off"     # a shared notice-board…
+agents board read --topic plan                # …any vassal (or you) can read
+agents start grok --handle rev1 --resume      # bring a dismissed vassal back — full memory intact
+```
+
+- **👁 Watch it think (live streaming).** `read --follow` tails the reply as the model writes it — grok's native chunks, codex's token deltas, even gemini's answer pulled live out of Antigravity's database mid-generation. No more staring at a blank prompt.
+- **✋ Cancel mid-turn.** Told it the wrong thing? `agents cancel` stops the turn in flight. grok/composer and gemini stay **warm** for the next message; codex (which won't honor a soft cancel) is cut and reattached on demand. No waiting out a runaway essay.
+- **📐 Structured output on any engine.** `--schema FILE` makes *any* vassal return JSON that validates against your JSON Schema — it re-asks itself with the validator's complaint until it fits. None of them support this natively; the court adds it uniformly.
+- **📣 Broadcast to the whole court.** `--to-all` (or `--engines grok,codex`) sends one prompt to every live vassal at once, in parallel, and hands you `{handle: reply}` — one slow or failed vassal never holds up the rest.
+- **📜 A shared blackboard (agent-to-agent).** `agents board` is an append-only notice-board the vassals post to and read from — so a `--full-auto` vassal can leave findings for the next one. Coordination without a babysitter.
+- **🔁 Reattach with memory intact.** Stop a session, reboot the machine, come back tomorrow — `--resume` rebinds the engine's own conversation id (grok `session/load`, codex's thread, gemini's `--conversation`) and the model picks up exactly where it left off.
+
+> Verified the boring way: 81 self-tests (the streaming ones *fail* if you break a stream — no false greens), six live spikes against the real binaries, and a full end-to-end run on real Grok where a reattached vassal still recalled what it was first asked. The diverse panel (2 Codex + Gemini + an Opus skeptic) earned its keep — it caught a test that was passing for the wrong reason, and it got fixed.
 
 ## Why the vassals never break loose
 

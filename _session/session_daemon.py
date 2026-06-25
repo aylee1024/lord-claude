@@ -18,7 +18,13 @@ Live sessions live under their own namespace (default /tmp/agent_sessions/<handl
 Session dir files: status, session.txt, pid, wd_pid, daemon.log, stderr.log, meta.json,
 turns.jsonl, outbox/<n>.md, inbox/, control.sock.
 """
-import argparse, concurrent.futures, glob, json, os, queue, shutil, signal, socket, sqlite3, subprocess, sys, threading, time, traceback
+import argparse, concurrent.futures, glob, json, os, queue, shutil, signal, socket, sqlite3, subprocess, sys, threading, time, traceback, urllib.parse
+
+try:
+    import schema_util                       # lives next to this script (sys.path[0] when run directly)
+except ImportError:                          # be robust if imported as a module from elsewhere
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import schema_util
 
 # ---- timing knobs (mirror run_with_watchdog.sh) ----
 HEARTBEAT_SEC = int(os.environ.get("SESSION_HEARTBEAT_SEC", "30"))
@@ -28,7 +34,7 @@ POLL_SEC      = 0.5
 MAX_REQ_BYTES = 8 * 1024 * 1024   # cap a single control request
 
 LIVE_STATES = ("starting", "idle", "busy")
-TERMINAL_STATES = ("done", "failed", "hung_killed", "aborted", "stopped")
+TERMINAL_STATES = ("done", "failed", "hung_killed", "aborted", "stopped", "cancelled")
 
 
 # --------------------------------------------------------------------------- utils
@@ -42,6 +48,37 @@ class _Box:
 
 class RpcError(Exception):
     def __init__(self, err): self.err = err; super().__init__(str(err))
+
+
+class _PartialSink:
+    """A per-turn live view of the reply-so-far at outbox/<n>.partial. Two write modes, both leaving
+    the file holding the current partial text: append() for token deltas (grok/codex), replace() for
+    growing snapshots (gemini reads the whole (20,1) text each poll). Thread-safe — backends write from
+    the reader thread / pool while the worker owns open/close."""
+    def __init__(self, path):
+        self.path = path
+        self._lock = threading.Lock()
+        self._fh = open(path, "w")
+    def append(self, text):
+        if not text:
+            return
+        with self._lock:
+            try:
+                self._fh.write(text); self._fh.flush()
+            except Exception:
+                pass
+    def replace(self, full):
+        with self._lock:
+            try:
+                self._fh.seek(0); self._fh.truncate(); self._fh.write(full or ""); self._fh.flush()
+            except Exception:
+                pass
+    def close(self):
+        with self._lock:
+            try:
+                self._fh.close()
+            except Exception:
+                pass
 
 
 def _pid_alive(pid):
@@ -233,13 +270,31 @@ class Backend:
     kind = "base"
     def __init__(self):
         self._send_lock = threading.Lock()
-    def start(self): raise NotImplementedError
+        self._partial = None        # set per-turn by the worker; backends stream into it if present
+        self._cancel = threading.Event()   # set by cancel(); the in-flight _send respects it
+    def set_partial_sink(self, sink):
+        self._partial = sink
+    def _emit_partial_append(self, text):
+        s = self._partial
+        if s is not None:
+            s.append(text)
+    def _emit_partial_replace(self, full):
+        s = self._partial
+        if s is not None:
+            s.replace(full)
+    def start(self, resume_id=""): raise NotImplementedError
     def _send(self, text): raise NotImplementedError
     def send(self, text):
         # the daemon worker is single-threaded, but this guard makes concurrent send impossible by
-        # construction (no cross-turn collector bleed)
+        # construction (no cross-turn collector bleed). _cancel is cleared by the worker ONCE per worker
+        # turn (not here) so a cancel set mid-turn survives a schema retry's repeated send()s.
         with self._send_lock:
             return self._send(text)
+    def cancel(self):
+        """Best-effort interrupt of the in-flight turn, called from the control thread while the worker
+        blocks in send(). Returns 'graceful' (turn stops, session stays warm) or 'killed' (backend torn
+        down; the daemon should go terminal). Base: unsupported."""
+        return None
     def stop(self): pass
     def child_pid(self): return None
     def is_alive(self): return True
@@ -283,7 +338,7 @@ class AcpBackend(Backend):
             return {"fs": {"readTextFile": True, "writeTextFile": True}, "terminal": True}
         return {"fs": {"readTextFile": True, "writeTextFile": False}, "terminal": False}
 
-    def start(self):
+    def start(self, resume_id=""):
         argv = ["grok", "agent", "--model", self.model]
         if self.full_auto:
             argv.append("--always-approve")
@@ -297,9 +352,32 @@ class AcpBackend(Backend):
         self.client.request("initialize",
                             {"protocolVersion": 1, "clientCapabilities": self._client_capabilities()},
                             timeout=60)
-        r = self.client.request("session/new", {"cwd": self.cwd, "mcpServers": []}, timeout=60)
-        self.session_id = (r or {}).get("sessionId", "")
+        if resume_id:
+            # reattach to a prior conversation (ACP session/load, ~/.grok/docs/.../17-sessions.md)
+            self.client.request("session/load",
+                                {"sessionId": resume_id, "cwd": self.cwd, "mcpServers": []}, timeout=60)
+            self.session_id = resume_id
+            self.log(f"reattach via ACP session/load id={resume_id}")
+        else:
+            r = self.client.request("session/new", {"cwd": self.cwd, "mcpServers": []}, timeout=60)
+            self.session_id = (r or {}).get("sessionId", "")
         return self.session_id
+
+    def cancel(self):
+        self._cancel.set()
+        # unblock any in-flight client-side terminal wait first: a full-auto turn parked in
+        # terminal/wait_for_exit won't observe session/cancel until the command exits, so kill the procs.
+        with self._tlock:
+            terms = list(self._terminals.values())
+        for t in terms:
+            _kill_tree(t["proc"].pid, self.log)
+        if self.client and self.client.alive and self.session_id:
+            try:
+                self.client.notify("session/cancel", {"sessionId": self.session_id})  # ACP S3: graceful
+                return "graceful"
+            except Exception:
+                pass
+        return None
 
     def child_pid(self):
         return self.client.proc.pid if self.client else None
@@ -310,8 +388,11 @@ class AcpBackend(Backend):
     def _on_notification(self, method, params):
         if method == "session/update":
             u = params.get("update", {})
-            if u.get("sessionUpdate") == "agent_message_chunk" and self._collector is not None:
-                self._collector.append((u.get("content", {}) or {}).get("text", ""))
+            if u.get("sessionUpdate") == "agent_message_chunk":
+                text = (u.get("content", {}) or {}).get("text", "")
+                if self._collector is not None:
+                    self._collector.append(text)
+                self._emit_partial_append(text)   # live stream (NATIVE: chunks already arrive)
 
     def _on_server_request(self, method, params):
         if method == "fs/read_text_file":
@@ -444,7 +525,7 @@ class McpBackend(Backend):
         self.thread_id = ""
         self._reasoning = os.environ.get("CODEX_REASONING", "xhigh")
 
-    def start(self):
+    def start(self, resume_id=""):
         env = dict(os.environ)
         self.client = JsonRpcStdioClient(
             ["codex", "mcp-server"], self.cwd, env, os.path.join(self.sdir, "stderr.log"),
@@ -455,7 +536,20 @@ class McpBackend(Backend):
             "clientInfo": {"name": "agents-session", "version": "1"},
         }, timeout=60)
         self.client.notify("notifications/initialized", {})
+        if resume_id:
+            self._set_thread_id(resume_id)   # reattach: first _send takes the codex-reply branch (no new RPC)
         return ""
+
+    def cancel(self):
+        self._cancel.set()
+        # codex ignores MCP notifications/cancelled for a text turn (spike S4) -> kill the backend;
+        # the thread id persists in session.txt, so `agents start --resume` reattaches via codex-reply.
+        if self.client:
+            try:
+                self.client.stop()
+            except Exception:
+                pass
+        return "killed"
 
     def child_pid(self):
         return self.client.proc.pid if self.client else None
@@ -468,6 +562,12 @@ class McpBackend(Backend):
             tid = self._scan_thread_id(params)
             if tid:
                 self._set_thread_id(tid)
+        if method == "codex/event":
+            msg = params.get("msg")
+            if isinstance(msg, dict) and msg.get("type") == "agent_message_content_delta":
+                d = msg.get("delta")           # S1: incremental agent text (verified on-machine)
+                if isinstance(d, str):
+                    self._emit_partial_append(d)
 
     def _on_server_request(self, method, params):
         return {}
@@ -621,8 +721,10 @@ class PtyDbBackend(Backend):
         self._pre_snapshot = {}
         self.CONV_DIR = os.environ.get(
             "AGY_CONV_DIR", os.path.expanduser("~/.gemini/antigravity-cli/conversations"))
+        self._resume_id = ""
 
-    def start(self):
+    def start(self, resume_id=""):
+        self._resume_id = resume_id or ""
         self._pre_snapshot = self._db_mtimes()
         return ""  # spawn lazily on the first send (agy -i needs the first prompt)
 
@@ -649,6 +751,8 @@ class PtyDbBackend(Backend):
             raise RuntimeError(f"gemini first message too large for argv ({len(first_text)} chars); "
                                "send a shorter first message (follow-ups have no limit) or use one-shot /gemini")
         argv = ["agy", "--model", self.model]
+        if self._resume_id:
+            argv += ["--conversation", self._resume_id]   # reattach to a prior conversation (S5b)
         if self.full_auto:
             argv.append("--dangerously-skip-permissions")
         argv += ["-i", first_text]
@@ -722,8 +826,13 @@ class PtyDbBackend(Backend):
     def child_pid(self):
         return self._pid
 
+    @staticmethod
+    def _ro_uri(path):
+        # URL-encode so a path with spaces/#/? still forms a valid sqlite file: URI (no-op for plain paths)
+        return "file:" + urllib.parse.quote(path) + "?mode=ro"
+
     def _query(self, sql, args=()):
-        con = sqlite3.connect(f"file:{self._conv_db}?mode=ro", uri=True, timeout=3)
+        con = sqlite3.connect(self._ro_uri(self._conv_db), uri=True, timeout=3)
         try:
             con.execute("PRAGMA busy_timeout=2000")
             return con.execute(sql, args).fetchall()
@@ -747,7 +856,7 @@ class PtyDbBackend(Backend):
 
     def _db_user_text(self, path):
         try:
-            con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2)
+            con = sqlite3.connect(self._ro_uri(path), uri=True, timeout=2)
             try:
                 rows = con.execute("SELECT step_payload FROM steps WHERE step_type=14").fetchall()
             finally:
@@ -763,6 +872,8 @@ class PtyDbBackend(Backend):
         deadline = time.time() + timeout
         snip = prompt.strip()[:32].encode("utf-8", "replace")
         while time.time() < deadline:
+            if self._cancel.is_set() or (self._started and not self.is_alive()):
+                return None       # cancelled (or agy died) before the conversation db appeared
             cur = self._db_mtimes()
             fresh = sorted((p for p in cur if p not in self._pre_snapshot),
                            key=lambda p: cur[p], reverse=True)
@@ -784,6 +895,14 @@ class PtyDbBackend(Backend):
         stable_sig = None
         stable_since = None
         while time.time() < deadline:
+            if self._cancel.is_set():
+                # cancelled mid-turn (\x03 was sent): return whatever the in-progress assistant row holds
+                try:
+                    pr = self._query("SELECT step_payload FROM steps WHERE step_type=15 AND idx>? "
+                                     "ORDER BY idx", (pre_max,))
+                    return [r[0] for r in pr]
+                except Exception:
+                    return []
             time.sleep(0.8)
             try:
                 rows = self._query(
@@ -792,6 +911,17 @@ class PtyDbBackend(Backend):
                 continue
             if not rows:
                 continue
+            if self._partial is not None:
+                # S2: the in-progress assistant row (status 8) grows its (20,1) text before status 3.
+                try:
+                    pr = self._query("SELECT step_payload FROM steps WHERE step_type=15 AND idx>? "
+                                     "ORDER BY idx DESC LIMIT 1", (pre_max,))
+                    if pr and pr[0][0] is not None:
+                        cur = _extract_gemini_reply(pr[0][0])
+                        if cur:
+                            self._emit_partial_replace(cur)
+                except Exception:
+                    pass
             user_idx = max((r[0] for r in rows if r[1] == 14), default=None)
             answered = (user_idx is not None
                         and any(r[0] > user_idx and r[1] == 15 and r[2] == 3 for r in rows))
@@ -831,18 +961,33 @@ class PtyDbBackend(Backend):
 
     def _send(self, text):
         if not self._started:
-            self._pre_snapshot = self._db_mtimes()
-            self._spawn(text)
-            self._conv_db = self._wait_new_db(text)
-            if not self._conv_db:
-                raise RuntimeError("gemini conversation db did not appear")
-            uuid = os.path.splitext(os.path.basename(self._conv_db))[0]
-            try:
-                with open(os.path.join(self.sdir, "session.txt"), "w") as f:
-                    f.write(uuid + "\n")
-            except Exception:
-                pass
-            payloads = self._wait_turn_end(-1, HANG_SEC)
+            if self._resume_id:
+                # reattach: bind to the existing conversation db, spawn agy --conversation, read the
+                # new turn's rows beyond the current max idx (S5b).
+                self._conv_db = os.path.join(self.CONV_DIR, self._resume_id + ".db")
+                if not os.path.exists(self._conv_db):
+                    raise RuntimeError(f"gemini resume: conversation db '{self._resume_id}' not found")
+                pre = self._max_idx()
+                self._spawn(text)
+                try:
+                    with open(os.path.join(self.sdir, "session.txt"), "w") as f:
+                        f.write(self._resume_id + "\n")
+                except Exception:
+                    pass
+                payloads = self._wait_turn_end(pre, HANG_SEC)
+            else:
+                self._pre_snapshot = self._db_mtimes()
+                self._spawn(text)
+                self._conv_db = self._wait_new_db(text)
+                if not self._conv_db:
+                    raise RuntimeError("gemini conversation db did not appear")
+                uuid = os.path.splitext(os.path.basename(self._conv_db))[0]
+                try:
+                    with open(os.path.join(self.sdir, "session.txt"), "w") as f:
+                        f.write(uuid + "\n")
+                except Exception:
+                    pass
+                payloads = self._wait_turn_end(-1, HANG_SEC)
         else:
             if self._master is None or not self.is_alive():
                 raise RuntimeError("gemini pty not alive")
@@ -854,6 +999,15 @@ class PtyDbBackend(Backend):
             self.log("gemini: empty DB extraction, falling back to screen text")
             reply = self._screen_tail_text()
         return reply
+
+    def cancel(self):
+        self._cancel.set()
+        try:
+            if self._master is not None:
+                os.write(self._master, b"\x03")   # single ETX: cancel the turn, keep agy alive (S5)
+            return "graceful"
+        except Exception:
+            return None
 
     def stop(self):
         try:
@@ -884,12 +1038,13 @@ def make_backend(engine, model, cwd, full_auto, sdir, log):
 
 # --------------------------------------------------------------------------- daemon
 class Daemon:
-    def __init__(self, sdir, engine, model, cwd, full_auto):
+    def __init__(self, sdir, engine, model, cwd, full_auto, resume_id=""):
         self.sdir = sdir
         self.engine = engine
         self.model = model
         self.cwd = cwd
         self.full_auto = full_auto
+        self.resume_id = resume_id or ""
         self.status = "starting"
         self.turn_q = queue.Queue()
         self.turn_counter = 0
@@ -929,9 +1084,11 @@ class Daemon:
             f.write(content)
         os.replace(tmp, self._p(name))
 
-    def _append_turn(self, n, prompt, reply, status):
+    def _append_turn(self, n, prompt, reply, status, frm=None):
         rec = {"n": n, "ts": int(time.time()), "prompt_chars": len(prompt or ""),
                "reply_chars": len(reply or ""), "status": status}
+        if frm:
+            rec["from"] = frm        # a2a sender tag (optional)
         with open(self._p("turns.jsonl"), "a") as f:
             f.write(json.dumps(rec) + "\n")
 
@@ -947,7 +1104,7 @@ class Daemon:
         self.write_status("starting")
         signal.signal(signal.SIGTERM, self._on_signal)
         signal.signal(signal.SIGINT, self._on_signal)
-        self.log(f"daemon start engine={self.engine} model={self.model} cwd={self.cwd} full_auto={self.full_auto}")
+        self.log(f"daemon start engine={self.engine} model={self.model} cwd={self.cwd} full_auto={self.full_auto} resume={self.resume_id!r}")
         # bind the control socket BEFORE announcing idle, so a fast send never races a missing listener
         try:
             self._bind_socket()
@@ -956,8 +1113,9 @@ class Daemon:
             self.write_status("failed")
             return 1
         try:
-            sid = self.backend.start()
-            self._write("session.txt", (sid or "") + "\n")
+            sid = self.backend.start(self.resume_id)
+            # never blank an existing native id on resume (codex/gemini start() return "")
+            self._write("session.txt", (sid or self.resume_id or "") + "\n")
             cp = self.backend.child_pid()
             if cp:
                 self._write("pid", str(cp))
@@ -1075,6 +1233,24 @@ class Daemon:
             self._terminal_reason = "stopped"
             self._stop.set()
             return {"ok": True, "status": "stopping"}
+        if op == "cancel":
+            if not self.active_turn_started:
+                return {"ok": True, "cancelled": False, "note": "no active turn to cancel"}
+            try:
+                verdict = self.backend.cancel()
+            except Exception as e:
+                self.log(f"cancel error: {e!r}")
+                verdict = None
+            if verdict == "killed":
+                # backend torn down (codex S4): the turn errors out and the session ends terminal.
+                self._terminal_reason = "cancelled"
+                self._stop.set()
+                return {"ok": True, "cancelled": True, "graceful": False,
+                        "note": "backend killed; session ended — use `agents start --resume` to reattach"}
+            if verdict == "graceful":
+                return {"ok": True, "cancelled": True, "graceful": True,
+                        "note": "turn cancelled; session stays warm"}
+            return {"ok": False, "cancelled": False, "error": "cancel not supported or backend not live"}
         if op == "read":
             n = int(req.get("turn") or self.turn_counter)
             f = self._p("outbox", f"{n}.md")
@@ -1086,12 +1262,13 @@ class Daemon:
                 self.turn_counter += 1
                 n = self.turn_counter
             text = req.get("text", "")
+            opts = {"schema": req.get("schema"), "from": req.get("from")}  # optional; absent -> identical
             self.last_activity = time.time()
             if req.get("bg"):
-                self.turn_q.put((n, text, None))
+                self.turn_q.put((n, text, None, opts))
                 return {"ok": True, "turn": n, "status": "queued"}
             box = _Box()
-            self.turn_q.put((n, text, box))
+            self.turn_q.put((n, text, box, opts))
             if not box.event.wait(HANG_SEC + 20):
                 return {"ok": False, "turn": n, "error": "turn wait timed out"}
             if box.error is not None:
@@ -1103,47 +1280,75 @@ class Daemon:
     def _worker(self):
         while not self._stop.is_set():
             try:
-                n, text, box = self.turn_q.get(timeout=POLL_SEC)
+                n, text, box, opts = self.turn_q.get(timeout=POLL_SEC)
             except queue.Empty:
                 continue
+            opts = opts or {}
             result = None
             err = None
+            sink = None
+            partial_path = self._p("outbox", f"{n}.partial")
             try:
                 # everything that can throw (incl. write_status) is inside the try, so the finally
                 # ALWAYS sets the caller's box — a status-write failure can never silently kill the
                 # worker and wedge the session for HANG_SEC (Opus 2nd-panel finding).
                 self.active_turn_started = time.time()
+                self.backend._cancel.clear()    # fresh cancel state for the WHOLE worker turn (schema retries share it)
                 self.write_status("busy")
                 self.log(f"turn {n} start ({len(text)} chars)")
-                reply = self.backend.send(text)
+                sink = _PartialSink(partial_path)             # live view streamed at outbox/<n>.partial (every turn)
+                self.backend.set_partial_sink(sink)
+                schema = opts.get("schema")
+                if schema:
+                    # the retry loop shares this turn's single HANG_SEC budget (heartbeat bounds the whole
+                    # worker turn); each attempt is a real turn on the warm session. should_abort stops the
+                    # retries promptly when the turn is cancelled. The .partial streams the raw attempts; the
+                    # .md is the validated JSON.
+                    obj, raw = schema_util.run_with_schema(
+                        self.backend.send, text, schema, log=self.log,
+                        should_abort=lambda: self.backend._cancel.is_set())
+                    reply = json.dumps(obj, ensure_ascii=False, indent=2) if obj is not None else (raw or "")
+                else:
+                    reply = self.backend.send(text)
+                self.active_turn_started = None    # turn produced a reply; a late cancel must NOT kill it now
                 rf = self._p("outbox", f"{n}.md")
                 with open(rf, "w") as f:
                     f.write(reply or "")
-                self._append_turn(n, text, reply, "done")
-                self.log(f"turn {n} done ({len(reply or '')} chars)")
-                result = {"reply": reply, "reply_file": rf}
+                label = "cancelled" if self.backend._cancel.is_set() else "done"
+                self._append_turn(n, text, reply, label, opts.get("from"))
+                self.log(f"turn {n} {label} ({len(reply or '')} chars)")
+                result = {"reply": reply, "reply_file": rf, "cancelled": (label == "cancelled")}
             except TimeoutError as e:
                 # a turn that blows the per-turn HANG budget leaves the backend mid-work in an unknown
                 # state — end the session LOUDLY (hung_killed) rather than limp on idle and risk a
                 # crossed reply on the next turn. The caller still gets the error immediately.
                 self.log(f"turn {n} TIMED OUT -> hung_killed: {e}")
                 try:
-                    self._append_turn(n, text, "", "hung")
+                    self._append_turn(n, text, "", "hung", opts.get("from"))
                 except Exception:
                     pass
                 err = f"turn timed out (hung); session ended: {e}"
                 self._terminal_reason = "hung_killed"
                 self._stop.set()
             except Exception as e:
-                self.log(f"turn {n} FAILED: {repr(e)}")
+                label = "cancelled" if self.backend._cancel.is_set() else "failed"
+                self.log(f"turn {n} {label.upper()}: {repr(e)}")
                 try:
-                    self._append_turn(n, text, "", "failed")
+                    self._append_turn(n, text, "", label, opts.get("from"))
                 except Exception:
                     pass
-                err = str(e) or "turn failed"
+                err = (f"turn cancelled: {e}" if label == "cancelled" else (str(e) or "turn failed"))
             finally:
                 self.active_turn_started = None
                 self.last_activity = time.time()
+                if sink is not None:
+                    self.backend.set_partial_sink(None)
+                    sink.close()
+                try:
+                    if os.path.exists(partial_path):
+                        os.remove(partial_path)   # the final .md is authoritative; drop the live view
+                except Exception:
+                    pass
                 try:
                     self.write_status("idle", only_if_live=True)
                 except Exception:
@@ -1201,7 +1406,7 @@ class Daemon:
         # error any still-queued turns so foreground callers waiting on them unblock immediately
         while True:
             try:
-                _, _, box = self.turn_q.get_nowait()
+                _, _, box, _ = self.turn_q.get_nowait()
             except queue.Empty:
                 break
             if box:
@@ -1216,8 +1421,9 @@ def main():
     ap.add_argument("--model", default="")
     ap.add_argument("--cwd", default=os.getcwd())
     ap.add_argument("--full-auto", action="store_true")
+    ap.add_argument("--resume-id", default="", help="reattach to this native conversation/thread id")
     args = ap.parse_args()
-    d = Daemon(args.sdir, args.engine, args.model, os.path.abspath(args.cwd), args.full_auto)
+    d = Daemon(args.sdir, args.engine, args.model, os.path.abspath(args.cwd), args.full_auto, args.resume_id)
     return d.run()
 
 

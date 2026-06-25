@@ -15,7 +15,7 @@ Addresses any engine by a stable handle, the way Claude Code messages a named su
 Sessions live under /tmp/agent_sessions/<handle>/ (own namespace; one-shot /tmp/<skill>_runs untouched).
 Control channel: the daemon's unix socket, with an inbox/ file-drop fallback.
 """
-import argparse, json, os, re, shutil, socket, subprocess, sys, time
+import argparse, json, os, re, shutil, socket, subprocess, sys, threading, time
 
 BASE_DIR = os.environ.get("AGENT_SESSIONS_DIR", "/tmp/agent_sessions")
 DAEMON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "session_daemon.py")
@@ -142,9 +142,50 @@ def control(d, req, timeout=920):
 
 
 # --------------------------------------------------------------------------- commands
+def _clear_for_resume(d):
+    """Clear only the volatile runtime files so a fresh daemon starts clean, but PRESERVE session.txt
+    (the native conversation id we reattach to) + meta.json."""
+    for nm in ("status", "control.sock", "pid", "wd_pid", "daemon.log", "launch.log",
+               "stderr.log", "turns.jsonl"):
+        try:
+            os.unlink(os.path.join(d, nm))
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+    for sub in ("outbox", "inbox"):
+        shutil.rmtree(os.path.join(d, sub), ignore_errors=True)
+
+
 def cmd_start(a):
     d = sdir(a.handle)
-    if os.path.isdir(d):
+    resume_id = ""
+    meta = {}
+    if getattr(a, "resume", False):
+        # reattach to a prior conversation: keep session.txt + meta, restart the daemon with --resume-id
+        if not os.path.isdir(d):
+            print(f"--resume: no existing session '{a.handle}' to resume", file=sys.stderr)
+            return 2
+        st, stale = session_status(d)
+        wd = read_file(os.path.join(d, "wd_pid"))
+        if st in LIVE_STATES and not stale and bool(wd) and pid_alive(wd):
+            print(f"--resume: '{a.handle}' is still live (status={st}); `agents stop` it first", file=sys.stderr)
+            return 2
+        resume_id = read_file(os.path.join(d, "session.txt"))
+        if not resume_id:
+            print(f"--resume: '{a.handle}' has no saved conversation id to reattach to", file=sys.stderr)
+            return 2
+        try:
+            meta = json.loads(read_file(os.path.join(d, "meta.json"), "{}"))
+        except Exception:
+            meta = {}
+        saved_engine = meta.get("engine")
+        if saved_engine and saved_engine != a.engine:
+            print(f"--resume: '{a.handle}' is a {saved_engine} session; run "
+                  f"`agents start {saved_engine} --handle {a.handle} --resume`", file=sys.stderr)
+            return 2
+        _clear_for_resume(d)
+    elif os.path.isdir(d):
         st, stale = session_status(d)
         wd = read_file(os.path.join(d, "wd_pid"))
         wd_dead = bool(wd) and not pid_alive(wd)   # a just-killed daemon has a fresh log but a dead pid
@@ -154,10 +195,14 @@ def cmd_start(a):
         # dead or stale handle: clear the old session dir so the name can be reused
         shutil.rmtree(d, ignore_errors=True)
     os.makedirs(d, exist_ok=True)
-    model = a.model or DEFAULT_MODEL.get(a.engine, "")
-    argv = [sys.executable, DAEMON, d, "--engine", a.engine, "--model", model, "--cwd", os.path.abspath(a.cwd)]
-    if a.full_auto:
+    model = a.model or meta.get("model") or DEFAULT_MODEL.get(a.engine, "")
+    cwd = meta.get("cwd") if (resume_id and meta.get("cwd")) else os.path.abspath(a.cwd)
+    full_auto = a.full_auto or bool(meta.get("full_auto"))
+    argv = [sys.executable, DAEMON, d, "--engine", a.engine, "--model", model, "--cwd", cwd]
+    if full_auto:
         argv.append("--full-auto")
+    if resume_id:
+        argv += ["--resume-id", resume_id]
     launch_log = open(os.path.join(d, "launch.log"), "ab")
     try:
         subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=launch_log, stderr=launch_log,
@@ -169,9 +214,12 @@ def cmd_start(a):
     while time.time() < deadline:
         st = read_file(os.path.join(d, "status"), "starting")
         if st == "idle":
-            print(json.dumps({"handle": a.handle, "engine": a.engine, "model": model,
-                              "status": "idle", "session_dir": d,
-                              "session_id": read_file(os.path.join(d, "session.txt"))}))
+            out = {"handle": a.handle, "engine": a.engine, "model": model,
+                   "status": "idle", "session_dir": d,
+                   "session_id": read_file(os.path.join(d, "session.txt"))}
+            if resume_id:
+                out["resumed"] = True       # only on resume -> a plain start stays byte-identical to round 1
+            print(json.dumps(out))
             return 0
         if st in ("failed", "aborted", "stopped", "done"):
             print(f"session failed to start (status={st}). See {d}/daemon.log + {d}/stderr.log", file=sys.stderr)
@@ -187,19 +235,112 @@ def _resolve_text(a):
     return a.text
 
 
+def _load_schema_into(req, schema_path):
+    if schema_path:
+        with open(schema_path) as f:
+            req["schema"] = json.load(f)   # may raise; the caller turns it into a clear error
+
+
+def _fanout_targets(a):
+    """Live sessions to broadcast to: all of them, optionally filtered to --engines."""
+    want = set(e.strip() for e in a.engines.split(",") if e.strip()) if a.engines else None
+    targets = []
+    if not os.path.isdir(BASE_DIR):
+        return targets
+    for h in sorted(os.listdir(BASE_DIR)):
+        if h.startswith("."):
+            continue                            # skip .board and other non-session dirs
+        d = os.path.join(BASE_DIR, h)
+        if not os.path.isdir(d):
+            continue
+        st, stale = session_status(d)
+        wd = read_file(os.path.join(d, "wd_pid"))
+        if stale or st not in ("idle", "busy", "starting") or (wd and not pid_alive(wd)):
+            continue
+        if want is not None:
+            meta = {}
+            try:
+                meta = json.loads(read_file(os.path.join(d, "meta.json"), "{}"))
+            except Exception:
+                pass
+            if meta.get("engine") not in want:
+                continue
+        targets.append((h, d))
+    return targets
+
+
+def _cmd_send_fanout(a):
+    """Broadcast the same text to every live target IN PARALLEL (thread per target, failures isolated)."""
+    base = {"op": "send", "bg": bool(a.bg)}
+    if getattr(a, "from_", None):
+        base["from"] = a.from_
+    if getattr(a, "schema", None):
+        try:
+            _load_schema_into(base, a.schema)
+        except Exception as e:
+            print(f"--schema: cannot read/parse '{a.schema}': {e}", file=sys.stderr)
+            return 2
+    targets = _fanout_targets(a)
+    if not targets:
+        print(json.dumps({}))
+        print("no live target sessions matched", file=sys.stderr)
+        return 1
+    text = _resolve_text(a)
+    results = {}
+    lock = threading.Lock()
+    def worker(h, d):
+        req = dict(base); req["text"] = text
+        try:
+            resp = control(d, req)
+        except Exception as e:
+            resp = {"ok": False, "error": str(e)}
+        with lock:
+            results[h] = resp
+    ths = [threading.Thread(target=worker, args=(h, d), daemon=True) for h, d in targets]
+    for t in ths:
+        t.start()
+    deadline = time.time() + int(os.environ.get("SESSION_HANG_SEC", "900")) + 60   # ONE global deadline
+    for t in ths:
+        t.join(timeout=max(0.0, deadline - time.time()))
+    out = {}
+    for h, _d in targets:
+        r = results.get(h, {"ok": False, "error": "no response (timed out)"})
+        if r.get("ok"):
+            out[h] = {"turn": r.get("turn"), "status": r.get("status")} if a.bg else {"reply": r.get("reply")}
+        else:
+            out[h] = {"error": r.get("error")}
+    print(json.dumps(out, indent=2))
+    return 0 if any(results.get(h, {}).get("ok") for h, _ in targets) else 1
+
+
 def cmd_send(a):
+    if getattr(a, "to_all", False) or getattr(a, "engines", None):
+        return _cmd_send_fanout(a)
+    if not a.to:
+        print("send: provide --to H (or --to-all / --engines to broadcast)", file=sys.stderr)
+        return 2
     d = sdir(a.to)
     if not os.path.isdir(d):
         print(f"no such session '{a.to}'", file=sys.stderr)
         return 2
     st, stale = session_status(d)
     wd = read_file(os.path.join(d, "wd_pid"))
-    if stale or st in ("done", "failed", "hung_killed", "aborted", "stopped") or (wd and not pid_alive(wd)):
+    if stale or st in ("done", "failed", "hung_killed", "aborted", "stopped", "cancelled") or (wd and not pid_alive(wd)):
         print(f"session '{a.to}' is not live (status={st}{', stale' if stale else ''})", file=sys.stderr)
         return 1
     text = _resolve_text(a)
+    req = {"op": "send", "text": text, "bg": bool(a.bg)}
+    if getattr(a, "from_", None):
+        req["from"] = a.from_
+    if getattr(a, "schema", None):
+        try:
+            with open(a.schema) as f:
+                req["schema"] = json.load(f)
+        except Exception as e:
+            print(f"--schema: cannot read/parse '{a.schema}': {e}", file=sys.stderr)
+            return 2
     try:
-        resp = control(d, {"op": "send", "text": text, "bg": bool(a.bg)})
+        resp = control(d, req)
     except Exception as e:
         print(f"send failed: {e}", file=sys.stderr)
         return 1
@@ -215,20 +356,169 @@ def cmd_send(a):
     return 0
 
 
+def cmd_cancel(a):
+    d = sdir(a.to)
+    if not os.path.isdir(d):
+        print(f"no such session '{a.to}'", file=sys.stderr)
+        return 2
+    st, stale = session_status(d)
+    wd = read_file(os.path.join(d, "wd_pid"))
+    if stale or st in ("done", "failed", "hung_killed", "aborted", "stopped", "cancelled") or (wd and not pid_alive(wd)):
+        print(f"session '{a.to}' is not live (status={st})", file=sys.stderr)
+        return 1
+    try:
+        resp = control(d, {"op": "cancel"}, timeout=60)
+    except Exception as e:
+        print(f"cancel failed: {e}", file=sys.stderr)
+        return 1
+    print(json.dumps(resp))
+    return 0 if resp.get("ok") else 1
+
+
+_TOPIC_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]*$')
+
+
+def _board_topic_path(topic):
+    """A topic is a single safe filename under BASE_DIR/.board/ (never an escaping path)."""
+    if not topic or not _TOPIC_RE.match(topic):
+        raise ValueError(f"invalid topic '{topic}': letters/digits/_/-/. only, no '/'")
+    bd = os.path.join(BASE_DIR, ".board")
+    os.makedirs(bd, exist_ok=True)
+    return os.path.join(bd, topic + ".jsonl")
+
+
+def cmd_board(a):
+    """Shared append-only blackboard for agent-to-agent coordination (full-auto agents run this too)."""
+    sub = getattr(a, "board_cmd", None)
+    if sub == "post":
+        try:
+            path = _board_topic_path(a.topic)
+        except ValueError as e:
+            print(str(e), file=sys.stderr)
+            return 2
+        msg = a.msg
+        if msg is None or msg == "-":
+            msg = sys.stdin.read()
+        import fcntl
+        with open(path, "a+") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)        # atomic seq + append under an exclusive lock
+            try:
+                f.seek(0)
+                n = sum(1 for _ in f) + 1
+                rec = {"n": n, "ts": int(time.time()), "from": a.from_, "msg": msg}
+                f.write(json.dumps(rec) + "\n")
+                f.flush()
+            finally:
+                fcntl.flock(f, fcntl.LOCK_UN)
+        print(json.dumps({"topic": a.topic, "n": n, "from": a.from_}))
+        return 0
+    if sub == "read":
+        try:
+            path = _board_topic_path(a.topic)
+        except ValueError as e:
+            print(str(e), file=sys.stderr)
+            return 2
+        out = []
+        if os.path.exists(path):
+            import fcntl
+            with open(path) as f:
+                fcntl.flock(f, fcntl.LOCK_SH)    # shared lock: never read a line mid-write
+                try:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except Exception:
+                            continue
+                        if rec.get("n", 0) > (a.since or 0):
+                            out.append(rec)
+                finally:
+                    fcntl.flock(f, fcntl.LOCK_UN)
+        print(json.dumps(out, indent=2))
+        return 0
+    print('board: `agents board post --topic T --from H "msg"` or `agents board read --topic T [--since N]`',
+          file=sys.stderr)
+    return 2
+
+
+def _outbox_turn_nums(outdir):
+    nums = set()
+    if os.path.isdir(outdir):
+        for nm in os.listdir(outdir):
+            base = None
+            if nm.endswith(".md"):
+                base = nm[:-3]
+            elif nm.endswith(".partial"):
+                base = nm[:-len(".partial")]
+            if base is not None:
+                try:
+                    nums.add(int(base))
+                except ValueError:
+                    pass
+    return nums
+
+
+def _follow_turn(d, n):
+    """Stream outbox/<n>.partial live (printing only the newly-appended suffix; gemini rewrites the
+    file with a growing snapshot, grok/codex append — both stay a growing prefix), then print the
+    authoritative outbox/<n>.md when it appears. Bails out if the session goes terminal first."""
+    outdir = os.path.join(d, "outbox")
+    partial = os.path.join(outdir, f"{n}.partial")
+    final = os.path.join(outdir, f"{n}.md")
+    shown = ""
+    deadline = time.time() + int(os.environ.get("SESSION_HANG_SEC", "900")) + 60
+    while time.time() < deadline:
+        if os.path.exists(final):
+            break
+        cur = read_file(partial, "")
+        if cur != shown:
+            if cur.startswith(shown) and len(cur) > len(shown):
+                sys.stdout.write(cur[len(shown):]); sys.stdout.flush(); shown = cur   # grew: print the new suffix
+            elif cur and not shown.startswith(cur):
+                sys.stdout.write("\n" + cur); sys.stdout.flush(); shown = cur          # genuinely diverged: reprint
+            # else: cur is a prefix of shown or empty -> a transient truncation (gemini rewrites in place); ignore
+        st, stale = session_status(d)
+        if (stale or st in ("failed", "hung_killed", "aborted", "stopped")) and not os.path.exists(final):
+            sys.stdout.write(f"\n(turn {n} ended without a final reply; status={st}{', stale' if stale else ''})\n")
+            return 1
+        time.sleep(0.2)
+    final_text = read_file(final, "")
+    sys.stdout.write(final_text[len(shown):] if final_text.startswith(shown) else ("\n" if shown else "") + final_text)
+    if not final_text.endswith("\n"):
+        sys.stdout.write("\n")
+    return 0
+
+
 def cmd_read(a):
     d = sdir(a.to)
     if not os.path.isdir(d):
         print(f"no such session '{a.to}'", file=sys.stderr)
         return 2
+    outdir = os.path.join(d, "outbox")
+    if getattr(a, "follow", False):
+        n = a.turn
+        if not n:
+            # wait briefly for an in-flight turn to register (e.g. `send --bg` then immediate `read --follow`)
+            for _ in range(25):
+                nums = _outbox_turn_nums(outdir)
+                if nums:
+                    n = max(nums)
+                    break
+                time.sleep(0.2)
+            if not n:
+                print("(no turns yet)", file=sys.stderr)
+                return 1
+        return _follow_turn(d, n)
     if a.turn:
-        f = os.path.join(d, "outbox", f"{a.turn}.md")
+        f = os.path.join(outdir, f"{a.turn}.md")
     else:
-        outdir = os.path.join(d, "outbox")
-        outs = sorted(int(n[:-3]) for n in os.listdir(outdir) if n.endswith(".md")) if os.path.isdir(outdir) else []
+        outs = sorted(int(nm[:-3]) for nm in (os.listdir(outdir) if os.path.isdir(outdir) else []) if nm.endswith(".md"))
         if not outs:
             print("(no turns yet)", file=sys.stderr)
             return 1
-        f = os.path.join(d, "outbox", f"{outs[-1]}.md")
+        f = os.path.join(outdir, f"{outs[-1]}.md")
     sys.stdout.write(read_file(f) + "\n")
     return 0
 
@@ -260,6 +550,8 @@ def cmd_list(a):
         return 0
     rows = []
     for h in sorted(os.listdir(BASE_DIR)):
+        if h.startswith("."):
+            continue                    # .board and other non-session dirs
         d = os.path.join(BASE_DIR, h)   # iterating existing dirs; do not re-validate the name
         if not os.path.isdir(d):
             continue
@@ -304,6 +596,8 @@ def cmd_gc(a):
     removed = 0
     import shutil
     for h in os.listdir(BASE_DIR):
+        if h.startswith("."):
+            continue                    # never sweep .board (the shared blackboard)
         d = os.path.join(BASE_DIR, h)   # iterating existing dirs; do not re-validate the name
         if not os.path.isdir(d):
             continue
@@ -327,15 +621,29 @@ def main():
     p = sub.add_parser("start"); p.add_argument("engine", choices=["grok", "composer", "codex", "gemini"])
     p.add_argument("--handle", required=True); p.add_argument("--model", default="")
     p.add_argument("--cwd", default=os.getcwd()); p.add_argument("--full-auto", action="store_true")
+    p.add_argument("--resume", action="store_true", help="reattach to this handle's saved conversation id")
     p.set_defaults(fn=cmd_start)
 
-    p = sub.add_parser("send"); p.add_argument("--to", required=True)
+    p = sub.add_parser("send"); p.add_argument("--to", default=None)
     p.add_argument("text", nargs="?", default=None); p.add_argument("--bg", action="store_true")
+    p.add_argument("--schema", default=None, help="path to a JSON Schema file; reply is JSON validated against it")
+    p.add_argument("--to-all", dest="to_all", action="store_true", help="broadcast to ALL live sessions")
+    p.add_argument("--engines", default=None, help="broadcast to live sessions of these engines (comma list)")
+    p.add_argument("--from", dest="from_", default=None, help="sender tag recorded on the turn (a2a)")
     p.set_defaults(fn=cmd_send)
 
     p = sub.add_parser("read"); p.add_argument("--to", required=True); p.add_argument("--turn", type=int)
+    p.add_argument("--follow", action="store_true", help="stream the turn's live partial until it finalizes")
     p.set_defaults(fn=cmd_read)
 
+    p = sub.add_parser("cancel"); p.add_argument("--to", required=True); p.set_defaults(fn=cmd_cancel)
+    bp = sub.add_parser("board")
+    bs = bp.add_subparsers(dest="board_cmd")
+    bpost = bs.add_parser("post"); bpost.add_argument("--topic", default="default")
+    bpost.add_argument("--from", dest="from_", default="?"); bpost.add_argument("msg", nargs="?", default=None)
+    bread = bs.add_parser("read"); bread.add_argument("--topic", default="default")
+    bread.add_argument("--since", type=int, default=0)
+    bp.set_defaults(fn=cmd_board)
     p = sub.add_parser("status"); p.add_argument("--to", required=True); p.set_defaults(fn=cmd_status)
     p = sub.add_parser("list"); p.set_defaults(fn=cmd_list)
     p = sub.add_parser("stop"); p.add_argument("--to", required=True); p.set_defaults(fn=cmd_stop)
