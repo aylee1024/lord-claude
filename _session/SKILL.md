@@ -1,9 +1,9 @@
 ---
 name: agents
-description: "Hold LIVE, warm, multi-turn sessions with grok, composer, codex, and gemini — message a named agent and it remembers, like Claude Code messaging its own subagents. One unified dispatcher over a per-engine backend (grok/composer ACP, codex MCP, gemini PTY+DB)."
+description: "Hold LIVE, warm, multi-turn sessions with grok, composer, codex, and gemini — message a named agent and it remembers, like Claude Code messaging its own subagents. Live streaming, mid-turn cancel, reattach/resume, schema-validated JSON replies, broadcast fan-out, and an agent-to-agent blackboard. One unified dispatcher over a per-engine backend (grok/composer ACP, codex MCP, gemini PTY+DB)."
 user-invocable: true
 allowed-tools: Read, Write, Bash
-argument-hint: "start <engine> --handle H | send --to H \"<text>\" | read|status|list|stop|gc"
+argument-hint: "start <engine> --handle H [--resume] | send --to H|--to-all [--schema F] \"<text>\" | read --to H [--follow] | cancel|status|list|stop|gc|board"
 ---
 
 # agents — live, addressable model sessions
@@ -18,14 +18,27 @@ The real interface is the dispatcher `~/.claude/skills/_session/agents`. Each en
 ## Verbs
 
 ```
-agents start  <grok|composer|codex|gemini> --handle H [--model M] [--cwd DIR] [--full-auto]
-agents send   --to H [--bg] "<text>"        # foreground blocks until the turn ends; --bg returns a turn id
-agents read   --to H [--turn N]             # reply text for a turn (newest if --turn omitted)
+agents start  <grok|composer|codex|gemini> --handle H [--model M] [--cwd DIR] [--full-auto] [--resume]
+agents send   --to H [--bg] [--schema FILE] [--from TAG] "<text>"   # blocks until turn-end; --bg returns a turn id
+agents send   --to-all | --engines grok,codex [--schema FILE] "<text>"   # broadcast to live sessions, in parallel
+agents read   --to H [--turn N] [--follow]  # reply text; --follow streams the live partial until it finalizes
+agents cancel --to H                        # interrupt the in-flight turn (graceful where possible)
 agents status --to H                        # status + engine + native session id + turn count
 agents list                                 # all sessions (flags a dead daemon as "(stale)")
 agents stop   --to H                        # graceful shutdown
 agents gc     [--days N]                    # remove dead/old session dirs
+agents board  post --topic T --from H "msg" # a2a blackboard: append a message
+agents board  read --topic T [--since N]    # a2a blackboard: read messages after seq N
 ```
+
+## Round-2 powers (streaming · cancel · reattach · structured output · broadcast · blackboard)
+
+- **Live streaming** — every turn writes a growing `outbox/<n>.partial`; `agents read --to H --follow` tails it live then prints the authoritative final. grok streams native chunks, codex taps `agent_message_content_delta`, gemini streams the answer text out of the conversation DB as it generates.
+- **Mid-turn cancel** — `agents cancel --to H` stops a running turn. grok/composer cancel gracefully (ACP `session/cancel`) and stay warm; gemini cancels with a single `\x03` and stays warm; codex has no honored MCP cancel, so it kills the backend and the session ends `cancelled` — reattach to continue.
+- **Reattach / resume** — `agents start <engine> --handle H --resume` brings a stopped/cancelled/idle-timed-out session back, bound to its saved native conversation id (grok `session/load`, codex `codex-reply` thread, gemini `agy --conversation`). The model keeps its full context; the local turn log restarts.
+- **Structured output** — `agents send --to H --schema FILE` makes the reply valid JSON matching a JSON Schema (re-asks the model with the validator error on a miss, up to `SESSION_SCHEMA_RETRIES`, default 2). `read` returns the validated JSON.
+- **Broadcast / fan-out** — `agents send --to-all "…"` (or `--engines grok,codex`) sends the same prompt to every live session in parallel, isolating per-target failures, and prints `{handle: reply|error}`. Composes with `--schema`.
+- **Agent-to-agent blackboard** — `agents board post/read --topic T` is a shared append-only log (atomic, `--since N` for new-only). Full-auto agents reach it through their terminal bridge by running `agents board …` themselves; `--from` tags both board messages and the receiving session's `turns.jsonl`.
 
 Sessions live under `/tmp/agent_sessions/<handle>/` (own namespace; the one-shot `/tmp/<engine>_runs`
 dirs are never touched). The dir mirrors the watchdog contract: `status`, `session.txt`, `pid`,
@@ -88,7 +101,12 @@ file," never to "unknown":
 
 - grok read-only is **capability-based** (the agent has no write channel), not OS-Seatbelt; codex
   read-only **is** OS-enforced.
-- Hard mid-turn interruption is not built (queued messaging only, like Claude subagents).
+- Mid-turn `cancel` is graceful for grok/composer (ACP `session/cancel`) and gemini (single `\x03`),
+  but codex has no honored MCP cancel — `cancel` kills its backend and the session ends `cancelled`;
+  use `--resume` to reattach. A cancelled turn may or may not be persisted by the engine.
+- Reattach restores the model's conversation via its native id, but loses the warm in-RAM process and
+  restarts the local turn counter (old `outbox/` is cleared on resume).
+- The blackboard is cooperative (no ACL): full-auto agents can post, read-only agents cannot.
 - gemini reply-text extraction reads protobuf field (20,1) of the assistant step; if a future
   Antigravity build changes that, the daemon falls back to the on-screen text.
 
