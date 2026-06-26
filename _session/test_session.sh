@@ -449,9 +449,9 @@ wait_for gemcan busy; chk "gemini cancel: busy before cancel" "$(cat "$AGENT_SES
 CNG="$(python3 "$AG" cancel --to gemcan 2>/dev/null)"
 has "gemini cancel: graceful (single \\x03)" "$CNG" '"graceful": true'
 wait_for gemcan idle; chk "gemini cancel: session warm (idle) after cancel" "$(cat "$AGENT_SESSIONS_DIR/gemcan/status" 2>/dev/null)" "idle"
-sleep 0.5    # let the mock consume the \x03 and return to its prompt before the follow-up
+# no test-side sleep: the daemon's post-cancel _wait_pty_quiesce settles agy before the follow-up injects
 RWG="$(python3 "$AG" send --to gemcan "Remember the number 7. Reply OK" 2>/dev/null)"
-has "gemini cancel: follow-up after cancel works (warm)" "$RWG" "OK"
+has "gemini cancel: follow-up after cancel works (warm, daemon-settled)" "$RWG" "OK"
 IDX0="$(db_maxidx "$GEMDB")"
 python3 "$AG" stop --to gemcan >/dev/null 2>&1; sleep 1
 RESG="$(python3 "$AG" start gemini --handle gemcan --cwd "$ROOT" --resume 2>/dev/null)"
@@ -549,6 +549,26 @@ Z="$AGENT_SESSIONS_DIR/zombie"; mkdir -p "$Z"; echo unknown > "$Z/status"; echo 
 touch -t 200001010000 "$Z/daemon.log" 2>/dev/null
 python3 "$AG" gc --days 0 >/dev/null 2>&1
 chk "gc removed unknown-status dir" "$([ -d "$Z" ] && echo yes || echo no)" "no"
+
+echo "== hardening: concurrent same-handle start -> exactly one live, no rmtree race =="
+python3 "$AG" start grok --handle dup --cwd "$ROOT" >"$ROOT/dupA.out" 2>&1 &
+PA=$!
+python3 "$AG" start grok --handle dup --cwd "$ROOT" >"$ROOT/dupB.out" 2>&1 &
+PB=$!
+wait $PA; RA=$?
+wait $PB; RB=$?
+OKN=$(grep -l '"status": "idle"' "$ROOT/dupA.out" "$ROOT/dupB.out" 2>/dev/null | wc -l | tr -d ' ')
+ALN=$(grep -l 'already live' "$ROOT/dupA.out" "$ROOT/dupB.out" 2>/dev/null | wc -l | tr -d ' ')
+chk "concurrent start: exactly ONE became idle" "$OKN" "1"
+chk "concurrent start: the loser reported 'already live' (not rmtree+relaunch)" "$ALN" "1"
+chk "concurrent start: the session is live + usable" "$(python3 "$AG" send --to dup "hi" 2>/dev/null)" "ack"
+python3 "$AG" stop --to dup >/dev/null 2>&1
+
+echo "== hardening: sessions dir is private 0700 (loose perms get tightened) =="
+chmod 0777 "$AGENT_SESSIONS_DIR" 2>/dev/null
+python3 "$AG" list >/dev/null 2>&1
+PERM="$(stat -f '%Lp' "$AGENT_SESSIONS_DIR" 2>/dev/null || stat -c '%a' "$AGENT_SESSIONS_DIR" 2>/dev/null)"
+chk "base sessions dir tightened to 0700" "$PERM" "700"
 
 echo
 echo "==================================="
