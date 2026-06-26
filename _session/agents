@@ -15,9 +15,11 @@ Addresses any engine by a stable handle, the way Claude Code messages a named su
 Sessions live under /tmp/agent_sessions/<handle>/ (own namespace; one-shot /tmp/<skill>_runs untouched).
 Control channel: the daemon's unix socket, with an inbox/ file-drop fallback.
 """
-import argparse, json, os, re, shutil, socket, subprocess, sys, threading, time
+import argparse, fcntl, json, os, re, shutil, socket, subprocess, sys, threading, time
 
-BASE_DIR = os.environ.get("AGENT_SESSIONS_DIR", "/tmp/agent_sessions")
+# default to a PER-USER path (not the shared /tmp/agent_sessions) so another local user can't pre-create
+# or read this user's sessions; _ensure_base_dir() locks it down to 0700 + own-uid.
+BASE_DIR = os.environ.get("AGENT_SESSIONS_DIR", f"/tmp/agent_sessions-{os.getuid()}")
 DAEMON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "session_daemon.py")
 STARTUP_TIMEOUT = int(os.environ.get("SESSION_STARTUP_TIMEOUT", "180"))
 STALE_SEC = int(os.environ.get("SESSION_STALE_SEC", "90"))
@@ -157,59 +159,106 @@ def _clear_for_resume(d):
         shutil.rmtree(os.path.join(d, sub), ignore_errors=True)
 
 
+def _ensure_base_dir():
+    """Create BASE_DIR private to this user (0700) and refuse a pre-existing one owned by someone else —
+    a shared /tmp path is otherwise a local hijack/DoS surface."""
+    try:
+        if os.path.isdir(BASE_DIR):
+            st = os.stat(BASE_DIR)
+            if st.st_uid != os.getuid():
+                print(f"refusing: {BASE_DIR} is owned by uid {st.st_uid}, not you ({os.getuid()}); "
+                      f"set AGENT_SESSIONS_DIR to a private path", file=sys.stderr)
+                sys.exit(2)
+            if st.st_mode & 0o077:
+                os.chmod(BASE_DIR, 0o700)      # tighten any group/world bits (umask) on our own dir
+        else:
+            os.makedirs(BASE_DIR, mode=0o700, exist_ok=True)
+    except SystemExit:
+        raise
+    except Exception:
+        pass
+
+
+def _handle_lock(handle):
+    """An flock-held file serializing concurrent `start` of the SAME handle, so two racing starts can't
+    both see a just-launched (pre-wd_pid) session as stale and rmtree it. Caller closes it to release."""
+    lockdir = os.path.join(BASE_DIR, ".locks")
+    os.makedirs(lockdir, exist_ok=True)
+    lf = open(os.path.join(lockdir, handle + ".lock"), "w")
+    fcntl.flock(lf, fcntl.LOCK_EX)
+    return lf
+
+
 def cmd_start(a):
     d = sdir(a.handle)
+    lock = _handle_lock(a.handle)            # serialize same-handle starts through the claim
     resume_id = ""
     meta = {}
-    if getattr(a, "resume", False):
-        # reattach to a prior conversation: keep session.txt + meta, restart the daemon with --resume-id
-        if not os.path.isdir(d):
-            print(f"--resume: no existing session '{a.handle}' to resume", file=sys.stderr)
-            return 2
-        st, stale = session_status(d)
-        wd = read_file(os.path.join(d, "wd_pid"))
-        if st in LIVE_STATES and not stale and bool(wd) and pid_alive(wd):
-            print(f"--resume: '{a.handle}' is still live (status={st}); `agents stop` it first", file=sys.stderr)
-            return 2
-        resume_id = read_file(os.path.join(d, "session.txt"))
-        if not resume_id:
-            print(f"--resume: '{a.handle}' has no saved conversation id to reattach to", file=sys.stderr)
-            return 2
-        try:
-            meta = json.loads(read_file(os.path.join(d, "meta.json"), "{}"))
-        except Exception:
-            meta = {}
-        saved_engine = meta.get("engine")
-        if saved_engine and saved_engine != a.engine:
-            print(f"--resume: '{a.handle}' is a {saved_engine} session; run "
-                  f"`agents start {saved_engine} --handle {a.handle} --resume`", file=sys.stderr)
-            return 2
-        _clear_for_resume(d)
-    elif os.path.isdir(d):
-        st, stale = session_status(d)
-        wd = read_file(os.path.join(d, "wd_pid"))
-        wd_dead = bool(wd) and not pid_alive(wd)   # a just-killed daemon has a fresh log but a dead pid
-        if st in LIVE_STATES and not stale and not wd_dead:
-            print(f"handle '{a.handle}' already live (status={st}) at {d}", file=sys.stderr)
-            return 2
-        # dead or stale handle: clear the old session dir so the name can be reused
-        shutil.rmtree(d, ignore_errors=True)
-    os.makedirs(d, exist_ok=True)
-    model = a.model or meta.get("model") or DEFAULT_MODEL.get(a.engine, "")
-    cwd = meta.get("cwd") if (resume_id and meta.get("cwd")) else os.path.abspath(a.cwd)
-    full_auto = a.full_auto or bool(meta.get("full_auto"))
-    argv = [sys.executable, DAEMON, d, "--engine", a.engine, "--model", model, "--cwd", cwd]
-    if full_auto:
-        argv.append("--full-auto")
-    if resume_id:
-        argv += ["--resume-id", resume_id]
-    launch_log = open(os.path.join(d, "launch.log"), "ab")
+    model = ""
     try:
-        subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=launch_log, stderr=launch_log,
-                         start_new_session=True, close_fds=True)
+        if getattr(a, "resume", False):
+            # reattach to a prior conversation: keep session.txt + meta, restart the daemon with --resume-id
+            if not os.path.isdir(d):
+                print(f"--resume: no existing session '{a.handle}' to resume", file=sys.stderr)
+                return 2
+            st, stale = session_status(d)
+            wd = read_file(os.path.join(d, "wd_pid"))
+            if st in LIVE_STATES and not stale and bool(wd) and pid_alive(wd):
+                print(f"--resume: '{a.handle}' is still live (status={st}); `agents stop` it first", file=sys.stderr)
+                return 2
+            resume_id = read_file(os.path.join(d, "session.txt"))
+            if not resume_id:
+                print(f"--resume: '{a.handle}' has no saved conversation id to reattach to", file=sys.stderr)
+                return 2
+            try:
+                meta = json.loads(read_file(os.path.join(d, "meta.json"), "{}"))
+            except Exception:
+                meta = {}
+            saved_engine = meta.get("engine")
+            if saved_engine and saved_engine != a.engine:
+                print(f"--resume: '{a.handle}' is a {saved_engine} session; run "
+                      f"`agents start {saved_engine} --handle {a.handle} --resume`", file=sys.stderr)
+                return 2
+            _clear_for_resume(d)
+        elif os.path.isdir(d):
+            st, stale = session_status(d)
+            wd = read_file(os.path.join(d, "wd_pid"))
+            wd_dead = bool(wd) and not pid_alive(wd)   # a just-killed daemon has a fresh log but a dead pid
+            if st in LIVE_STATES and not stale and not wd_dead:
+                print(f"handle '{a.handle}' already live (status={st}) at {d}", file=sys.stderr)
+                return 2
+            # dead or stale handle: clear the old session dir so the name can be reused
+            shutil.rmtree(d, ignore_errors=True)
+        os.makedirs(d, exist_ok=True)
+        model = a.model or meta.get("model") or DEFAULT_MODEL.get(a.engine, "")
+        cwd = meta.get("cwd") if (resume_id and meta.get("cwd")) else os.path.abspath(a.cwd)
+        full_auto = a.full_auto or bool(meta.get("full_auto"))
+        argv = [sys.executable, DAEMON, d, "--engine", a.engine, "--model", model, "--cwd", cwd]
+        if full_auto:
+            argv.append("--full-auto")
+        if resume_id:
+            argv += ["--resume-id", resume_id]
+        launch_log = open(os.path.join(d, "launch.log"), "ab")
+        try:
+            subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=launch_log, stderr=launch_log,
+                             start_new_session=True, close_fds=True)
+        finally:
+            launch_log.close()
+        # hold the lock until the daemon CLAIMS the handle (writes wd_pid), so a concurrent same-handle
+        # start can't see this just-launched (pre-wd_pid) session as stale and rmtree it out from under us
+        claim_deadline = time.time() + 15
+        while time.time() < claim_deadline:
+            if read_file(os.path.join(d, "wd_pid")):
+                break
+            if read_file(os.path.join(d, "status"), "") in ("failed", "aborted", "stopped", "done"):
+                break
+            time.sleep(0.1)
     finally:
-        launch_log.close()
-    # wait for the daemon to leave 'starting'
+        try:
+            fcntl.flock(lock, fcntl.LOCK_UN); lock.close()
+        except Exception:
+            pass
+    # wait for the daemon to leave 'starting' (lock released — the handle is already claimed)
     deadline = time.time() + STARTUP_TIMEOUT
     while time.time() < deadline:
         st = read_file(os.path.join(d, "status"), "starting")
@@ -650,6 +699,7 @@ def main():
     p = sub.add_parser("gc"); p.add_argument("--days", type=int, default=7); p.set_defaults(fn=cmd_gc)
 
     a = ap.parse_args()
+    _ensure_base_dir()       # private 0700 sessions dir; refuse a foreign-owned shared path
     return a.fn(a)
 
 

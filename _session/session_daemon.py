@@ -722,6 +722,23 @@ class PtyDbBackend(Backend):
         self.CONV_DIR = os.environ.get(
             "AGY_CONV_DIR", os.path.expanduser("~/.gemini/antigravity-cli/conversations"))
         self._resume_id = ""
+        self._needs_settle = False    # set by cancel(); the next send waits for agy to quiesce first
+
+    def _wait_pty_quiesce(self, bound=3.0, stable=0.4):
+        """After a \\x03 cancel, wait until agy stops emitting (it's back at its prompt) before the next
+        inject, so the follow-up can't interleave with the turn being torn down."""
+        deadline = time.time() + bound
+        last_len = -1
+        last_change = time.time()
+        while time.time() < deadline:
+            with self._slock:
+                cur = len(self._screen)
+            if cur != last_len:
+                last_len = cur
+                last_change = time.time()
+            elif time.time() - last_change >= stable:
+                return
+            time.sleep(0.1)
 
     def start(self, resume_id=""):
         self._resume_id = resume_id or ""
@@ -991,6 +1008,9 @@ class PtyDbBackend(Backend):
         else:
             if self._master is None or not self.is_alive():
                 raise RuntimeError("gemini pty not alive")
+            if self._needs_settle:
+                self._wait_pty_quiesce()   # let agy finish unwinding a just-cancelled turn before injecting
+                self._needs_settle = False
             pre = self._max_idx()
             self._inject(text)
             payloads = self._wait_turn_end(pre, HANG_SEC)
@@ -1005,6 +1025,7 @@ class PtyDbBackend(Backend):
         try:
             if self._master is not None:
                 os.write(self._master, b"\x03")   # single ETX: cancel the turn, keep agy alive (S5)
+                self._needs_settle = True         # next send waits for agy to return to its prompt
             return "graceful"
         except Exception:
             return None
