@@ -177,12 +177,17 @@ ln -sfn "$RUN_DIR" /tmp/codex_runs/latest 2>/dev/null || true
 # reconstructed byte-for-byte (incl. any -C), so normal calls are unchanged.
 ISOLATE=0; ISOLATE_WT=""; ISOLATE_REPO=""; ISOLATE_BASE_SHA=""
 for a in "$@"; do [ "$a" = "--isolate" ] && ISOLATE=1; done
+# --no-net: OUR flag (peeled below, never forwarded to codex). Opts OUT of the
+# default network grant under workspace-write (see the network block after --isolate).
+NO_NET=0
+for a in "$@"; do [ "$a" = "--no-net" ] && NO_NET=1; done
 _NEWARGS=(); _want_cd=0; _want_ad=0; _dropped_ad=""
 for a in "$@"; do
     if [ "$_want_cd" -eq 1 ]; then ISOLATE_REPO="$a"; _want_cd=0; continue; fi
     if [ "$_want_ad" -eq 1 ]; then _dropped_ad="$_dropped_ad $a"; _want_ad=0; continue; fi
     case "$a" in
         --isolate)   ;;                                                          # always drop our flag
+        --no-net)    ;;                                                          # always drop our flag (network opt-out; handled after the --isolate block)
         -C|--cd)     if [ "$ISOLATE" -eq 1 ]; then _want_cd=1; else _NEWARGS+=( "$a" ); fi ;;
         -C=*)        if [ "$ISOLATE" -eq 1 ]; then ISOLATE_REPO="${a#-C=}"; else _NEWARGS+=( "$a" ); fi ;;
         --cd=*)      if [ "$ISOLATE" -eq 1 ]; then ISOLATE_REPO="${a#--cd=}"; else _NEWARGS+=( "$a" ); fi ;;
@@ -330,6 +335,41 @@ if [ "$ISOLATE" -eq 1 ]; then
     fi
 fi
 
+# --- Network access under workspace-write (--full-auto) --------------------
+# codex's workspace-write seatbelt DISABLES network by default — including
+# localhost — so a --full-auto build cannot reach a local Postgres/dev-server to
+# run its own DB-backed integration tests (observed: "sandbox blocks Postgres TCP
+# to 127.0.0.1:5432 — Operation not permitted"). Every verify round-trip then fell
+# back to the orchestrator. The watchdog passes --ignore-user-config, so nothing in
+# ~/.codex/config.toml can loosen this; the ONLY lever is an explicit -c. When
+# workspace-write is in effect (--full-auto, or -s/--sandbox workspace-write in any
+# spelling), grant network access so codex can verify its own work. Opt out with
+# --no-net. Codex's own docs: "[sandbox_workspace_write] network_access = true".
+#
+# Injected AFTER the --isolate escape-flag guard above (which refuses CALLER -c to
+# stop a sandbox-widening TOML override). This key is watchdog-controlled and only
+# toggles network — it never touches writable_roots — so it does NOT re-grant live
+# write access and is safe under --isolate (the worktree still bounds all writes).
+# Placed BEFORE "$@" so an explicit caller -c ...network_access=false still wins.
+NET_FLAGS=()
+if [ "$NO_NET" -eq 0 ]; then
+    _ws=0; _sbctx=0
+    for a in "$@"; do
+        if [ "$_sbctx" -eq 1 ]; then
+            case "$a" in workspace-write) _ws=1 ;; esac; _sbctx=0
+        fi
+        case "$a" in
+            --full-auto)                                                   _ws=1 ;;
+            -s=workspace-write|--sandbox=workspace-write|-sworkspace-write) _ws=1 ;;
+            -s|--sandbox)                                                  _sbctx=1 ;;
+        esac
+    done
+    if [ "$_ws" -eq 1 ]; then
+        NET_FLAGS=(-c sandbox_workspace_write.network_access=true)
+        log_wd "network: workspace-write detected -> granting sandbox network access (-c sandbox_workspace_write.network_access=true); opt out with --no-net"
+    fi
+fi
+
 # With --ignore-user-config as the default, attempt 0 already bypasses the
 # broken-MCP startup hang. Attempt 1 adds --ephemeral to rule out any
 # session-state corruption. Two tiers cover the observed failure space.
@@ -357,7 +397,7 @@ while true; do
     : > "$STDERR_FILE"
 
     # shellcheck disable=SC2086
-    codex exec $extra_isolation "$@" \
+    codex exec $extra_isolation ${NET_FLAGS[@]+"${NET_FLAGS[@]}"} "$@" \
         --json -o "$OUTPUT_FILE" - \
         < "$PROMPT_FILE" \
         > "$EVENTS_FILE" \

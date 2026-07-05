@@ -64,6 +64,8 @@ cat > "$RUN_DIR/prompt.txt" <<'PROMPT'
 PROMPT
 ```
 
+> **ALWAYS quote the heredoc delimiter (`<<'PROMPT'`, not `<<PROMPT`).** An *unquoted* heredoc makes the shell expand the body: `` `backticks` `` are command-substituted and run, `$var`/`$(...)` are expanded, and a prompt that contains code, SQL, `$`, or backticks is silently mangled — often to **empty**, which the watchdog then rejects with `missing or empty prompt`. The quoted form writes the body verbatim. When the prompt is a single string you control, prefer the **Write tool** over a shell heredoc entirely. Only use an unquoted heredoc if you deliberately need shell expansion, and even then inject just the one variable safely (see Parallel Batch below), never by unquoting the whole prompt.
+
 The main session enhances the user's prompt by adding file/dir paths to read or work in, relevant context from the conversation, and the expected deliverable. For `--full-auto`: which directory to work in and what files to modify.
 
 ### 4. Invoke Watchdog
@@ -134,9 +136,16 @@ SUBJECTS=(subject_a subject_b subject_c)
 for sid in "${SUBJECTS[@]}"; do
     RUN_DIR=/tmp/gemini_runs/gemini_${sid}
     mkdir -p "$RUN_DIR"
-    cat > "$RUN_DIR/prompt.txt" <<PROMPT
-[per-subject prompt referencing $sid]
+    # Keep the body in a QUOTED heredoc so code/SQL/backticks/$ in the prompt are
+    # written verbatim (an unquoted <<PROMPT would command-substitute them and can
+    # silently empty the file). Inject the ONE per-subject variable via a controlled
+    # printf line — never by unquoting the whole body.
+    {
+        printf 'Subject id: %s\n\n' "$sid"
+        cat <<'PROMPT'
+[static per-subject prompt body; refer to the subject id printed above]
 PROMPT
+    } > "$RUN_DIR/prompt.txt"
 done
 ```
 
