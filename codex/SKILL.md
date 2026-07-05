@@ -3,7 +3,7 @@ name: codex
 description: "Delegate a task to a Codex agent (GPT-5.5, xhigh reasoning). Runs codex exec via watchdog, supervises one run per directory, reads result. Background and session resume supported."
 user-invocable: true
 allowed-tools: Read, Write, Bash
-argument-hint: "[--bg] [--resume] [--full-auto] [--schema <file>] [--with-user-config] [--run-id <name>] <prompt>"
+argument-hint: "[--bg] [--resume] [--full-auto] [--no-net] [--schema <file>] [--with-user-config] [--run-id <name>] <prompt>"
 ---
 
 # Codex Skill
@@ -31,18 +31,24 @@ Extract from `$ARGUMENTS`:
 |------|--------|
 | `--bg` | Run watchdog in background (`run_in_background: true`). Main session continues; reads result on completion notification. |
 | `--resume` | Resume the latest codex session. Reads thread_id from `/tmp/codex_runs/latest/session.txt` (or `/tmp/codex_runs/<run-id>/session.txt` if `--run-id` is given). |
-| `--full-auto` | Workspace writes (`--sandbox workspace-write -c approval_policy=never`). Combine with `-C <project_dir>` to set codex's working directory. |
+| `--full-auto` | Workspace writes (`--sandbox workspace-write -c approval_policy=never`). Combine with `-C <project_dir>` to set codex's working directory. The watchdog also grants **network access** in this mode (`-c sandbox_workspace_write.network_access=true`) so codex can reach a local DB / dev-server and run its own integration tests; opt out with `--no-net`. Note: `.git` stays **read-only** under workspace-write, so codex cannot commit — see "Git under `--full-auto`". |
+| `--no-net` | Opt OUT of the default network grant under workspace-write (keeps codex's sandbox network-isolated, incl. localhost). Use for tasks that process untrusted input or run third-party code and have no reason to touch the network. No effect on read-only runs (network is already off). |
 | `--isolate` | Run codex inside a throwaway `git worktree` at HEAD of the target repo, so a `--full-auto` builder cannot reach your live uncommitted source (the `git reset --hard` data-loss class). Pair with `--full-auto -C <repo>`. The watchdog symlinks `.venv` + sets `PYTHONPATH` (the `.venv` is SHARED — a build that rewrites it affects the live env, the gitignored/reconstructable tradeoff); on completion it leaves the worktree (review/merge note in `$RUN_DIR/isolate_result`) if codex changed anything OR committed, else removes it. If a worktree can't be created (unborn HEAD, non-git, reused stale path), OR a prior isolated run left unmerged work at the run-dir's worktree, OR a sandbox-modifying flag is present — `--dangerously-bypass-approvals-and-sandbox`, `-s danger-full-access`, or ANY `-c`/`--config` or `-p`/`--profile` (these can set/widen the sandbox; codex parses `-c` as TOML so it can't be safely allowlisted) — it FAILS CLOSED (refuses, exit 1) — never runs in the live tree. Under `--isolate` pass model/reasoning via `CODEX_MODEL`/`CODEX_REASONING` env and the write mode via `--full-auto`, not explicit `-c`/`-s`/`-p`. Caller `--add-dir` is also stripped under `--isolate`. Codex's workspace-write sandbox makes this OS-enforced isolation — caveat: workspace-write also grants `/tmp` + `$TMPDIR` writable by default, so a repo located UNDER `/tmp`/`$TMPDIR` is NOT fully confined (keep repos in your home tree). Opt-in — see "When to isolate". |
 | `--schema <file>` | Pass `--output-schema <file>` to codex for structured output. |
 | `--with-user-config` | Load `~/.codex/config.toml` (default: ignored). Use only when codex needs the configured MCP servers (github, semantic-scholar, playwright). |
 | `--run-id <name>` | Override default run_id. Run dir becomes `/tmp/codex_runs/<name>`. Useful for parallel-batch subject ids and for `--resume` targeting a specific prior run. |
 | Everything else | The prompt. |
 
-> Verified on codex-cli 0.133.0 (2026-05-25): `--full-auto` is NOT listed in `codex exec --help`. It is an undocumented alias that still works today and maps to `--sandbox workspace-write -c approval_policy=never`. It functions, but new code (e.g. the review-panel adjudicator) should prefer the explicit `--sandbox workspace-write -c approval_policy=never` form rather than depend on the alias. Separately: the broken figma/notion/linear MCP servers were removed from `~/.codex/config.toml` on 2026-05-25, so bare `codex` no longer hangs at startup; `--ignore-user-config` (the watchdog default) is now belt-and-suspenders, not load-bearing.
+> Verified on codex-cli 0.133.0 (2026-05-25) and re-checked on 0.142.5 (2026-07-05): `--full-auto` is NOT listed in `codex exec --help`. It is an undocumented alias that still works today and maps to `--sandbox workspace-write -c approval_policy=never`. It functions, but new code (e.g. the review-panel adjudicator) should prefer the explicit `--sandbox workspace-write -c approval_policy=never` form rather than depend on the alias. Separately: the broken figma/notion/linear MCP servers were removed from `~/.codex/config.toml` on 2026-05-25, so bare `codex` no longer hangs at startup; `--ignore-user-config` (the watchdog default) is now belt-and-suspenders, not load-bearing.
+>
+> **Network under workspace-write (fixed 2026-07-05).** codex's workspace-write seatbelt disables network *including localhost* by default, so a `--full-auto` build could not reach a local Postgres/dev-server to run its own DB-backed tests ("sandbox blocks Postgres TCP to 127.0.0.1:5432 — Operation not permitted"), and every verify round-trip fell back to the orchestrator. Because the watchdog runs `--ignore-user-config`, `~/.codex/config.toml` cannot loosen this — the only lever is an explicit `-c`. The watchdog now detects workspace-write (`--full-auto` or `-s/--sandbox workspace-write`) and injects `-c sandbox_workspace_write.network_access=true` (codex's own documented key). `--no-net` opts out. Verified against codex 0.142.5: `[sandbox_workspace_write]` exposes only `network_access`, `writable_roots`, `exclude_slash_tmp`, `exclude_tmpdir_env_var` — there is **no** git-write toggle.
 
 Do not auto-infer `--full-auto` from prompt content. If the user did not pass it explicitly and the task seems to need writes, ask before launching.
 
 If the user passes `--bg --full-auto` together, ask before running. Claude Code's permission layer may block `workspace-write + background` as bypassing approval gates.
+
+#### Git under `--full-auto` — codex does NOT self-commit
+Under workspace-write the seatbelt keeps `.git` **read-only** (it prevents the model from rewriting history), so any `git add`/`git commit` codex attempts fails with `could not commit .git/index.lock — Operation not permitted`. **This is expected, not a task failure.** codex edits files in the worktree; the orchestrator (the main session) reviews the resulting diff and commits. Do not treat "could not commit" in codex's output as an error to retry. There is no clean config toggle to make `.git` writable (codex 0.142.5's `[sandbox_workspace_write]` has no git-write key — only `writable_roots`), and granting it would defeat the point of the read-only-history guard, so we don't. If a task genuinely must self-commit, run it read-only for planning and have the orchestrator do the git work, or use `--isolate` (a throwaway worktree) and merge afterward.
 
 #### When to isolate (`--isolate`) — decide per task
 `--isolate` is OFF by default (codex writes directly in the repo, as today). Turn it ON when:
@@ -72,6 +78,8 @@ cat > "$RUN_DIR/prompt.txt" <<'PROMPT'
 {enhanced prompt}
 PROMPT
 ```
+
+> **ALWAYS quote the heredoc delimiter (`<<'PROMPT'`, not `<<PROMPT`).** An *unquoted* heredoc makes the shell expand the body: `` `backticks` `` are command-substituted and run, `$var`/`$(...)` are expanded, and a prompt that contains code, SQL, `$`, or backticks is silently mangled — often to **empty**, which the watchdog then rejects with `ERROR: missing or empty prompt`. The quoted form writes the body verbatim. When the prompt is a single string you control, prefer the **Write tool** over a shell heredoc entirely — no quoting to get wrong. Only reach for an unquoted heredoc if you deliberately need shell expansion in the body, and even then inject just the one variable safely (see Parallel Batch below), never by unquoting the whole prompt.
 
 The main session enhances the user's prompt by adding:
 - File paths and directory paths to read or work in.
@@ -147,9 +155,16 @@ SUBJECTS=(subject_a subject_b subject_c)
 for sid in "${SUBJECTS[@]}"; do
     RUN_DIR=/tmp/codex_runs/codex_${sid}
     mkdir -p "$RUN_DIR"
-    cat > "$RUN_DIR/prompt.txt" <<PROMPT
-[per-subject prompt referencing $sid]
+    # Keep the body in a QUOTED heredoc so code/SQL/backticks/$ in the prompt are
+    # written verbatim (an unquoted <<PROMPT would command-substitute them and can
+    # silently empty the file). Inject the ONE per-subject variable via a controlled
+    # printf line — never by unquoting the whole body.
+    {
+        printf 'Subject id: %s\n\n' "$sid"
+        cat <<'PROMPT'
+[static per-subject prompt body; refer to the subject id printed above]
 PROMPT
+    } > "$RUN_DIR/prompt.txt"
 done
 ```
 
