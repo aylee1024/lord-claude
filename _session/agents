@@ -25,7 +25,7 @@ STARTUP_TIMEOUT = int(os.environ.get("SESSION_STARTUP_TIMEOUT", "180"))
 STALE_SEC = int(os.environ.get("SESSION_STALE_SEC", "90"))
 LIVE_STATES = ("starting", "idle", "busy")
 DEFAULT_MODEL = {"grok": "grok-build", "composer": "grok-composer-2.5-fast",
-                 "codex": "gpt-5.5", "gemini": "Gemini 3.5 Flash (High)"}
+                 "codex": "gpt-5.6-sol", "gemini": "Gemini 3.5 Flash (High)"}
 
 
 _HANDLE_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]*$')

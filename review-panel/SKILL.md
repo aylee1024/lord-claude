@@ -33,8 +33,8 @@ Every reviewer prompt is prepended with: `~/.claude/CLAUDE.md`, the active plan 
 
 ### 3. Spawn the panel (background, one watchdog call per agent)
 Allocate a run dir per reviewer. Each reviewer is told: **emit ONLY a JSON object matching `~/.claude/skills/review-panel/findings.schema.json`.** Per-agent model/effort via the existing env knobs.
-- **codex-domain** — `CODEX_MODEL=gpt-5.5 CODEX_REASONING=xhigh run_with_watchdog.sh <dir> --output-schema ~/.claude/skills/review-panel/findings.schema.json -C $REPO --skip-git-repo-check` ; prompt = per-deliverable craft/physics correctness. (`--output-schema` is codex's flag; the raw watchdog forwards it verbatim. Prompt-instructed JSON also works without it.)
-- **codex-integration** — same; prompt = cross-file consistency, build chain, would-it-work-on-this-machine. (A cheaper/`medium` pass is fine here.)
+- **codex-domain** — `CODEX_MODEL=gpt-5.6-sol CODEX_REASONING=ultra run_with_watchdog.sh <dir> --output-schema ~/.claude/skills/review-panel/findings.schema.json -C $REPO --skip-git-repo-check` ; prompt = per-deliverable craft/physics correctness. (`--output-schema` is codex's flag; the raw watchdog forwards it verbatim. Prompt-instructed JSON also works without it.)
+- **codex-integration** — same; prompt = cross-file consistency, build chain, would-it-work-on-this-machine.
 - **gemini** — `GEMINI_MODEL="Gemini 3.5 Flash (High)"` gemini `run_with_watchdog.sh` (agy-backed; use `"Gemini 3.1 Pro (High)"` for the heaviest waves); prompt = fresh-eye/alternative-mechanism; emit the same JSON shape in a fenced ```json block.
 - **grok** — `GROK_MODEL=grok-build GROK_EFFORT=max GROK_WATCHDOG_CWD=$REPO ~/.claude/skills/grok/run_with_watchdog.sh <dir>` (xAI; read-only by default — reviewers don't execute, the adjudicator does); prompt = fresh-eye/alternative-mechanism, a distinct lens from gemini; emit the same JSON shape in a fenced ```json block.
 - **composer** — same call with `GROK_MODEL=grok-composer-2.5-fast` (Cursor Composer 2.5); prompt = another independent lens; emit the same JSON shape.

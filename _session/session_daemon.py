@@ -516,14 +516,14 @@ class McpBackend(Backend):
 
     def __init__(self, model, cwd, full_auto, sdir, log):
         super().__init__()
-        self.model = model or "gpt-5.5"
+        self.model = model or "gpt-5.6-sol"
         self.cwd = cwd
         self.full_auto = full_auto
         self.sdir = sdir
         self.log = log
         self.client = None
         self.thread_id = ""
-        self._reasoning = os.environ.get("CODEX_REASONING", "xhigh")
+        self._reasoning = os.environ.get("CODEX_REASONING", "ultra")
 
     def start(self, resume_id=""):
         env = dict(os.environ)
