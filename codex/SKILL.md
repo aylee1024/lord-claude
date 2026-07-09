@@ -1,6 +1,6 @@
 ---
 name: codex
-description: "Delegate a task to a Codex agent (GPT-5.5, xhigh reasoning). Runs codex exec via watchdog, supervises one run per directory, reads result. Background and session resume supported."
+description: "Delegate a task to a Codex agent (GPT-5.6-Sol, ultra reasoning). Runs codex exec via watchdog, supervises one run per directory, reads result. Background and session resume supported."
 user-invocable: true
 allowed-tools: Read, Write, Bash
 argument-hint: "[--bg] [--resume] [--full-auto] [--no-net] [--schema <file>] [--with-user-config] [--run-id <name>] <prompt>"
@@ -102,7 +102,7 @@ Bash call settings:
 - `timeout: 1800000` (always)
 - `run_in_background: true` (only if `--bg`)
 
-The watchdog already plumbs `--ignore-user-config -m gpt-5.5 -c model_reasoning_effort=xhigh`. Do not pass these yourself.
+The watchdog already plumbs `--ignore-user-config -m gpt-5.6-sol -c model_reasoning_effort=ultra`. Do not pass these yourself.
 
 #### 4b. Resume
 
@@ -230,7 +230,7 @@ Even with `wait`, the harness only sees ONE completion notification — for the 
 Every codex invocation MUST go through `~/.claude/skills/codex/run_with_watchdog.sh`. Calling `codex exec` directly is forbidden because it skips four critical defenses:
 
 1. **No MCP-OAuth fast-fail.** Codex blocks at startup on the 30s `tools/list` MCP timeout (openai/codex #19556) or on `AuthRequired` loops from figma/notion/linear MCP servers in `~/.codex/config.toml`. The watchdog detects these patterns in stderr and kills+retries within seconds.
-2. **No model pinning.** Without `-m gpt-5.5`, codex CLI falls back to its compiled-in default (`gpt-5.4` as of 0.125) when `--ignore-user-config` is set, or to whatever the user-config last set. The watchdog plumbs `-m gpt-5.5 -c model_reasoning_effort=xhigh` consistently.
+2. **No model pinning.** Without `-m gpt-5.6-sol`, codex CLI falls back to its compiled-in default (`gpt-5.6-sol` as of 0.144.0 — it drifts with CLI version) when `--ignore-user-config` is set, or to whatever the user-config last set. The watchdog plumbs `-m gpt-5.6-sol -c model_reasoning_effort=ultra` consistently.
 3. **No status primitive.** Bare invocations don't write `$RUN_DIR/status`, so the main session can't tell `done` from `hung_killed` from `aborted`.
 4. **Lost harness notifications when shell-backgrounded.** `codex exec ... &` (shell `&`) detaches codex from the Bash subprocess; the Bash tool returns immediately and the harness considers the work done while codex continues running unobserved. The watchdog runs codex as a foreground child inside its own process, so the Bash tool's `run_in_background: true` correctly fires its completion notification when codex actually exits.
 
@@ -247,7 +247,7 @@ echo "PID: $!"
 
 Failure modes (any combination, often together):
 - Main session loses notification (`&` detaches from Bash subprocess)
-- Model falls back to gpt-5.4 (no `-m` flag)
+- Model falls back to the CLI's compiled-in default, which drifts with CLI version (no `-m` flag)
 - MCP OAuth hangs for minutes with no diagnostic
 - No status file to query
 
@@ -289,7 +289,7 @@ The watchdog defaults to `--ignore-user-config`, which bypasses the broken-OAuth
 
 Two thresholds:
 - `STARTUP_GRACE_SEC` (default 60): no `thread.started` event by then → kill, retry with `--ephemeral` once, then give up with `status=hung_killed`. Catches MCP-OAuth hangs and codex CLI startup failures.
-- `NO_PROGRESS_SEC` (default **0 = disabled**): once `thread.started` has fired, the watchdog does NOT enforce a steady-state liveness threshold by default. xhigh reasoning streams tokens with long inter-token gaps (3-15 minutes is normal for deep architectural debates or design tasks), and event-stream growth is not a reliable liveness signal once codex is alive. The Bash tool's 30-min timeout is the ultimate backstop. Opt in by setting `NO_PROGRESS_SEC=600` (or similar) when you want tight steady-state monitoring for a specific call.
+- `NO_PROGRESS_SEC` (default **0 = disabled**): once `thread.started` has fired, the watchdog does NOT enforce a steady-state liveness threshold by default. ultra reasoning streams tokens with long inter-token gaps (3-15 minutes is normal for deep architectural debates or design tasks), and event-stream growth is not a reliable liveness signal once codex is alive. The Bash tool's 30-min timeout is the ultimate backstop. Opt in by setting `NO_PROGRESS_SEC=600` (or similar) when you want tight steady-state monitoring for a specific call.
 
 **Empty-output gate (audit 2e):** a codex run that exits 0 but writes nothing (or only whitespace) to `output.md` is treated as a FAILED attempt — retried once, then `status=failed` with exit 1. The watchdog never reports `done` with a blank answer.
 
@@ -306,7 +306,7 @@ STARTUP_GRACE_SEC=120 ~/.claude/skills/codex/run_with_watchdog.sh "$RUN_DIR" ...
 Override model:
 
 ```bash
-CODEX_MODEL=gpt-5.6 CODEX_REASONING=xhigh \
+CODEX_MODEL=gpt-5.5 CODEX_REASONING=xhigh \
     ~/.claude/skills/codex/run_with_watchdog.sh "$RUN_DIR" ...
 ```
 
@@ -338,7 +338,7 @@ CODEX_MODEL=gpt-5.6 CODEX_REASONING=xhigh \
 | `-C <dir> --full-auto` | Code tasks (writes to project directory). |
 | `--sandbox workspace-write -c approval_policy=never` | Required for `--full-auto` non-interactive. |
 
-**Gotcha:** `codex exec --ignore-user-config` without an explicit `-m` flag falls back to the CLI's compiled-in default, which is currently `gpt-5.4` (verified codex-cli 0.125, 2026-04-29). The user-config setting `model = "gpt-5.5"` is bypassed by `--ignore-user-config`. Always pass `-m gpt-5.5` when invoking codex directly. The watchdog plumbs this for you; bare `codex exec` calls do not.
+**Gotcha:** `codex exec --ignore-user-config` without an explicit `-m` flag falls back to the CLI's compiled-in default, which is currently `gpt-5.6-sol` (verified codex-cli 0.144.0, 2026-07-09) but drifts with CLI version. The user-config setting `model = "gpt-5.6-sol"` is bypassed by `--ignore-user-config`. Always pass `-m gpt-5.6-sol` when invoking codex directly. The watchdog plumbs this for you; bare `codex exec` calls do not.
 
 ## Session Lifecycle
 
