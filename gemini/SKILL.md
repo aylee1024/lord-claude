@@ -196,7 +196,7 @@ wait
 Every invocation MUST go through `~/.claude/skills/gemini/run_with_watchdog.sh`. Calling `agy --print` directly skips four defenses:
 
 1. **No fast-fail on auth/quota errors.** The watchdog greps stderr for `IneligibleTier`, `UNSUPPORTED_CLIENT`, `RESOURCE_EXHAUSTED`, etc., kills within seconds, and classifies the failure — auth fails immediately (no pointless retry), quota loud-fails with a tier hint.
-2. **No model validation/remap.** The watchdog validates `GEMINI_MODEL` against `agy models` and remaps any stale/legacy id (e.g. a gemini-cli `gemini-2.5-pro`) to the default, so a frozen caller still runs.
+2. **No model validation/remap.** The watchdog validates `GEMINI_MODEL` against `agy models`, normalizes a display name to its matching bare id (same tier), and remaps a genuinely unknown/legacy id (e.g. a gemini-cli `gemini-2.5-pro`) to the default, so a frozen caller still runs — and, critically, never hands agy a display name that agy would silently ignore.
 3. **No status primitive.** Bare invocations don't write `$RUN_DIR/status`, so the main session can't tell `done` from `hung_killed` from `failed`.
 4. **Lost harness notifications when shell-backgrounded.** `agy --print ... &` detaches agy from the Bash subprocess; the watchdog runs agy as a foreground child in its own subshell so `run_in_background: true` fires its completion correctly.
 
@@ -283,7 +283,7 @@ GEMINI_MODEL="Gemini 3.1 Pro (High)" \
 | `--sandbox` | Run with terminal restrictions enabled. |
 | `agy models` | List available models (watchdog uses this to validate/remap `GEMINI_MODEL`). |
 
-Available models (from `agy models`, 2026-06-18): `Gemini 3.5 Flash (Low|Medium|High)`, `Gemini 3.1 Pro (Low|High)`, `Claude Sonnet 4.6 (Thinking)`, `Claude Opus 4.6 (Thinking)`, `GPT-OSS 120B (Medium)`. The reasoning tier is baked into the model name.
+Available models (from `agy models`, 2026-07-23): `gemini-3.6-flash-{low,medium,high}`, `gemini-3.5-flash-{low,medium,high}`, `gemini-3.1-pro-{low,high}`, `claude-sonnet-4-6`, `claude-opus-4-6-thinking`, `gpt-oss-120b-medium`. The reasoning tier is baked into the model id. **agy binds bare ids only** — as of 2026-07-22 it silently ignores the old display-name form (`Gemini 3.5 Flash (High)`) and serves its own default. The watchdog normalizes any display name a caller passes to the matching bare id (same tier, not a downgrade) before invoking agy, so display-name callers keep working; prefer the bare id in new callers.
 
 ## Known Divergences from `/codex`
 
@@ -304,7 +304,7 @@ Available models (from `agy models`, 2026-06-18): `Gemini 3.5 Flash (Low|Medium|
 
 - **Resume is by conversation id.** The watchdog records this run's conversation — the newest `~/.gemini/antigravity-cli/conversations/<uuid>.db` — into `session.txt`, so `resume <uuid>` maps to `--conversation <uuid>` (exact) and `resume latest`/empty maps to `--continue`. For a warm in-memory multi-turn session, see *Live session* below.
 - **No MCP allowlist knob.** The old gemini-cli `--allowed-mcp-server-names` isolation is gone; agy manages its own tools. The retry path simply re-runs.
-- **Legacy `GEMINI_MODEL` ids self-heal.** Any value not in `agy models` (including every gemini-cli id) is remapped to the default and logged in `watchdog.log` — this is what lets already-running sessions adopt agy without an edit.
+- **Legacy `GEMINI_MODEL` ids self-heal.** A display name (`Gemini 3.6 Flash (High)`) is normalized to its bare id (`gemini-3.6-flash-high`, same tier); any value with no matching tier (including every gemini-cli id) is remapped to the default. Both are logged in `watchdog.log` — this is what lets already-running sessions adopt agy without an edit.
 
 ## Live session (Tier 2 — warm, multi-turn)
 For an ongoing conversation where gemini stays warm in memory and remembers the whole exchange, use the unified dispatcher or this skill's shim:
