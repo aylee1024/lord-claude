@@ -28,11 +28,16 @@ cat > "$STUBDIR/agy" <<'STUB'
 set -u
 if [ "${1:-}" = "models" ]; then
     [ -n "${STUB_COUNTER_FILE:-}" ] && echo x >> "$STUB_COUNTER_FILE"
+    # Real agy models output form since 2026-07-22: lowercase BARE ids, one per line
+    # (display names like "Gemini 3.5 Flash (High)" are gone — agy silently ignores them).
     case "${STUB_MODELS:-models}" in
-        models) printf '%s\n' "Gemini 3.5 Flash (High)" "Gemini 3.5 Flash (Low)" \
-                              "Gemini 3.1 Pro (High)" "Claude Opus 4.6 (Thinking)" "GPT-OSS 120B (Medium)" ;;
-        models_padded) printf '   %s   \n' "Gemini 3.1 Pro (High)"; printf '%s\n' "Gemini 3.5 Flash (High)" ;;
+        models) printf '%s\n' "gemini-3.6-flash-high" "gemini-3.5-flash-high" "gemini-3.5-flash-low" \
+                              "gemini-3.1-pro-high" "claude-opus-4-6-thinking" "gpt-oss-120b-medium" ;;
+        models_padded) printf '   %s   \n' "gemini-3.1-pro-high"; printf '%s\n' "gemini-3.5-flash-high" ;;
         models_empty) : ;;
+        # Diagnostic prose that CONTAINS "gemini" but is NOT a model-id list — a substring
+        # sentinel would wrongly cache this; the anchored sentinel must reject it.
+        models_garbage) printf '%s\n' "no gemini models available (catalog unavailable)" "try again later" ;;
         models_hang) [ -n "${STUB_HANG_PIDFILE:-}" ] && echo "$$" > "$STUB_HANG_PIDFILE"; sleep 600 ;;
     esac
     exit 0
@@ -55,7 +60,7 @@ case "${STUB_PRINT:-ok}" in
     transient)
         n=1; [ -n "${STUB_ATTEMPT_FILE:-}" ] && { echo x >> "$STUB_ATTEMPT_FILE"; n=$(wc -l < "$STUB_ATTEMPT_FILE" | tr -d ' '); }
         if [ "$n" -lt 2 ]; then echo "transient network blip" >&2; exit 1; else printf 'STUB recovered on attempt %s\n' "$n"; exit 0; fi ;;
-    quota_pro) case "$model" in *Pro*) echo "RESOURCE_EXHAUSTED: quota exceeded" >&2; exit 1 ;; *) printf 'STUB FLASH ANSWER for %s\n' "$model"; exit 0 ;; esac ;;
+    quota_pro) case "$model" in *pro*) echo "RESOURCE_EXHAUSTED: quota exceeded" >&2; exit 1 ;; *) printf 'STUB FLASH ANSWER for %s\n' "$model"; exit 0 ;; esac ;;
     hang) sleep 600 ;;
     slow) sleep "${STUB_SLEEP:-3}"; printf 'STUB SLOW for %s\n' "$model"; exit 0 ;;
     clobber)
@@ -89,7 +94,7 @@ echo "== T1 ok / regression (verbatim, no banner) =="
 d=$(newrun t1)
 base AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models STUB_PRINT=ok "$WD" "$d" >/dev/null 2>&1; rc=$?
 chk "exit 0" "$rc" 0; chk "status done" "$(cat "$d/status")" done
-chk "output verbatim" "$(cat "$d/output.md")" "STUB ANSWER for Gemini 3.5 Flash (High)"
+chk "output verbatim" "$(cat "$d/output.md")" "STUB ANSWER for gemini-3.5-flash-high"
 nofile "no degraded marker" "$d/degraded"
 
 echo "== T2 empty output -> failed =="
@@ -138,7 +143,7 @@ t1=$(date +%s)
 chk "exit 0 (ran despite models hang)" "$rc" 0; chk "status done" "$(cat "$d/status")" done
 if [ "$((t1-t0))" -lt 30 ]; then ok "no wedge ($((t1-t0))s)"; else bad "slow: $((t1-t0))s"; fi
 has "timeout logged" "agy models timed out" "$d/watchdog.log"
-has "kept requested Pro model" "model='Gemini 3.1 Pro (High)'" "$d/watchdog.log"
+has "kept requested Pro model (normalized to bare id offline)" "model='gemini-3.1-pro-high'" "$d/watchdog.log"
 sleep 1; hpid="$(cat "$HPF" 2>/dev/null || echo '')"
 if [ -n "$hpid" ] && kill -0 "$hpid" 2>/dev/null; then bad "leaked stub (pid=$hpid)"
 elif [ -n "$hpid" ] && pgrep -P "$hpid" >/dev/null 2>&1; then bad "leaked sleep child"
@@ -146,10 +151,10 @@ else ok "no leak (hung pid=$hpid reaped)"; fi
 
 echo "== T8 tolerant match: padded Pro line not downgraded =="
 d=$(newrun t8)
-base AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models_padded STUB_PRINT=ok GEMINI_MODEL="Gemini 3.1 Pro (High)" "$WD" "$d" >/dev/null 2>&1; rc=$?
+base AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models_padded STUB_PRINT=ok GEMINI_MODEL="gemini-3.1-pro-high" "$WD" "$d" >/dev/null 2>&1; rc=$?
 chk "exit 0" "$rc" 0; chk "status done" "$(cat "$d/status")" done
 has "tolerant match logged" "whitespace-tolerant" "$d/watchdog.log"
-has "used Pro (not downgraded)" "model='Gemini 3.1 Pro (High)'" "$d/watchdog.log"
+has "used Pro (not downgraded)" "model='gemini-3.1-pro-high'" "$d/watchdog.log"
 nofile "no degraded marker" "$d/degraded"
 
 echo "== T9a cache hit: second run skips agy models =="
@@ -167,13 +172,15 @@ nofile "cache file not written" "$d/.cache"
 
 echo "== T10 diversity guard: non-Gemini forced back to Gemini =="
 d=$(newrun t10a)
-base AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models STUB_PRINT=ok GEMINI_MODEL="Claude Opus 4.6 (Thinking)" "$WD" "$d" >/dev/null 2>&1; rc=$?
+# Exact bare id that IS in the list — binds to Claude, so the diversity guard (not the
+# "not offered" downgrade) is what forces it back to a Gemini model.
+base AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models STUB_PRINT=ok GEMINI_MODEL="claude-opus-4-6-thinking" "$WD" "$d" >/dev/null 2>&1; rc=$?
 chk "exit 0" "$rc" 0; chk "status done" "$(cat "$d/status")" done
-if grep -q "model='Gemini" "$d/watchdog.log" && ! grep -q "model='Claude" "$d/watchdog.log"; then ok "ran Gemini, not Claude"; else bad "did not force Gemini"; fi
+if grep -qi "model='gemini" "$d/watchdog.log" && ! grep -qi "model='claude" "$d/watchdog.log"; then ok "ran Gemini, not Claude"; else bad "did not force Gemini"; fi
 has "degraded (diversity)" "diversity invariant" "$d/degraded"
 d=$(newrun t10b)
-base AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models_empty STUB_PRINT=ok GEMINI_MODEL="Claude Sonnet 4.6 (Thinking)" "$WD" "$d" >/dev/null 2>&1
-if grep -q "model='Gemini" "$d/watchdog.log" && ! grep -q "model='Claude" "$d/watchdog.log"; then ok "offline path forced Gemini"; else bad "offline path leaked non-Gemini"; fi
+base AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models_empty STUB_PRINT=ok GEMINI_MODEL="claude-sonnet-4-6" "$WD" "$d" >/dev/null 2>&1
+if grep -qi "model='gemini" "$d/watchdog.log" && ! grep -qi "model='claude" "$d/watchdog.log"; then ok "offline path forced Gemini"; else bad "offline path leaked non-Gemini"; fi
 
 echo "== T11 sweep matcher precision (unit) =="
 if python3 - <<'PY'
@@ -389,24 +396,26 @@ base AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models STUB_PRINT=ok STUB_ARGV_FIL
 if grep -qxF -- "--sandbox" "$d/argv"; then ok "agy --sandbox injected under GEMINI_ISOLATE_SANDBOX=1"; else bad "no --sandbox injected"; fi
 
 echo "== T26 default mode: single-response directive (reads allowed, no writes/commands) is prepended =="
+# The prompt travels as the --print ARGUMENT (stdin is /dev/null since the 2026-07-10 stdin-drop
+# fix), so assert against the captured argv — not stdin, which agy never reads.
 d=$(newrun t26)
-base AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models STUB_PRINT=ok STUB_STDIN_FILE="$d/stdin" "$WD" "$d" >/dev/null 2>&1
+base AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models STUB_PRINT=ok STUB_ARGV_FILE="$d/argv" "$WD" "$d" >/dev/null 2>&1
 chk "status done" "$(cat "$d/status")" done
-has "forbids shell commands" "do NOT run shell commands" "$d/stdin"
-has "allows reads (documented /gemini ./FILE usage)" "MAY read files" "$d/stdin"
-has "original prompt preserved" "say hi" "$d/stdin"
+has "forbids shell commands" "do NOT run shell commands" "$d/argv"
+has "allows reads (documented /gemini ./FILE usage)" "MAY read files" "$d/argv"
+has "original prompt preserved" "say hi" "$d/argv"
 
 echo "== T27 write mode (--dangerously-skip-permissions): lighter directive, does NOT forbid commands =="
 d=$(newrun t27)
-base AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models STUB_PRINT=ok STUB_STDIN_FILE="$d/stdin" "$WD" "$d" --dangerously-skip-permissions >/dev/null 2>&1
-has "write directive present" "Complete the task FULLY" "$d/stdin"
-if grep -q "do NOT run shell commands" "$d/stdin"; then bad "write mode wrongly forbids commands"; else ok "write mode keeps commands available"; fi
+base AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models STUB_PRINT=ok STUB_ARGV_FILE="$d/argv" "$WD" "$d" --dangerously-skip-permissions >/dev/null 2>&1
+has "write directive present" "Complete the task FULLY" "$d/argv"
+if grep -q "do NOT run shell commands" "$d/argv"; then bad "write mode wrongly forbids commands"; else ok "write mode keeps commands available"; fi
 
 echo "== T28 GEMINI_NO_DIRECTIVE=1: raw prompt fed, no directive =="
 d=$(newrun t28)
-base AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models STUB_PRINT=ok STUB_STDIN_FILE="$d/stdin" GEMINI_NO_DIRECTIVE=1 "$WD" "$d" >/dev/null 2>&1
-if grep -q "single-response" "$d/stdin"; then bad "directive leaked despite opt-out"; else ok "no directive under GEMINI_NO_DIRECTIVE=1"; fi
-has "raw prompt fed" "say hi" "$d/stdin"
+base AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models STUB_PRINT=ok STUB_ARGV_FILE="$d/argv" GEMINI_NO_DIRECTIVE=1 "$WD" "$d" >/dev/null 2>&1
+if grep -q "single-response" "$d/argv"; then bad "directive leaked despite opt-out"; else ok "no directive under GEMINI_NO_DIRECTIVE=1"; fi
+has "raw prompt fed" "say hi" "$d/argv"
 
 echo "== T29 narration gate: agentic narration-without-answer -> failed, not done =="
 d=$(newrun t29)
@@ -441,6 +450,55 @@ chk "session.txt == newest db uuid" "$(cat "$d/session.txt")" "aaaaaaaa-bbbb-ccc
 d=$(newrun t33b); CONVE="$TMP/conv33b"; mkdir -p "$CONVE"
 base AGY_CONV_DIR="$CONVE" AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models STUB_PRINT=ok "$WD" "$d" >/dev/null 2>&1
 chk "session.txt empty when no db (resume->--continue)" "$(cat "$d/session.txt")" ""
+
+echo "== T34 bare-id agy models list IS cached (case-insensitive sentinel; regression 2026-07-23) =="
+# Real agy emits lowercase bare ids; a case-sensitive 'Gemini' sentinel would reject every
+# fresh list and re-spawn the hang-prone `agy models` on every run. Cache hit => called once.
+d=$(newrun t34); C="$d/counter"
+base AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models STUB_COUNTER_FILE="$C" STUB_PRINT=ok AGY_MODELS_TTL=600 "$WD" "$d" >/dev/null 2>&1
+base AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models STUB_COUNTER_FILE="$C" STUB_PRINT=ok AGY_MODELS_TTL=600 "$WD" "$d" >/dev/null 2>&1
+chk "bare-id list cached; agy models called once for two runs" "$(wc -l < "$C" | tr -d ' ')" 1
+if [ -s "$d/.cache" ] && grep -qi 'gemini' "$d/.cache"; then ok "bare-id cache file written"; else bad "bare-id list not cached (case-sensitive sentinel regression)"; fi
+
+echo "== T35 quota fallback fires with a DEFAULT (bare-id) fallback target (regression 2026-07-23) =="
+# The default GEMINI_FALLBACK_MODEL is the bare id 'gemini-3.5-flash-high'. A case-sensitive
+# 'Gemini*' gate would refuse it and the fallback could never fire. Here the fallback target is
+# left at its default (not passed) to prove the gate accepts a bare id end-to-end.
+d=$(newrun t35)
+base AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models STUB_PRINT=quota_pro \
+     GEMINI_MODEL="gemini-3.1-pro-high" GEMINI_QUOTA_FALLBACK=1 "$WD" "$d" >/dev/null 2>&1; rc=$?
+chk "exit 0 (fallback fired)" "$rc" 0
+has "fell back to a bare-id Gemini model" "fallback to Gemini 'gemini-" "$d/watchdog.log"
+has "flash answer captured" "STUB FLASH ANSWER" "$d/output.md"
+
+echo "== T36 DISPLAY-name fallback target normalized to bare id before binding (regression 2026-07-23) =="
+# agy silently ignores display names; a display-name fallback must be normalized to bare so the
+# requested Gemini tier actually binds (not agy's default).
+d=$(newrun t36)
+base AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models STUB_PRINT=quota_pro \
+     GEMINI_MODEL="gemini-3.1-pro-high" GEMINI_QUOTA_FALLBACK=1 \
+     GEMINI_FALLBACK_MODEL="Gemini 3.5 Flash (High)" "$WD" "$d" >/dev/null 2>&1; rc=$?
+chk "exit 0" "$rc" 0
+has "display-name fallback normalized to bare id" "fallback to Gemini 'gemini-3.5-flash-high'" "$d/watchdog.log"
+
+echo "== T37 anchored sentinel: diagnostic/garbage output containing 'gemini' is NOT cached (2026-07-23) =="
+# run_agy_models returns whatever stdout was captured even on a killed/partial call; a substring
+# 'gemini' sentinel would cache prose like "no gemini models available", poisoning matching for
+# the TTL. The anchored ^gemini-<digit> sentinel must reject it (and re-call, not cache).
+d=$(newrun t37); C="$d/counter"
+base AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models_garbage STUB_COUNTER_FILE="$C" STUB_PRINT=ok AGY_MODELS_TTL=600 "$WD" "$d" >/dev/null 2>&1
+base AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models_garbage STUB_COUNTER_FILE="$C" STUB_PRINT=ok AGY_MODELS_TTL=600 "$WD" "$d" >/dev/null 2>&1
+nofile "garbage (gemini-substring) list not cached" "$d/.cache"
+chk "re-called agy models (not served from a poisoned cache)" "$(wc -l < "$C" | tr -d ' ')" 2
+
+echo "== T38 leading/trailing whitespace in GEMINI_MODEL normalizes cleanly, no misleading label (2026-07-23) =="
+# A padded display name must normalize to a clean bare id (no leading/trailing hyphen) and bind
+# as a Gemini model — NOT trip the diversity guard with a spurious "non-Gemini" degraded note.
+d=$(newrun t38)
+base AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models_empty STUB_PRINT=ok GEMINI_MODEL="  Gemini 3.1 Pro (High)  " "$WD" "$d" >/dev/null 2>&1; rc=$?
+chk "exit 0" "$rc" 0
+has "bound clean bare id (no leading hyphen)" "model='gemini-3.1-pro-high'" "$d/watchdog.log"
+if [ -f "$d/degraded" ] && grep -q "non-Gemini" "$d/degraded"; then bad "spurious non-Gemini label on a padded Gemini request"; else ok "no spurious diversity-guard label"; fi
 
 echo
 echo "==================  $PASS passed, $FAIL failed  =================="
