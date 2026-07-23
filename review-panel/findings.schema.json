@@ -13,7 +13,7 @@
   "properties": {
     "reviewer_role": {
       "type": "string",
-      "description": "codex-domain | codex-integration | gemini | grok | composer | opus-skeptic"
+      "description": "codex-domain | codex-integration | gemini | grok | composer | anthropic-skeptic"
     },
     "verdict": {
       "type": "string",
