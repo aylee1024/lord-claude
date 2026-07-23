@@ -31,7 +31,7 @@ Five Claude Code skills that make OpenAI **Codex**, Google **Gemini**, xAI **Gro
 
 ## ✦ What the court can do
 
-- **🗡 Five rival engines, one harness.** Codex, Gemini, Grok, and Composer (plus an Opus skeptic in panels) all answer to the same supervised contract — so each one *always works the same way*, not "usually."
+- **🗡 Five rival engines, one harness.** Codex, Gemini, Grok, and Composer (plus an Anthropic skeptic in panels) all answer to the same supervised contract — so each one *always works the same way*, not "usually."
 - **💬 Message them like Claude's own subagents.** `agents` holds a **warm, multi-turn session** with any engine: address it by handle, it stays alive in memory and remembers the whole thread. One verb-set (`start · send · read · cancel · list · stop · board`) for every model — with **live streaming, mid-turn cancel, schema-validated JSON, broadcast, an agent-to-agent blackboard, and reattach-with-memory** all on tap.
 - **⚖ A review court that checks itself.** `/review-panel` runs a diverse set in parallel, then an adjudicator **re-runs every HIGH+ finding in a throwaway `git worktree`** and blocks the commit *only on what it can reproduce* — never on confident prose.
 - **🛡 Read-only by default; real isolation on demand.** A delegated review can't touch your tree — OS-enforced Seatbelt for grok/composer one-shots, capability-gated + cwd-confined for live sessions, `sandbox=read-only` for codex. `--full-auto` to let it act, `--isolate` for a throwaway worktree that **fails closed**.
@@ -47,11 +47,11 @@ Five Claude Code skills that make OpenAI **Codex**, Google **Gemini**, xAI **Gro
 | `/gemini <prompt>` | one delegated sub-task, supervised | Antigravity `agy --print` · `Gemini 3.5 Flash` |
 | `/grok <prompt>` | one delegated sub-task, supervised | xAI `grok` · `grok-build` · `--effort max` |
 | `/composer <prompt>` | one delegated sub-task, supervised | Cursor **Composer 2.5** via the `grok` CLI · `grok-composer-2.5-fast` |
-| `/review-panel <diff>` | Codex + Gemini + Grok + Composer + an Opus skeptic review in parallel, then an adjudicator re-runs every HIGH+ finding in a throwaway `git worktree` and **blocks only on reproductions, never on prose** | the whole court at once |
+| `/review-panel <diff>` | Codex + Gemini + Grok + Composer + an Anthropic skeptic review in parallel, then an adjudicator re-runs every HIGH+ finding in a throwaway `git worktree` and **blocks only on reproductions, never on prose** | the whole court at once |
 
 > 🪶 **The Gemini vassal serves through [Antigravity](https://antigravity.google) `agy`.** Google retired Gemini CLI's free OAuth tier (2026-06-18). The `/gemini` skill keeps its name, run-dir contract, and `GEMINI_MODEL` knob — only the engine swapped to `agy --print`, serving the same Google Gemini models. Callers, `/review-panel` included, need no changes.
 
-> ⚡ **Grok and Composer share one CLI.** The installed xAI `grok` binary serves *both* `grok-build` (xAI's coding model) and `grok-composer-2.5-fast` (Cursor's Composer 2.5). So `/grok` and `/composer` ride **one** model-parameterized watchdog (`composer` is `grok` with `GROK_MODEL=grok-composer-2.5-fast`). Both run **read-only by default** under an OS-enforced sandbox (macOS Seatbelt) — a delegated review can't write your tree; pass `--full-auto` to allow writes, `--isolate` to confine them to a throwaway worktree. Because they share one grok.com account, `/review-panel` counts them as **one** family for its diversity gate (breadth, not a substitute for the Codex+Gemini+Opus floor).
+> ⚡ **Grok and Composer share one CLI.** The installed xAI `grok` binary serves *both* `grok-build` (xAI's coding model) and `grok-composer-2.5-fast` (Cursor's Composer 2.5). So `/grok` and `/composer` ride **one** model-parameterized watchdog (`composer` is `grok` with `GROK_MODEL=grok-composer-2.5-fast`). Both run **read-only by default** under an OS-enforced sandbox (macOS Seatbelt) — a delegated review can't write your tree; pass `--full-auto` to allow writes, `--isolate` to confine them to a throwaway worktree. Because they share one grok.com account, `/review-panel` counts them as **one** family for its diversity gate (breadth, not a substitute for the Codex+Gemini+Anthropic floor).
 
 ## Swear in the vassals (install)
 
@@ -154,7 +154,7 @@ agents start grok --handle rev1 --resume      # bring a dismissed vassal back �
 - **📜 A shared blackboard (agent-to-agent).** `agents board` is an append-only notice-board the vassals post to and read from — so a `--full-auto` vassal can leave findings for the next one. Coordination without a babysitter.
 - **🔁 Reattach with memory intact.** Stop a session, reboot the machine, come back tomorrow — `--resume` rebinds the engine's own conversation id (grok `session/load`, codex's thread, gemini's `--conversation`) and the model picks up exactly where it left off.
 
-> Verified the boring way: 81 self-tests (the streaming ones *fail* if you break a stream — no false greens), six live spikes against the real binaries, and a full end-to-end run on real Grok where a reattached vassal still recalled what it was first asked. The diverse panel (2 Codex + Gemini + an Opus skeptic) earned its keep — it caught a test that was passing for the wrong reason, and it got fixed.
+> Verified the boring way: 81 self-tests (the streaming ones *fail* if you break a stream — no false greens), six live spikes against the real binaries, and a full end-to-end run on real Grok where a reattached vassal still recalled what it was first asked. The diverse panel (2 Codex + Gemini + an Anthropic skeptic) earned its keep — it caught a test that was passing for the wrong reason, and it got fixed.
 
 ## Why the vassals never break loose
 

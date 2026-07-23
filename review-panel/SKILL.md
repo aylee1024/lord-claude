@@ -1,6 +1,6 @@
 ---
 name: review-panel
-description: "Empirically-gated diverse code review. 2 Codex (Domain+Integration) + Gemini + Opus skeptic emit STRUCTURED findings on a diff; an adjudicator re-runs every HIGH+ finding in a throwaway worktree and blocks ONLY on reproduced findings, never on model text. Use before committing a substantive code wave (physics, multi-file refactor, architecture/correctness changes)."
+description: "Empirically-gated diverse code review. 2 Codex (Domain+Integration) + Gemini + an Anthropic skeptic emit STRUCTURED findings on a diff; an adjudicator re-runs every HIGH+ finding in a throwaway worktree and blocks ONLY on reproduced findings, never on model text. Use before committing a substantive code wave (physics, multi-file refactor, architecture/correctness changes)."
 user-invocable: true
 argument-hint: "<branch-or-base..head> --repo <path> --gate '<cmd>'"
 ---
@@ -18,9 +18,9 @@ This skill **only calls** the existing engines; it never edits them:
 - Codex reviewers via `~/.claude/skills/codex/run_with_watchdog.sh` (unchanged).
 - Gemini reviewer via `~/.claude/skills/gemini/run_with_watchdog.sh` (unchanged; its engine is now Antigravity `agy` since gemini-cli was retired 2026-06-18 — the call site is identical).
 - Grok + Composer reviewers via `~/.claude/skills/grok/run_with_watchdog.sh` (xAI `grok` CLI; `GROK_MODEL=grok-build` for the grok seat, `GROK_MODEL=grok-composer-2.5-fast` for the composer seat).
-- Opus skeptic via the `Agent` tool with `model: opus`.
+- Anthropic skeptic via the `Agent` tool. The model is the session's choice of Anthropic model (`model: opus` is the default; a session may pick another) — the seat is a *family*, not a fixed model.
 
-The diversity invariant (≥3 distinct families, never one family self-checking) is load-bearing — the floor stays Codex + Gemini + Opus(anthropic). The Gemini seat is a Google-family model served through `agy`; do not swap it for agy's Claude/GPT-OSS models, which would collapse the invariant. Grok (xAI) and Composer (Cursor/Kimi) add review BREADTH as two seats, but they share one grok.com account/proxy (a single independence + outage domain), so they map to ONE family token (`grok`) for the diversity gate and cannot substitute for the codex+gemini+anthropic floor.
+The diversity invariant (≥3 distinct families, never one family self-checking) is load-bearing — the floor stays Codex + Gemini + an Anthropic skeptic. The Gemini seat is a Google-family model served through `agy`; do not swap it for agy's Claude/GPT-OSS models, which would collapse the invariant. Grok (xAI) and Composer (Cursor/Kimi) add review BREADTH as two seats, but they share one grok.com account/proxy (a single independence + outage domain), so they map to ONE family token (`grok`) for the diversity gate and cannot substitute for the codex+gemini+anthropic floor.
 
 ## Flow (the main session orchestrates)
 
@@ -38,7 +38,7 @@ Allocate a run dir per reviewer. Each reviewer is told: **emit ONLY a JSON objec
 - **gemini** — `GEMINI_MODEL="gemini-3.6-flash-high"` gemini `run_with_watchdog.sh` (agy-backed; use `gemini-3.1-pro-high` for the heaviest waves). agy binds **bare ids only** since 2026-07-22 — display names (`"Gemini 3.5 Flash (High)"`) are silently ignored; the watchdog normalizes any display name a caller passes, but new code should pass bare ids. After the run, check `$RUN_DIR/degraded`: a model-downgrade marker means the seat did NOT run on the requested model — treat it as a failed seat, never a clean pass. Prompt = fresh-eye/alternative-mechanism; emit the same JSON shape in a fenced ```json block.
 - **grok** — `GROK_MODEL=grok-build GROK_EFFORT=max GROK_WATCHDOG_CWD=$REPO ~/.claude/skills/grok/run_with_watchdog.sh <dir>` (xAI; read-only by default — reviewers don't execute, the adjudicator does); prompt = fresh-eye/alternative-mechanism, a distinct lens from gemini; emit the same JSON shape in a fenced ```json block.
 - **composer** — same call with `GROK_MODEL=grok-composer-2.5-fast` (Cursor Composer 2.5); prompt = another independent lens; emit the same JSON shape.
-- **opus-skeptic** — `Agent(subagent_type: "code-reviewer", model: "opus", ...)`; prompt = argue against "done", verify on machine, mandatory pushback; emit the same JSON shape.
+- **anthropic-skeptic** — `Agent(subagent_type: "code-reviewer", model: "opus", ...)`; prompt = argue against "done", verify on machine, mandatory pushback; emit the same JSON shape.
 
 **Every HIGH+ finding MUST carry a `repro_command` + `expected_exit`** (a shell command run from the repo root that exits with `expected_exit` iff the finding holds — for a fix proposal: `git apply PATCH && <gate>` asserting it now passes), OR set `evidence_kind: not_reproducible` with the reason in `mechanism`. A HIGH+ with neither is downgraded to a nit by the adjudicator (it will not block).
 
@@ -49,7 +49,7 @@ Read each reviewer's `output.md` (or events), extract its findings JSON, and mer
 First compute the distinct model **families** that produced VALID output — a seat counts only
 if its run reached `status=done` with non-empty, parseable findings JSON (the watchdogs'
 empty-output gates make "valid" honest). Map roles to families: `codex-domain` +
-`codex-integration` → `codex`; `gemini` → `gemini`; `opus-skeptic` → `anthropic`; and BOTH
+`codex-integration` → `codex`; `gemini` → `gemini`; `anthropic-skeptic` → `anthropic`; and BOTH
 `grok` AND `composer` → `grok` (the SAME family token). They run as two seats for finding
 breadth, but they share ONE grok.com account/proxy — a single independence domain — so they
 count as ONE family for the diversity gate. This MECHANICALLY blocks a weak `codex,grok,composer`
@@ -74,13 +74,13 @@ It re-runs each HIGH+ `repro_command` in ONE hardened worktree (installs banned,
 ## Hardening notes
 - Reviewers are output-only; only the adjudicator executes, in a throwaway worktree (`git reset --hard` + `clean` per finding). Source mutations cannot reach the user's tree; `node_modules` writes are guarded (offline installs, redirected caches, manifest-hash assertion).
 - Use the explicit codex sandbox form `--sandbox workspace-write -c approval_policy=never` if a reviewer must execute (prefer it over the undocumented `--full-auto`); but by default reviewers do NOT execute — the adjudicator does.
-- Gemini-via-agy can error on auth/quota (`RESOURCE_EXHAUSTED`, `IneligibleTier`, `UNSUPPORTED_CLIENT`) or time out. When it does, the family preflight in step 5 makes the result **PROVISIONAL automatically** — you no longer rely on remembering to check. To restore full diversity: retry; or note that Antigravity quota is **account-wide** (a Flash↔Pro tier switch will NOT help under quota — wait for reset); or substitute a second Opus pass labelled "standing in for Gemini" — but a substituted same-family pass does NOT restore the 3rd family, so the result stays PROVISIONAL until a real Gemini (or other third family) re-clears it. (The watchdog also self-heals any stale gemini-cli `GEMINI_MODEL` id by remapping it to the agy default.)
+- Gemini-via-agy can error on auth/quota (`RESOURCE_EXHAUSTED`, `IneligibleTier`, `UNSUPPORTED_CLIENT`) or time out. When it does, the family preflight in step 5 makes the result **PROVISIONAL automatically** — you no longer rely on remembering to check. To restore full diversity: retry; or note that Antigravity quota is **account-wide** (a Flash↔Pro tier switch will NOT help under quota — wait for reset); or substitute a second Anthropic-skeptic pass labelled "standing in for Gemini" — but a substituted same-family pass does NOT restore the 3rd family, so the result stays PROVISIONAL until a real Gemini (or other third family) re-clears it. (The watchdog also self-heals any stale gemini-cli `GEMINI_MODEL` id by remapping it to the agy default.)
 
 ## Live multi-round mode (optional; composes the `agents` live-session system)
 
 The one-shot flow above is **unchanged and remains the default.** When a wave needs **re-verification rounds in retained context** — the panel reviews, the adjudicator reproduces, then each seat *revises against its own reproduction result* without re-reading the whole diff — run the panel as warm `agents` sessions instead of one-shot watchdog calls. This composes the live-session features: `--schema` (each seat returns valid findings JSON), fan-out (issue/refresh all seats at once), and `--follow` (watch a slow seat stream). **`adjudicate.sh` and `findings.schema.json` are consumed verbatim — nothing about the gate changes.**
 
-The diversity invariant is identical: the same seats/families, same 3-family floor, same `--families` preflight. The live `agents` system covers the grok/composer/codex/gemini seats; the **opus-skeptic stays on the `Agent` tool** (`model: opus`) exactly as in one-shot — it has no `agents` backend.
+The diversity invariant is identical: the same seats/families, same 3-family floor, same `--families` preflight. The live `agents` system covers the grok/composer/codex/gemini seats; the **anthropic-skeptic stays on the `Agent` tool** (`model: opus`) exactly as in one-shot — it has no `agents` backend.
 
 **Round 1 — start a warm session per seat, send its role prompt with the findings schema:**
 ```bash
@@ -95,7 +95,7 @@ done
 "$A" send --to rp-cdomain  --schema "$SCH" "$(grounding)  ROLE=codex-domain: per-deliverable craft/physics. Diff:\n$DIFF"
 "$A" send --to rp-cinteg   --schema "$SCH" "$(grounding)  ROLE=codex-integration: cross-file/build/would-it-work-here. Diff:\n$DIFF"
 "$A" send --to rp-gemini   --schema "$SCH" "$(grounding)  ROLE=gemini: fresh-eye/alternative-mechanism. Diff:\n$DIFF"
-# ... grok + composer likewise; opus-skeptic via Agent(model: opus) as in one-shot.
+# ... grok + composer likewise; anthropic-skeptic via Agent(model: opus) as in one-shot.
 ```
 With `--schema`, `agents read --to <h>` returns **already-validated findings JSON** (the daemon validated + normalized it) — no fenced-block extraction. Merge the seats' replies into `merged.json` exactly as step 4, then run the **same** `adjudicate.sh` (step 5).
 
