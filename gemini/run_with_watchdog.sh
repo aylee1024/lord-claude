@@ -236,8 +236,17 @@ run_agy_models() {
 
 # Cached model list. Serves a fresh, non-empty cache to skip the (slow, sometimes
 # hanging) subprocess on the hot path; a parallel batch then hits the warm cache
-# instead of N simultaneous hangs. Never caches an empty/garbage list (poison guard:
-# must contain "Gemini"); writes atomically (temp+mv, the write_status idiom).
+# instead of N simultaneous hangs. Never caches an empty/garbage list. The poison guard
+# requires at least one line shaped like a real bare model id — `^<ws>gemini-<digit>` —
+# NOT just the substring "gemini". This matters two ways: (1) agy emits lowercase bare ids
+# ("gemini-3.6-flash-high") since 2026-07-22, so a case-sensitive 'Gemini' would reject every
+# fresh list and never cache, re-spawning the hang-prone `agy models` on every run; (2) a
+# case-insensitive SUBSTRING 'gemini' would accept diagnostic prose ("gemini catalog
+# unavailable") or a partial list that run_agy_models returns when the call is killed
+# mid-print — poisoning matching for the whole TTL. Anchoring to the id shape rejects both,
+# and also rejects a stale legacy display-name cache ("Gemini 3.5 Flash (High)"), forcing a
+# correct refresh. Writes atomically (temp+mv, the write_status idiom).
+_MODELS_SENTINEL='^[[:space:]]*gemini-[0-9]'
 get_agy_models() {
     mkdir -p /tmp/gemini_runs 2>/dev/null || true
     if [ -f "$AGY_MODELS_CACHE" ]; then
@@ -245,13 +254,13 @@ get_agy_models() {
         mtime="$(stat -f %m "$AGY_MODELS_CACHE" 2>/dev/null || echo 0)"
         now="$(date +%s)"
         age=$((now - mtime))
-        if [ "$age" -lt "$AGY_MODELS_TTL" ] && grep -q 'Gemini' "$AGY_MODELS_CACHE" 2>/dev/null; then
+        if [ "$age" -lt "$AGY_MODELS_TTL" ] && grep -qiE "$_MODELS_SENTINEL" "$AGY_MODELS_CACHE" 2>/dev/null; then
             cat "$AGY_MODELS_CACHE"
             return 0
         fi
     fi
     local fresh; fresh="$(run_agy_models)"
-    if printf '%s\n' "$fresh" | grep -q 'Gemini'; then
+    if printf '%s\n' "$fresh" | grep -qiE "$_MODELS_SENTINEL"; then
         printf '%s\n' "$fresh" > "$AGY_MODELS_CACHE.$$.tmp" 2>/dev/null \
             && mv "$AGY_MODELS_CACHE.$$.tmp" "$AGY_MODELS_CACHE" 2>/dev/null || true
     fi
@@ -591,7 +600,12 @@ is_legacy_model_id() {
 # Map a legacy display name ("Gemini 3.6 Flash (High)") to the bare id agy now
 # requires (gemini-3.6-flash-high): lowercase, drop parens, spaces -> hyphens.
 display_to_bare_id() {
-    printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[()]//g; s/[[:space:]][[:space:]]*/-/g; s/-$//'
+    # Trim surrounding whitespace BEFORE collapsing internal runs to hyphens, else a leading/
+    # trailing space in GEMINI_MODEL ("  Gemini 3.5 Flash (High)") would become a leading/trailing
+    # hyphen ("-gemini-3.5-flash-high") that fails the diversity guard with a misleading label.
+    # The final s/^-//; s/-$// are belt-and-suspenders. Idempotent on an already-bare id.
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]' \
+        | sed 's/[()]//g; s/^[[:space:]]*//; s/[[:space:]]*$//; s/[[:space:]][[:space:]]*/-/g; s/^-*//; s/-*$//'
 }
 log_wd "validating model via agy models (cap ${AGY_MODELS_TIMEOUT}s, ttl ${AGY_MODELS_TTL}s)"
 AGY_MODELS="$(get_agy_models)"
@@ -612,8 +626,12 @@ elif is_legacy_model_id "$REQ_MODEL"; then
     MODEL="$DEFAULT_AGY_MODEL"
     mark_degraded "agy models unavailable and '$REQ_MODEL' looks like a legacy id; downgraded to '$MODEL'"
 else
-    MODEL="$REQ_MODEL"
-    log_wd "agy models unavailable; trusting requested model '$REQ_MODEL'"
+    # Offline trust: can't validate against a list, but STILL normalize a display name to
+    # its bare id — agy silently ignores display names (2026-07-22), so trusting one verbatim
+    # would bind to agy's default, not the requested tier. display_to_bare_id is idempotent
+    # on an already-bare id, so a bare caller passes through unchanged.
+    MODEL="$(display_to_bare_id "$REQ_MODEL")"
+    log_wd "agy models unavailable; trusting requested model as bare id '$MODEL' (from '$REQ_MODEL')"
 fi
 
 # Diversity hard-guard: the /gemini seat must stay a Gemini model no matter which
@@ -883,13 +901,18 @@ while true; do
     fi
 
     # Opt-in, Gemini-only tier fallback on quota (one downgrade, uses the retry budget).
+    # Normalize the fallback target to a bare id BEFORE the family gate: agy silently ignores
+    # display names (2026-07-22), and the gate itself must accept a bare id — the default
+    # ("gemini-3.5-flash-high") is bare, so a case-sensitive "Gemini*" match would reject it
+    # and the fallback could never fire. display_to_bare_id is idempotent on an already-bare id.
     if [ "$fail_kind" = "quota" ] && [ "${GEMINI_QUOTA_FALLBACK:-0}" = "1" ] \
        && [ "$fallback_used" -eq 0 ] && [ "$retry" -lt "$MAX_RETRIES" ]; then
-        case "$GEMINI_FALLBACK_MODEL" in
-            Gemini*)
-                if [ "$GEMINI_FALLBACK_MODEL" != "$CUR_MODEL" ]; then
-                    log_wd "quota on '$CUR_MODEL'; opt-in fallback to Gemini '$GEMINI_FALLBACK_MODEL'"
-                    CUR_MODEL="$GEMINI_FALLBACK_MODEL"
+        _fb_model="$(display_to_bare_id "$GEMINI_FALLBACK_MODEL")"
+        case "$_fb_model" in
+            gemini-*)
+                if [ "$_fb_model" != "$CUR_MODEL" ]; then
+                    log_wd "quota on '$CUR_MODEL'; opt-in fallback to Gemini '$_fb_model'"
+                    CUR_MODEL="$_fb_model"
                     fallback_used=1
                     retry=$((retry + 1))
                     write_status "retrying"

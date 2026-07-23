@@ -4,3 +4,11 @@
 *~
 __pycache__/
 *.pyc
+
+# Process/builder files must never land in this public repo — code, tests, and
+# product docs only. Keep build logs, wave/phase notes, runbooks, and plans private.
+*_NOTES.md
+*RUNBOOK*
+BUILD_LOG.md
+plans/
+private/
