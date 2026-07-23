@@ -111,7 +111,11 @@ if [ ! -s "$PROMPT_FILE" ]; then
     exit 2
 fi
 
-DEFAULT_AGY_MODEL="Gemini 3.5 Flash (High)"
+# 2026-07-22: agy switched `agy models` (and --model) to bare ids (gemini-3.6-flash-high);
+# display names like "Gemini 3.5 Flash (High)" are now SILENTLY IGNORED by agy (it serves
+# its own default). Bare ids are the only form that binds; display-name callers are
+# normalized below.
+DEFAULT_AGY_MODEL="gemini-3.5-flash-high"
 AGY_PRINT_TIMEOUT="${AGY_PRINT_TIMEOUT:-8m}"     # foreground-safe; agy self-timeout fires before HANG_SEC
 HANG_SEC="${HANG_SEC:-540}"                       # 9m backstop, LOWER than the ~10m outer bound so the watchdog wins the race
 MAX_RETRIES="${MAX_RETRIES:-1}"
@@ -123,7 +127,7 @@ AGY_MODELS_TIMEOUT="${AGY_MODELS_TIMEOUT:-20}"   # wall-clock cap on the (hang-p
 AGY_MODELS_TTL="${AGY_MODELS_TTL:-600}"          # cache TTL (s) for the validated model list
 AGY_MODELS_CACHE="${AGY_MODELS_CACHE:-/tmp/gemini_runs/.models_cache}"
 RETRY_BACKOFF_SEC="${RETRY_BACKOFF_SEC:-3}"      # short pause before a retry (transient blips)
-GEMINI_FALLBACK_MODEL="${GEMINI_FALLBACK_MODEL:-Gemini 3.5 Flash (High)}"  # opt-in quota fallback target (Gemini-only)
+GEMINI_FALLBACK_MODEL="${GEMINI_FALLBACK_MODEL:-gemini-3.5-flash-high}"  # opt-in quota fallback target (Gemini-only)
 # GEMINI_QUOTA_FALLBACK (unset/0 = off): on quota, do ONE Gemini-only tier downgrade. Off by default
 # because agy uses a single Antigravity account whose quota may be account-wide (a downgrade would then
 # be a useless second call). Loud-fail + manual hint is the default; see the give-up ladder below.
@@ -260,7 +264,7 @@ get_agy_models() {
 # trimming surrounding whitespace is the only drift we defend without over-reaching).
 model_in_list_tolerant() {   # <requested> <models-list> ; returns 0 on match
     local req="$1" list="$2"
-    case "$req" in Gemini*) ;; *) return 1 ;; esac
+    case "$req" in Gemini* | gemini-*) ;; *) return 1 ;; esac
     local req_norm; req_norm="$(printf '%s' "$req" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')"
     local line line_norm
     while IFS= read -r line; do
@@ -577,10 +581,17 @@ fi
 # outage while still remapping stale ids. (Gemini reviewer finding, 2026-06-18.)
 REQ_MODEL="${GEMINI_MODEL:-$DEFAULT_AGY_MODEL}"
 is_legacy_model_id() {
+    # gemini-1*/gemini-2* and *-preview are gemini-cli-era ids; modern agy ids are ALSO
+    # lowercase gemini-3.* bare ids (2026-07-22), so those must NOT be treated as legacy.
     case "$1" in
-        "" | gemini-* | *-preview) return 0 ;;
+        "" | gemini-1* | gemini-2* | *-preview) return 0 ;;
         *) return 1 ;;
     esac
+}
+# Map a legacy display name ("Gemini 3.6 Flash (High)") to the bare id agy now
+# requires (gemini-3.6-flash-high): lowercase, drop parens, spaces -> hyphens.
+display_to_bare_id() {
+    printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[()]//g; s/[[:space:]][[:space:]]*/-/g; s/-$//'
 }
 log_wd "validating model via agy models (cap ${AGY_MODELS_TIMEOUT}s, ttl ${AGY_MODELS_TTL}s)"
 AGY_MODELS="$(get_agy_models)"
@@ -590,6 +601,9 @@ if [ -n "$AGY_MODELS" ]; then
     elif model_in_list_tolerant "$REQ_MODEL" "$AGY_MODELS"; then
         MODEL="$REQ_MODEL"
         log_wd "model matched via whitespace-tolerant compare: '$REQ_MODEL'"
+    elif printf '%s\n' "$AGY_MODELS" | grep -qxF -- "$(display_to_bare_id "$REQ_MODEL")"; then
+        MODEL="$(display_to_bare_id "$REQ_MODEL")"
+        log_wd "display name '$REQ_MODEL' normalized to bare id '$MODEL' (same tier, not a downgrade)"
     else
         MODEL="$DEFAULT_AGY_MODEL"
         mark_degraded "requested model '$REQ_MODEL' is not offered by agy; downgraded to '$MODEL'"
@@ -607,7 +621,7 @@ fi
 # serves Claude/GPT-OSS models; routing the panel's Gemini seat to one would collapse
 # the review-panel diversity invariant. Force the default (a Gemini) if so.
 case "$MODEL" in
-    Gemini*) ;;
+    Gemini* | gemini-*) ;;
     *)
         mark_degraded "non-Gemini model '$MODEL' requested; forced to '$DEFAULT_AGY_MODEL' to preserve the diversity invariant"
         MODEL="$DEFAULT_AGY_MODEL"
@@ -689,8 +703,19 @@ fi
 log_wd "directive: write_mode=$WRITE_MODE no_directive=${GEMINI_NO_DIRECTIVE:-0} effective_prompt=$EFFECTIVE_PROMPT"
 
 while true; do
+    # 2026-07-10 STDIN-DROP FIX (part 1): the prompt must be the --print
+    # flag's IMMEDIATE value — agy ignores both piped stdin and a trailing
+    # positional after other flags (reproduced; a bare positional at the end
+    # made agy answer its canned no-input state on Flash).
+    _prompt_bytes=$(wc -c < "$EFFECTIVE_PROMPT")
+    if [ "$_prompt_bytes" -gt 900000 ]; then
+        log_wd "prompt too large for argv (${_prompt_bytes} B > 900000); refusing (split the prompt or reference files instead)"
+        write_status "failed"
+        exit 1
+    fi
+    _prompt_content="$(cat "$EFFECTIVE_PROMPT")"
     CMD=( "$AGY_BIN"
-          --print
+          --print "$_prompt_content"
           --model "$CUR_MODEL"
           --print-timeout "$AGY_PRINT_TIMEOUT" )
     if [ "${#RESUME_ARGS[@]}" -gt 0 ]; then
@@ -707,10 +732,11 @@ while true; do
     : > "$STDERR_FILE"
 
     # exec inside the subshell so the subshell process IS agy (clean kill -9).
-    # Prompt via stdin (safe for large diffs); response on stdout -> output.md.
+    # 2026-07-10 STDIN-DROP FIX (part 2): prompt travels inside CMD as the
+    # --print value (see the CMD assembly above); stdin is closed.
     ( cd "$WORK_DIR" \
         && exec "${CMD[@]}" \
-            < "$EFFECTIVE_PROMPT" \
+            < /dev/null \
             > "$OUTPUT_FILE" \
             2> "$STDERR_FILE" ) &
     PID=$!
