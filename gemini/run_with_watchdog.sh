@@ -5,7 +5,7 @@
 # retired Gemini CLI / Gemini Code Assist for individuals on 2026-06-18 (the
 # OAuth `free-tier` returns IneligibleTierError/UNSUPPORTED_CLIENT). The skill
 # now routes the Gemini family through `agy` (Antigravity), which serves the same
-# Google models (default `Gemini 3.5 Flash (High)`) and preserves the review
+# Google models (default `gemini-3.6-flash-high`) and preserves the review
 # panel's diversity invariant. The `/gemini` name, run-dir contract, status/pid
 # files, and the `GEMINI_MODEL` knob are unchanged so callers (incl. review-panel
 # and already-running sessions) keep working without edits.
@@ -43,7 +43,7 @@
 #   137  watchdog killed last attempt (after exhausting retries on hang)
 #
 # Tunables (env):
-#   GEMINI_MODEL:       agy model display string (default "Gemini 3.5 Flash (High)").
+#   GEMINI_MODEL:       agy model id (default "gemini-3.6-flash-high").
 #                       Validated against `agy models`; any unset/legacy/unknown
 #                       value (e.g. a gemini-cli id like gemini-2.5-pro) is
 #                       REMAPPED to the default so stale callers self-heal.
@@ -66,7 +66,7 @@
 #   RETRY_BACKOFF_SEC:  pause (s) before a retry (default 3)
 #   GEMINI_QUOTA_FALLBACK: 1 = on quota, do ONE Gemini-only tier downgrade (default off)
 #   GEMINI_FALLBACK_MODEL: fallback target; must be a Gemini model
-#                       (default "Gemini 3.5 Flash (High)")
+#                       (default "gemini-3.6-flash-high")
 
 set -u
 
@@ -115,7 +115,7 @@ fi
 # display names like "Gemini 3.5 Flash (High)" are now SILENTLY IGNORED by agy (it serves
 # its own default). Bare ids are the only form that binds; display-name callers are
 # normalized below.
-DEFAULT_AGY_MODEL="gemini-3.5-flash-high"
+DEFAULT_AGY_MODEL="gemini-3.6-flash-high"
 AGY_PRINT_TIMEOUT="${AGY_PRINT_TIMEOUT:-8m}"     # foreground-safe; agy self-timeout fires before HANG_SEC
 HANG_SEC="${HANG_SEC:-540}"                       # 9m backstop, LOWER than the ~10m outer bound so the watchdog wins the race
 MAX_RETRIES="${MAX_RETRIES:-1}"

@@ -1,6 +1,6 @@
 ---
 name: gemini
-description: "Delegate a task to a Gemini agent via the Antigravity CLI (`agy`), default Gemini 3.5 Flash (High). Runs `agy --print` via watchdog, supervises one run per directory, reads result. Background and resume supported."
+description: "Delegate a task to a Gemini agent via the Antigravity CLI (`agy`), default gemini-3.6-flash-high. Runs `agy --print` via watchdog, supervises one run per directory, reads result. Background and resume supported."
 user-invocable: true
 allowed-tools: Read, Write, Bash
 argument-hint: "[--bg] [--resume] [--full-auto] [--run-id <name>] <prompt>"
@@ -274,7 +274,7 @@ GEMINI_MODEL="Gemini 3.1 Pro (High)" \
 | Flag | Purpose |
 |------|---------|
 | `--print` / `-p` / `--prompt` | Headless / non-interactive. Watchdog passes the prompt on stdin. |
-| `--model <name>` | Model (watchdog defaults to `Gemini 3.5 Flash (High)`; validates against `agy models`). |
+| `--model <name>` | Model (watchdog defaults to `gemini-3.6-flash-high`; validates against `agy models`). |
 | `--print-timeout <dur>` | Timeout for the print-mode call (watchdog sets 25m). |
 | `--continue` / `-c` | Continue the most recent conversation (the `--resume latest` path). |
 | `--conversation <id>` | Resume a specific conversation by id (ids not auto-captured in print mode). |

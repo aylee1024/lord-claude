@@ -28,7 +28,7 @@
 # Tunables (env):
 #   STARTUP_GRACE_SEC: max seconds before first thread.started event (default 60)
 #   NO_PROGRESS_SEC:   max seconds without event growth after thread.started.
-#                      Default 0 = disabled. ultra reasoning can sit silent for
+#                      Default 0 = disabled. deep reasoning can sit silent for
 #                      many minutes between tool calls; event-stream growth is
 #                      not a reliable liveness signal once codex is alive.
 #                      Bash tool's 30-min timeout is the ultimate backstop.
@@ -36,7 +36,7 @@
 #   MAX_RETRIES:       max retry attempts (default 1)
 #   POLL_INTERVAL_SEC: watchdog poll cadence (default 5)
 #   CODEX_MODEL:       overrides default model (default gpt-5.6-sol)
-#   CODEX_REASONING:   overrides reasoning effort (default ultra)
+#   CODEX_REASONING:   overrides reasoning effort (default max)
 
 set -u
 
@@ -81,7 +81,7 @@ NO_PROGRESS_SEC="${NO_PROGRESS_SEC:-0}"
 MAX_RETRIES="${MAX_RETRIES:-1}"
 POLL_INTERVAL_SEC="${POLL_INTERVAL_SEC:-5}"
 CODEX_MODEL="${CODEX_MODEL:-gpt-5.6-sol}"
-CODEX_REASONING="${CODEX_REASONING:-ultra}"
+CODEX_REASONING="${CODEX_REASONING:-max}"
 
 write_status() {
     printf '%s\n' "$1" > "$STATUS_FILE.tmp" && mv "$STATUS_FILE.tmp" "$STATUS_FILE"
@@ -439,7 +439,7 @@ while true; do
 
         # thread.started gates which threshold applies. Before it, we are in
         # startup and long pauses are real hangs. After it, the model may
-        # legitimately reason silently for many minutes (ultra effort streams
+        # legitimately reason silently for many minutes (max effort streams
         # tokens with large gaps; event-stream growth is unreliable as a
         # liveness signal once codex is alive).
         if [ "$started" -eq 0 ] && grep -q '"type":"thread.started"' "$EVENTS_FILE" 2>/dev/null; then

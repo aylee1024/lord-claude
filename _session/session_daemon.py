@@ -523,7 +523,7 @@ class McpBackend(Backend):
         self.log = log
         self.client = None
         self.thread_id = ""
-        self._reasoning = os.environ.get("CODEX_REASONING", "ultra")
+        self._reasoning = os.environ.get("CODEX_REASONING", "max")
 
     def start(self, resume_id=""):
         env = dict(os.environ)
@@ -707,7 +707,7 @@ class PtyDbBackend(Backend):
 
     def __init__(self, model, cwd, full_auto, sdir, log):
         super().__init__()
-        self.model = model or "Gemini 3.5 Flash (High)"
+        self.model = model or "gemini-3.6-flash-high"
         self.cwd = cwd
         self.full_auto = full_auto
         self.sdir = sdir

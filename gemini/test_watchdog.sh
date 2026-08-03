@@ -94,7 +94,7 @@ echo "== T1 ok / regression (verbatim, no banner) =="
 d=$(newrun t1)
 base AGY_MODELS_CACHE="$d/.cache" STUB_MODELS=models STUB_PRINT=ok "$WD" "$d" >/dev/null 2>&1; rc=$?
 chk "exit 0" "$rc" 0; chk "status done" "$(cat "$d/status")" done
-chk "output verbatim" "$(cat "$d/output.md")" "STUB ANSWER for gemini-3.5-flash-high"
+chk "output verbatim" "$(cat "$d/output.md")" "STUB ANSWER for gemini-3.6-flash-high"
 nofile "no degraded marker" "$d/degraded"
 
 echo "== T2 empty output -> failed =="

@@ -17,7 +17,7 @@
           ♛  L O R D   C L A U D E  ♛
            ( o_o )
           /(  |  )╮                                   ┌──────────────────────────────────┐
-            /  \  ╰═≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈ »S N A P!« ═▶│  CODEX    · gpt-5.6-sol · ultra  │  ...grind...
+            /  \  ╰═≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈ »S N A P!« ═▶│  CODEX    · gpt-5.6-sol · max    │  ...grind...
                                                       │  GEMINI   · agy · Gemini Flash   │  ...grind...
                                                       │  GROK     · grok-build · max     │  ...grind...
                                                       │  COMPOSER · Composer 2.5 · max   │  ...grind...
@@ -43,8 +43,8 @@ Five Claude Code skills that make OpenAI **Codex**, Google **Gemini**, xAI **Gro
 
 | Command | What it does | Engine under the whip |
 |---|---|---|
-| `/codex <prompt>` | one delegated sub-task, supervised | Codex CLI · `gpt-5.6-sol` · `ultra` |
-| `/gemini <prompt>` | one delegated sub-task, supervised | Antigravity `agy --print` · `Gemini 3.5 Flash` |
+| `/codex <prompt>` | one delegated sub-task, supervised | Codex CLI · `gpt-5.6-sol` · `max` |
+| `/gemini <prompt>` | one delegated sub-task, supervised | Antigravity `agy --print` · `gemini-3.6-flash-high` |
 | `/grok <prompt>` | one delegated sub-task, supervised | xAI `grok` · `grok-build` · `--effort max` |
 | `/composer <prompt>` | one delegated sub-task, supervised | Cursor **Composer 2.5** via the `grok` CLI · `grok-composer-2.5-fast` |
 | `/review-panel <diff>` | Codex + Gemini + Grok + Composer + an Anthropic skeptic review in parallel, then an adjudicator re-runs every HIGH+ finding in a throwaway `git worktree` and **blocks only on reproductions, never on prose** | the whole court at once |
