@@ -19,7 +19,7 @@
           /(  |  )╮                                   ┌──────────────────────────────────┐
             /  \  ╰═≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈≈ »S N A P!« ═▶│  CODEX    · gpt-5.6-sol · max    │  ...grind...
                                                       │  GEMINI   · agy · Gemini Flash   │  ...grind...
-                                                      │  GROK     · grok-build · max     │  ...grind...
+                                                      │  GROK     · grok-4.6 · xhigh     │  ...grind...
                                                       │  COMPOSER · Composer 2.5 · max   │  ...grind...
                                                       └──────────────────────────────────┘
        …all five vassals run under run_with_watchdog.sh — no hangs, no orphans, no excuses.
@@ -45,7 +45,7 @@ Five Claude Code skills that make OpenAI **Codex**, Google **Gemini**, xAI **Gro
 |---|---|---|
 | `/codex <prompt>` | one delegated sub-task, supervised | Codex CLI · `gpt-5.6-sol` · `max` |
 | `/gemini <prompt>` | one delegated sub-task, supervised | Antigravity `agy --print` · `gemini-3.6-flash-high` |
-| `/grok <prompt>` | one delegated sub-task, supervised | xAI `grok` · `grok-build` · `--effort max` |
+| `/grok <prompt>` | one delegated sub-task, supervised | xAI `grok` · `grok-4.6` · `--effort xhigh` |
 | `/composer <prompt>` | one delegated sub-task, supervised | Cursor **Composer 2.5** via the `grok` CLI · `grok-composer-2.5-fast` |
 | `/review-panel <diff>` | Codex + Gemini + Grok + Composer + an Anthropic skeptic review in parallel, then an adjudicator re-runs every HIGH+ finding in a throwaway `git worktree` and **blocks only on reproductions, never on prose** | the whole court at once |
 

@@ -25,7 +25,17 @@ case "$STATUS" in
         fi
         ;;
 esac
+# Live progress: grok streams NDJSON events while it works, so event count + idle time say
+# whether the run is producing or stalled — the thing a status line has to answer.
+EV="$RUN_DIR/events.jsonl"
+if [ -f "$EV" ]; then
+    _n=$(wc -l < "$EV" 2>/dev/null | tr -d ' ')
+    _idle=$(( $(date +%s) - $(stat -f %m "$EV" 2>/dev/null || date +%s) ))
+    _last=$(tail -c 4000 "$EV" 2>/dev/null | tail -1 | sed -n 's/.*"type"[[:space:]]*:[[:space:]]*"\([A-Za-z_]*\)".*/\1/p')
+    echo "stream:  ${_n:-0} events, idle ${_idle}s, last=${_last:-none}"
+fi
 [ -s "$RUN_DIR/session.txt" ] && echo "session: $(cat "$RUN_DIR/session.txt")"
+[ -s "$RUN_DIR/partial.md" ] && echo "partial: $(wc -c < "$RUN_DIR/partial.md" | tr -d ' ') bytes of streamed text kept from a killed run (partial.md)"
 echo "--- output.md tail ---"
 tail -5 "$RUN_DIR/output.md" 2>/dev/null
 echo "--- last 3 stderr ---"

@@ -8,14 +8,28 @@
 # run-dir contract, status/pid files, and supervision logic mirror the codex and
 # gemini watchdogs so callers (incl. review-panel) work the same way.
 #
-# Supervises a single headless `grok --prompt-file ... --output-format json` call
-# inside a per-run directory. Captures grok's single JSON result object, extracts
-# the response text into output.md and the session id into session.txt, classifies
-# auth/quota/transient failures (auth never retries; quota loud-fails), gates out
-# empty output, exposes status+pid files, and self-heals zombie runs.
+# Supervises a single headless `grok --prompt-file ... --output-format streaming-json`
+# call inside a per-run directory. grok streams NDJSON events (thought/text token
+# deltas, tool calls, a terminal `end` event) to events.jsonl; the watchdog uses that
+# stream's GROWTH as the liveness signal, reassembles it into response.json/output.md/
+# session.txt at exit, classifies auth/quota/transient failures (auth never retries;
+# quota loud-fails), gates out empty output, exposes status+pid files, and self-heals
+# zombie runs.
+#
+# Liveness, not wall-clock: a working agent and a wedged one look identical to a timer,
+# so a fixed ceiling kills real work — an xhigh agent turn routinely runs 10-45 minutes,
+# and CPU% reads near zero throughout because the process is waiting on the model, not
+# computing. Progress is measured from the event stream instead: silence BEFORE the
+# first event is a startup hang;
+# silence after it is a stall only past NO_PROGRESS_SEC (a long tool call legitimately
+# emits nothing while it runs). The wall-clock cap survives only on the foreground
+# path, where the outer ~10m Bash-call bound makes it real.
 #
 # Usage:
-#   run_with_watchdog.sh <run_dir> [extra grok args...]
+#   run_with_watchdog.sh <run_dir> [--bg] [--full-auto] [--isolate] [extra grok args...]
+#     --bg  the caller is backgrounding this run (no outer call bound) -> no wall-clock
+#           ceiling; liveness comes from the event stream alone. Any real agentic task
+#           belongs here: xhigh review/build turns routinely run 10-45 minutes.
 #   run_with_watchdog.sh <run_dir> [extra grok args...] resume <session-id|latest>
 #
 # Required pre-state:
@@ -26,8 +40,15 @@
 #   GROK_WATCHDOG_CWD=<dir>   # chdir before launching grok (its workspace is the cwd)
 #
 # Written files (all in <run_dir>):
-#   output.md     grok's response text (extracted from the JSON .text field)
-#   response.json grok's raw single JSON result object (stdout, --output-format json)
+#   output.md     grok's response text (the stream's concatenated `text` deltas)
+#   events.jsonl  grok's raw NDJSON event stream (stdout, --output-format streaming-json).
+#                 Grows continuously while grok works — the watchdog's liveness signal,
+#                 and a live progress tail for the operator (`tail -f events.jsonl`).
+#   partial.md    (only on a killed run) whatever text had streamed before the kill —
+#                 kept as evidence; never presented as the answer
+#   response.json the run's result object, reassembled from the stream's terminal `end`
+#                 event plus the concatenated text/thought deltas (same shape grok's
+#                 --output-format json emits)
 #   stderr.log    grok stderr (progress/thoughts/errors; stdout stays clean for JSON)
 #   watchdog.log  this wrapper's supervision log
 #   session.txt   grok session id (from JSON .sessionId), for `resume <id>` follow-ups
@@ -43,21 +64,27 @@
 #   137  watchdog killed last attempt (after exhausting retries on hang)
 #
 # Tunables (env):
-#   GROK_MODEL:         grok model id (default "grok-build"). Validated against
+#   GROK_MODEL:         grok model id (default "grok-4.6"). Validated against
 #                       ~/.grok/models_cache.json (or the {grok-build,
 #                       grok-composer-2.5-fast} allow-set); an unknown value falls
 #                       back to grok-build and is reported via the degraded file.
-#   GROK_EFFORT:        agent effort level (default "max"; one of low|medium|high|
+#   GROK_EFFORT:        agent effort level (default "xhigh"; one of low|medium|high|
 #                       xhigh|max). Headless-only flag; this is grok's "most effort" knob.
-#   HANG_SEC:           watchdog wall-clock backstop after which a wedged grok is killed
-#                       (default 540 = 9m). Deliberately LOWER than the outer Bash/session
-#                       call bound (~10m on the foreground path): the watchdog must WIN the
-#                       race and exit cleanly (status=hung_killed) instead of being SIGKILLed
-#                       mid-run and leaving a zombie `running`/`starting` status with an
-#                       orphaned grok. A hang is TERMINAL — no retry (a retry would re-cross
-#                       the outer bound and re-zombie). For heavy work, BACKGROUND the call
-#                       (--bg) and raise it (e.g. HANG_SEC=1800): background runs are not
-#                       bounded by the foreground ceiling, so the long backstop is safe there.
+#   STARTUP_GRACE_SEC:  max seconds from spawn to grok's FIRST stream event (default 180).
+#                       Before any event there is nothing to distinguish work from a wedge,
+#                       so this window is a real hang detector.
+#   NO_PROGRESS_SEC:    max seconds the event stream may stall AFTER it has started
+#                       (default 900 = 15m). A long tool call (a full test suite) emits
+#                       nothing while it runs, hence the generous default; 0 disables.
+#   HANG_SEC:           absolute wall-clock ceiling. Default 540 (9m) on the FOREGROUND
+#                       path only — deliberately LOWER than the outer ~10m Bash/session
+#                       call bound so the watchdog WINS the race and exits cleanly
+#                       (status=hung_killed) instead of being SIGKILLed mid-run, leaving a
+#                       zombie `running` status and an orphaned grok. Under --bg there is
+#                       no outer bound, so the default is 0 = NO ceiling: a background run
+#                       ends when grok ends, when the stream stalls, or when the caller
+#                       kills it. Setting HANG_SEC explicitly overrides both defaults.
+#                       A hang is TERMINAL — no retry (a retry would re-cross the bound).
 #   MAX_RETRIES:        max retry attempts (default 1)
 #   POLL_INTERVAL_SEC:  watchdog poll cadence (default 5)
 #   RETRY_BACKOFF_SEC:  pause (s) before a retry (default 3)
@@ -95,6 +122,8 @@ fi
 PROMPT_FILE="$RUN_DIR/prompt.txt"
 OUTPUT_FILE="$RUN_DIR/output.md"
 RESPONSE_FILE="$RUN_DIR/response.json"
+EVENTS_FILE="$RUN_DIR/events.jsonl"
+PARTIAL_FILE="$RUN_DIR/partial.md"
 STDERR_FILE="$RUN_DIR/stderr.log"
 WATCHDOG_FILE="$RUN_DIR/watchdog.log"
 SESSION_FILE="$RUN_DIR/session.txt"
@@ -106,9 +135,11 @@ if [ ! -s "$PROMPT_FILE" ]; then
     exit 2
 fi
 
-DEFAULT_GROK_MODEL="grok-build"
-GROK_EFFORT="${GROK_EFFORT:-max}"                 # agent effort: low|medium|high|xhigh|max ("most effort" = max). Headless-only flag.
-HANG_SEC="${HANG_SEC:-540}"                       # 9m backstop, LOWER than the ~10m outer bound so the watchdog wins the race
+DEFAULT_GROK_MODEL="${DEFAULT_GROK_MODEL:-grok-4.6}"
+GROK_EFFORT="${GROK_EFFORT:-xhigh}"                 # agent effort: low|medium|high|xhigh|max ("most effort" = max). Headless-only flag.
+HANG_SEC="${HANG_SEC:-auto}"                     # absolute ceiling; resolved after flag parsing: 540 foreground (< the ~10m outer bound), 0 (none) under --bg
+STARTUP_GRACE_SEC="${STARTUP_GRACE_SEC:-180}"    # max seconds to grok's first stream event; before it, silence IS a hang
+NO_PROGRESS_SEC="${NO_PROGRESS_SEC:-900}"        # max stall in the event stream once it has started (a long tool call emits nothing); 0 disables
 MAX_RETRIES="${MAX_RETRIES:-1}"
 POLL_INTERVAL_SEC="${POLL_INTERVAL_SEC:-5}"
 HEARTBEAT_SEC="${HEARTBEAT_SEC:-30}"             # log an elapsed/cpu/rss heartbeat this often; also keeps watchdog.log mtime fresh for the stale-run sweep
@@ -116,7 +147,7 @@ STALE_SEC="${STALE_SEC:-90}"                     # a non-terminal run whose watc
 RETRY_FAST_SEC="${RETRY_FAST_SEC:-60}"           # only retry a failure that failed FAST (< this). A slow failure + retry would cross the ~10m outer ceiling and re-zombie, so it is terminal.
 RETRY_BACKOFF_SEC="${RETRY_BACKOFF_SEC:-3}"      # short pause before a retry (transient blips)
 GROK_MODELS_CACHE="${GROK_MODELS_CACHE:-$HOME/.grok/models_cache.json}"  # grok maintains this on disk; used to validate GROK_MODEL with NO hang-prone live preflight
-GROK_ALLOWED_MODELS="${GROK_ALLOWED_MODELS:-grok-build grok-composer-2.5-fast}"  # allow-set used when the cache is absent/unreadable
+GROK_ALLOWED_MODELS="${GROK_ALLOWED_MODELS:-grok-4.6 grok-4.5}"  # allow-set used when the cache is absent/unreadable
 
 write_status() {
     printf '%s\n' "$1" > "$STATUS_FILE.tmp" && mv "$STATUS_FILE.tmp" "$STATUS_FILE"
@@ -259,7 +290,7 @@ if [ -z "$GROK_BIN" ] || [ ! -x "$GROK_BIN" ]; then
     exit 1
 fi
 
-# python3 is required to parse grok's --output-format json result. Fail loudly up-front rather
+# python3 is required to reassemble grok's NDJSON event stream. Fail loudly up-front rather
 # than silently yielding empty output at the parse step later (panel finding, 2026-06-22).
 if ! command -v python3 >/dev/null 2>&1; then
     write_status "failed"
@@ -339,18 +370,26 @@ esac
 # (write CWD + /tmp). --isolate ALSO runs grok inside a throwaway `git worktree` at HEAD so even
 # a writing run cannot reach the live tree; with --sandbox workspace the writes are OS-confined
 # to it. Both flags are watchdog-only and are peeled off EXTRA_ARGS (never forwarded to grok).
-ISOLATE=0; WRITE_MODE=0; ISOLATE_WT=""; ISOLATE_REPO=""; ISOLATE_BASE_SHA=""
+ISOLATE=0; WRITE_MODE=0; BG_MODE=0; ISOLATE_WT=""; ISOLATE_REPO=""; ISOLATE_BASE_SHA=""
 for a in ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}; do
     [ "$a" = "--isolate" ] && ISOLATE=1
     [ "$a" = "--full-auto" ] && WRITE_MODE=1
+    [ "$a" = "--bg" ] && BG_MODE=1
 done
 _EA=()
 for a in ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}; do
     case "$a" in
-        --isolate|--full-auto) ;;   # watchdog-only flags; never forwarded to grok
+        --isolate|--full-auto|--bg) ;;   # watchdog-only flags; never forwarded to grok
         *) _EA+=( "$a" ) ;;
     esac
 done
+
+# The wall-clock ceiling exists ONLY to win the race against the outer foreground call
+# bound. Backgrounded, there is no such bound and the ceiling has nothing to protect —
+# it would just guillotine long, healthy runs, which is exactly what it did.
+if [ "$HANG_SEC" = "auto" ]; then
+    if [ "$BG_MODE" -eq 1 ]; then HANG_SEC=0; else HANG_SEC=540; fi
+fi
 EXTRA_ARGS=( ${_EA[@]+"${_EA[@]}"} )
 
 # Sanitize EXTRA_ARGS: the watchdog OWNS these grok flags (it pins model/effort/sandbox/
@@ -473,7 +512,7 @@ fi
 # `models` preflight (unlike the agy path this was cloned from). Validate GROK_MODEL against
 # the static allow-set first (the two ids grok serves), then against any id present in the
 # on-disk cache (forward-compatible if xAI adds models). An unknown id is remapped to
-# grok-build (the safe xAI default) and reported via the degraded file.
+# DEFAULT_GROK_MODEL and reported via the degraded file.
 REQ_MODEL="${GROK_MODEL:-$DEFAULT_GROK_MODEL}"
 grok_model_is_known() {   # <model-id> ; returns 0 if grok offers it
     local m="$1" a
@@ -500,7 +539,7 @@ else
     mark_degraded "requested model '$REQ_MODEL' is not in the grok allow-set or $GROK_MODELS_CACHE; downgraded to '$MODEL'"
 fi
 
-log_wd "start: run_dir=$RUN_DIR grok=$GROK_BIN model=$MODEL effort=$GROK_EFFORT write_mode=$WRITE_MODE resume=${RESUME_ARGS[*]:-none} work_dir=$WORK_DIR"
+log_wd "start: run_dir=$RUN_DIR grok=$GROK_BIN model=$MODEL effort=$GROK_EFFORT write_mode=$WRITE_MODE bg=$BG_MODE hang_sec=$HANG_SEC startup_grace=$STARTUP_GRACE_SEC no_progress=$NO_PROGRESS_SEC resume=${RESUME_ARGS[*]:-none} work_dir=$WORK_DIR"
 
 mkdir -p /tmp/grok_runs
 ln -sfn "$RUN_DIR" /tmp/grok_runs/latest 2>/dev/null || true
@@ -543,7 +582,7 @@ while true; do
           --cwd "$WORK_DIR"
           --model "$CUR_MODEL"
           --effort "$GROK_EFFORT"
-          --output-format json
+          --output-format streaming-json
           --no-auto-update
           "${SANDBOX_ARGS[@]}" )
     if [ "${#RESUME_ARGS[@]}" -gt 0 ]; then
@@ -557,20 +596,22 @@ while true; do
 
     : > "$OUTPUT_FILE"
     : > "$RESPONSE_FILE"
+    : > "$EVENTS_FILE"
     : > "$STDERR_FILE"
+    rm -f "$PARTIAL_FILE"
     : > "$SESSION_FILE"   # truncate per attempt so a failed attempt's sessionId can't survive into a later success
 
     # exec inside the subshell so the subshell process IS grok (clean kill -9).
-    # Prompt comes from --prompt-file (headless grok does NOT read stdin); the single JSON
-    # result object lands on stdout -> response.json (parsed after exit), progress + errors
-    # on stderr -> stderr.log.
+    # Prompt comes from --prompt-file (headless grok does NOT read stdin); the NDJSON event
+    # stream lands on stdout -> events.jsonl (watched live, reassembled after exit), progress
+    # + errors on stderr -> stderr.log.
     # unset GROK_SANDBOX so a stray env value cannot influence the sandbox (the flag is explicit);
     # stdin from /dev/null since headless grok reads the prompt from --prompt-file, never stdin.
     ( cd "$WORK_DIR" \
         && unset GROK_SANDBOX \
         && exec "${CMD[@]}" \
             < /dev/null \
-            > "$RESPONSE_FILE" \
+            > "$EVENTS_FILE" \
             2> "$STDERR_FILE" ) &
     PID=$!
     echo "$PID" > "$PID_FILE"
@@ -580,23 +621,44 @@ while true; do
     spawn_at=$SECONDS
     last_hb=0
     hung_killed=0
+    hang_reason=""
     fast_failed=0
     empty_failed=0
     fail_kind=""
+    last_size=0
+    last_growth=$SECONDS
+    streaming=0
 
     while kill -0 "$PID" 2>/dev/null; do
         sleep "$POLL_INTERVAL_SEC"
 
-        # Heartbeat: record elapsed/cpu/rss every HEARTBEAT_SEC. Gives a live progress signal
-        # AND keeps watchdog.log mtime fresh — that freshness is the liveness signal the zombie
-        # sweep (sweep_stale_runs) uses to tell a live run from an externally-killed one. It is
-        # also how the real outer ceiling reveals itself in normal use (no dedicated probe).
+        # PROGRESS, measured — not assumed. grok streams token-level thought/text deltas and
+        # tool-call events, so growth of events.jsonl means the agent is alive and working.
+        # A timer cannot tell work from a wedge, and neither can CPU% (an agent waiting on
+        # the model sits at ~0% for minutes at a time); stream growth can.
+        cur_size=$(wc -c < "$EVENTS_FILE" 2>/dev/null | tr -d ' ')
+        cur_size="${cur_size:-0}"
+        if [ "$cur_size" -gt "$last_size" ]; then
+            last_size="$cur_size"
+            last_growth=$SECONDS
+            if [ "$streaming" -eq 0 ]; then
+                streaming=1
+                log_wd "first event at $((SECONDS - spawn_at))s"
+            fi
+        fi
+
+        # Heartbeat: elapsed/idle/event-count/cpu/rss every HEARTBEAT_SEC. Gives a live progress
+        # signal AND keeps watchdog.log mtime fresh — that freshness is the liveness signal the
+        # zombie sweep (sweep_stale_runs) uses to tell a live run from an externally-killed one.
         elapsed=$((SECONDS - spawn_at))
+        idle=$((SECONDS - last_growth))
         if [ $((elapsed - last_hb)) -ge "$HEARTBEAT_SEC" ]; then
             last_hb=$elapsed
             hb_cpu=$(ps -o pcpu= -p "$PID" 2>/dev/null | tr -d ' ')
             hb_rss=$(ps -o rss= -p "$PID" 2>/dev/null | tr -d ' ')
-            log_wd "hb elapsed=${elapsed}s cpu%=${hb_cpu:-?} rss_kb=${hb_rss:-?}"
+            hb_n=$(wc -l < "$EVENTS_FILE" 2>/dev/null | tr -d ' ')
+            hb_last=$(tail -c 4000 "$EVENTS_FILE" 2>/dev/null | tail -1 | sed -n 's/.*"type"[[:space:]]*:[[:space:]]*"\([A-Za-z_]*\)".*/\1/p')
+            log_wd "hb elapsed=${elapsed}s idle=${idle}s events=${hb_n:-0} last=${hb_last:-none} cpu%=${hb_cpu:-?} rss_kb=${hb_rss:-?}"
         fi
 
         # Fast-fail on known auth/quota errors (stderr only). Classify which: the
@@ -615,11 +677,24 @@ while true; do
             break
         fi
 
-        # Wall-clock backstop (grok should finish or self-exit well before this).
-        if [ $((SECONDS - spawn_at)) -ge "$HANG_SEC" ]; then
+        # Kill only on a MEASURED absence of progress. Before the first event, silence is a
+        # startup hang. After it, only a stalled stream is — a tool call (a full test suite)
+        # legitimately emits nothing while it runs. The wall-clock ceiling applies last and
+        # only where an outer call bound makes it real (foreground; see --bg).
+        if [ "$streaming" -eq 0 ]; then
+            if [ "$STARTUP_GRACE_SEC" -gt 0 ] && [ "$elapsed" -ge "$STARTUP_GRACE_SEC" ]; then
+                hang_reason="no stream event within STARTUP_GRACE_SEC=${STARTUP_GRACE_SEC}s (grok never started producing)"
+            fi
+        elif [ "$NO_PROGRESS_SEC" -gt 0 ] && [ "$idle" -ge "$NO_PROGRESS_SEC" ]; then
+            hang_reason="event stream stalled for ${idle}s (NO_PROGRESS_SEC=${NO_PROGRESS_SEC}s)"
+        fi
+        if [ -z "$hang_reason" ] && [ "$HANG_SEC" -gt 0 ] && [ "$elapsed" -ge "$HANG_SEC" ]; then
+            hang_reason="wall-clock ceiling HANG_SEC=${HANG_SEC}s reached while still working — the foreground path cannot run longer than the outer call bound; re-run with --bg"
+        fi
+        if [ -n "$hang_reason" ]; then
             cpu_pct=$(ps -o pcpu= -p "$PID" 2>/dev/null | tr -d ' ')
             rss_kb=$(ps -o rss= -p "$PID" 2>/dev/null | tr -d ' ')
-            log_wd "hang elapsed=$((SECONDS - spawn_at))s threshold=${HANG_SEC}s cpu%=$cpu_pct rss_kb=$rss_kb"
+            log_wd "hang: $hang_reason elapsed=${elapsed}s idle=${idle}s events=$(wc -l < "$EVENTS_FILE" 2>/dev/null | tr -d ' ') cpu%=$cpu_pct rss_kb=$rss_kb"
             kill_tree "$PID"
             hung_killed=1
             break
@@ -637,27 +712,58 @@ while true; do
     # killed grok ourselves (a -9'd run's stdout JSON is unreliable; fail_kind is already set).
     parse_verdict=""
     if [ "$hung_killed" -eq 0 ] && [ "$fast_failed" -eq 0 ]; then
-        parse_verdict="$(python3 - "$RESPONSE_FILE" "$OUTPUT_FILE" "$SESSION_FILE" <<'PY' 2>/dev/null
+        parse_verdict="$(python3 - "$EVENTS_FILE" "$RESPONSE_FILE" "$OUTPUT_FILE" "$SESSION_FILE" <<'PY' 2>/dev/null
 import json, sys
-resp, outp, sessp = sys.argv[1], sys.argv[2], sys.argv[3]
+evp, resp, outp, sessp = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+# Reassemble the streamed turn. `text`/`thought` arrive as token deltas whose concatenation
+# is byte-identical to what --output-format json returns in .text/.thought; the terminal
+# `end` event carries every other field of that summary object.
+text, thought, end, err, seen = [], [], None, None, 0
 try:
-    raw = open(resp, encoding="utf-8", errors="replace").read().strip()
+    fh = open(evp, encoding="utf-8", errors="replace")
 except Exception:
     print("unparseable"); sys.exit(0)
-if not raw:
+for line in fh:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        e = json.loads(line)
+    except Exception:
+        continue
+    if not isinstance(e, dict):
+        continue
+    seen += 1
+    t = e.get("type")
+    if t == "text":
+        text.append(str(e.get("data", "")))
+    elif t == "thought":
+        thought.append(str(e.get("data", "")))
+    elif t == "end":
+        end = e
+    elif t == "error" and err is None:
+        err = str(e.get("message") or e.get("data") or json.dumps(e))
+if seen == 0:
     print("empty"); sys.exit(0)
+if err is not None:
+    print("error\t" + err.replace("\n", " ")[:500]); sys.exit(0)
+if end is None:
+    # Stream stopped without its terminal event: the turn did not finish, so whatever
+    # text arrived is a fragment. Never present a fragment as the answer.
+    print("truncated"); sys.exit(0)
+obj = {"text": "".join(text), "thought": "".join(thought)}
+for k, v in end.items():
+    if k != "type":
+        obj[k] = v
 try:
-    obj = json.loads(raw)
-except Exception:
-    print("unparseable"); sys.exit(0)
-if isinstance(obj, dict) and obj.get("type") == "error":
-    print("error\t" + str(obj.get("message", "")).replace("\n", " ")[:500]); sys.exit(0)
-text = obj.get("text") if isinstance(obj, dict) else None
-sid = obj.get("sessionId") if isinstance(obj, dict) else None
-try:
-    open(outp, "w", encoding="utf-8").write(text or "")
+    open(resp, "w", encoding="utf-8").write(json.dumps(obj) + "\n")
 except Exception:
     pass
+try:
+    open(outp, "w", encoding="utf-8").write(obj["text"])
+except Exception:
+    pass
+sid = obj.get("sessionId")
 if sid:
     try:
         open(sessp, "w", encoding="utf-8").write(str(sid) + "\n")
@@ -678,6 +784,26 @@ PY
         fi
     fi
 
+    # A killed run's streamed text is evidence, not an answer: keep it in partial.md so a
+    # long run cut short is not lost, and leave output.md empty so nothing downstream can
+    # mistake a fragment for the result.
+    if [ "$hung_killed" -eq 1 ] && [ -s "$EVENTS_FILE" ]; then
+        python3 - "$EVENTS_FILE" "$PARTIAL_FILE" <<'PY' 2>/dev/null || true
+import json, sys
+out = []
+for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    try:
+        e = json.loads(line)
+    except Exception:
+        continue
+    if isinstance(e, dict) and e.get("type") == "text":
+        out.append(str(e.get("data", "")))
+if out:
+    open(sys.argv[2], "w", encoding="utf-8").write("".join(out))
+PY
+        [ -s "$PARTIAL_FILE" ] && log_wd "killed run: kept $(wc -c < "$PARTIAL_FILE" | tr -d ' ') bytes of streamed text in partial.md (NOT output.md)"
+    fi
+
     # Secondary stderr classification for a nonzero exit that left no structured error
     # (e.g. a crash before any JSON). For a killed run fail_kind is already set, so skip.
     if [ "$fast_failed" -eq 0 ] && [ "$exit_code" -ne 0 ]; then
@@ -688,9 +814,9 @@ PY
         fi
     fi
 
-    # Empty-output gate: grok can exit 0 yet yield no usable text (empty/garbled JSON, or a
-    # whitespace-only .text). Treat as a failed attempt so it retries, and fail loudly if it
-    # persists — never present a blank file as the answer.
+    # Empty-output gate: grok can exit 0 yet yield no usable text (an empty or truncated
+    # stream, or whitespace-only text). Treat as a failed attempt so it retries, and fail
+    # loudly if it persists — never present a blank file as the answer.
     if [ "$exit_code" -eq 0 ] && [ "$hung_killed" -eq 0 ] && [ "$fast_failed" -eq 0 ]; then
         if [ "$parse_verdict" != "ok" ] || ! output_has_content; then
             empty_failed=1
@@ -720,8 +846,9 @@ PY
     fi
 
     # Terminal? Quota/rate-limit terminates here (grok has no tier fallback — one model per seat).
-    # A HANG is terminal immediately — NO retry: HANG_SEC is tuned just under the outer call
-    # bound, so a retry would re-cross it and re-zombie. A SLOW failure (attempt_elapsed >=
+    # A HANG is terminal immediately — NO retry: on the foreground path HANG_SEC sits just
+    # under the outer call bound, so a retry would re-cross it and re-zombie; and a stalled
+    # or never-started stream will not fare better on a second try. A SLOW failure (attempt_elapsed >=
     # RETRY_FAST_SEC) is also terminal — retrying it would cross the ceiling too. Only a FAST
     # transient/empty failure retries (within the retry budget).
     if [ "$retry" -ge "$MAX_RETRIES" ] || [ "$fail_kind" = "quota" ] || [ "$hung_killed" -eq 1 ] || [ "$attempt_elapsed" -ge "$RETRY_FAST_SEC" ]; then
@@ -729,8 +856,9 @@ PY
         trap - EXIT
         if [ "$hung_killed" -eq 1 ]; then
             write_status "hung_killed"
-            log_wd "giving up (hang): grok exceeded HANG_SEC=${HANG_SEC}s after $((retry + 1)) attempt(s); last_exit=$exit_code. For heavy work re-run with --bg and a higher ceiling (e.g. HANG_SEC=1800) — background runs are not bounded by the ~10m foreground call ceiling. Otherwise the grok backend is slow/wedged."
-            printf 'GROK hung_killed: grok exceeded %ss. Heavy work: re-run with --bg (raises the ceiling).\n' "$HANG_SEC" >> "$STDERR_FILE" 2>/dev/null || true
+            log_wd "giving up (hang): ${hang_reason:-unknown} after $((retry + 1)) attempt(s); last_exit=$exit_code."
+            printf 'GROK hung_killed: %s\n' "${hang_reason:-unknown}" >> "$STDERR_FILE" 2>/dev/null || true
+            [ -s "$PARTIAL_FILE" ] && printf 'Streamed text before the kill is in %s\n' "$PARTIAL_FILE" >> "$STDERR_FILE" 2>/dev/null || true
             exit 137
         elif [ "$fail_kind" = "quota" ]; then
             write_status "failed"
