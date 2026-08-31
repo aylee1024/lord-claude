@@ -260,8 +260,24 @@ sweep_stale_runs() {
             p="$(cat "$d/pid" 2>/dev/null || true)"
             [ -n "${p:-}" ] && kill -0 "$p" 2>/dev/null && continue
         fi
+        # POSITIVE ATTRIBUTION BEFORE DESTRUCTION: a live recorded watchdog means the
+        # run is NOT stale, whatever the log mtime says (a quiet codex-style run was
+        # falsely swept on 2026-08-31 while its supervisor was alive and parenting).
+        _wp="$(cat "$d/wd_pid" 2>/dev/null || true)"
+        [ -n "${_wp:-}" ] && kill -0 "$_wp" 2>/dev/null && continue
         _orphan=""; _op="$(cat "$d/pid" 2>/dev/null || true)"
-        [ -n "${_op:-}" ] && kill -0 "$_op" 2>/dev/null && _orphan=" WARNING: grok pid=$_op may still be running orphaned (a SIGKILLed watchdog cannot reap it); if it was a --full-auto in-repo run, kill it: kill $_op"
+        if [ -n "${_op:-}" ] && kill -0 "$_op" 2>/dev/null && ps -o command= -p "$_op" 2>/dev/null | grep -qE "grok"; then
+            # An orphan is REAPED, not merely warned about: a swept-but-alive child ran
+            # 5.5h unsupervised on 2026-08-31 (and 130+GB of such orphans crashed the
+            # box on 08-29). Tree-kill (children first), then verify.
+            _okill() { local q c; q="$1"; for c in $(pgrep -P "$q" 2>/dev/null); do _okill "$c"; done; kill -9 "$q" 2>/dev/null; }
+            _okill "$_op"; sleep 1
+            if kill -0 "$_op" 2>/dev/null; then
+                _orphan=" ERROR: orphan pid=$_op SURVIVED the sweep kill"
+            else
+                _orphan=" orphan pid=$_op and its tree were killed by the sweep"
+            fi
+        fi
         printf 'aborted\n' > "$d/status.tmp" 2>/dev/null && mv "$d/status.tmp" "$d/status" 2>/dev/null || true
         printf '[%s] swept: was %s, watchdog.log %ss stale and no live watchdog -> aborted (externally killed; the outer call bound likely SIGKILLed the watchdog mid-run).%s\n' \
             "$(date +%H:%M:%S)" "$st" "$age" "$_orphan" >> "$logf" 2>/dev/null || true
@@ -364,9 +380,10 @@ case "$WORK_DIR" in
 esac
 
 # --- Watchdog flags: --isolate (throwaway worktree) and --full-auto (writes) ----------------
-# Default mode is READ-ONLY: the command build runs grok under `--sandbox read-only` (macOS
-# Seatbelt — reads + read-only shell allowed, ALL writes/network OS-blocked), so a delegated
-# analysis/review cannot mutate the tree. --full-auto switches to `--sandbox workspace`
+# Default mode is READ-ONLY: the command build runs grok under `--sandbox readonly-sockdeny`
+# (macOS Seatbelt — reads + read-only shell allowed, ALL writes OS-blocked outside ~/.grok and
+# the temp dirs), so a delegated analysis/review cannot mutate the tree. --full-auto switches
+# to `--sandbox workspace`
 # (write CWD + /tmp). --isolate ALSO runs grok inside a throwaway `git worktree` at HEAD so even
 # a writing run cannot reach the live tree; with --sandbox workspace the writes are OS-confined
 # to it. Both flags are watchdog-only and are peeled off EXTRA_ARGS (never forwarded to grok).
@@ -494,7 +511,7 @@ if [ "$ISOLATE" -eq 1 ]; then
         # Writes are OS-confined to the worktree: the command build runs grok with cwd=$WORK_DIR
         # (the worktree) plus `--sandbox workspace` (write CWD + /tmp; macOS Seatbelt), so even a
         # --full-auto run cannot reach the live tree. No --add-dir is needed — grok's workspace IS
-        # the cwd. (Default read-only mode is confined even harder by `--sandbox read-only`.)
+        # the cwd. (Default read-only mode is confined even harder by `--sandbox readonly-sockdeny`.)
         log_wd "isolate: grok runs in worktree $WORK_DIR (HEAD $ISOLATE_BASE_SHA of $ISOLATE_REPO); uncommitted SOURCE isolated, .venv shared; writes OS-confined via --sandbox. venv_symlinked=$([ -L "$ISOLATE_WT/.venv" ] && echo yes || echo no)"
     else
         # FAIL CLOSED — see codex watchdog. --isolate requested but no worktree possible: REFUSE.
@@ -561,20 +578,63 @@ kill_grace() {
     local i=0
     while [ "$i" -lt 3 ] && kill -0 "$1" 2>/dev/null; do sleep 1; i=$((i + 1)); done
     kill_tree "$1"
+    wd_verify_dead "$1"
 }
+
+# Sum RSS (KB) over a pid and all its descendants (recursive pgrep -P — the same
+# traversal kill_tree uses). The memory ceiling gates the whole tree: on
+# 2026-08-29 orphaned/child pythons reached 53+46+33 GB and crashed the machine.
+wd_tree_rss_kb() {
+    local p="$1" total c
+    total=$(ps -o rss= -p "$p" 2>/dev/null | awk '{s+=$1} END {print s+0}')
+    for c in $(pgrep -P "$p" 2>/dev/null); do
+        total=$(( total + $(wd_tree_rss_kb "$c") ))
+    done
+    echo "$total"
+}
+WD_MEM_CEILING_KB="${WD_MEM_CEILING_KB:-12582912}"   # 12 GB default per lane
+
+# A kill is not a kill until verified: re-sweep the descendant tree after
+# kill_tree and log+re-kill any survivor. A yielded/killed child must be PROVEN
+# dead, never assumed (a PID-only kill left a 7h zombie pytest on 2026-08-28).
+wd_verify_dead() {
+    local p="$1" left
+    sleep 1
+    left="$( { pgrep -P "$p" 2>/dev/null; kill -0 "$p" 2>/dev/null && echo "$p"; } | tr '\n' ' ')"
+    if [ -n "${left// /}" ]; then
+        log_wd "WARNING: survivors after kill_tree of $p: $left — re-killing"
+        for c in ${left}; do kill_tree "$c" 2>/dev/null; done
+        sleep 1
+        left="$( { pgrep -P "$p" 2>/dev/null; kill -0 "$p" 2>/dev/null && echo "$p"; } | tr '\n' ' ')"
+        [ -n "${left// /}" ] && log_wd "ERROR: UNKILLABLE survivors of $p: $left"
+    fi
+}
+
 
 retry=0
 hung_killed=0
 CUR_MODEL="$MODEL"       # model used this attempt
 # Sandbox + permission flags by mode (macOS Seatbelt, OS-enforced, applied at startup):
-#   read-only (default):   reads + read-only shell allowed; ALL writes + network OS-blocked.
+#   readonly-sockdeny (default): reads + read-only shell allowed; ALL writes OS-blocked outside
+#                          ~/.grok and the temp dirs. This is a CUSTOM profile defined in
+#                          ~/.grok/sandbox.toml, not grok's built-in `read-only`, because the
+#                          built-in one cannot start wherever a container runtime has symlinked
+#                          /var/run/docker.sock: its restrict_network flag pulls in a hardcoded
+#                          container-socket deny list whose resolver rejects a symlinked
+#                          endpoint, and grok then refuses to start rather than run unprotected.
+#                          The custom profile inherits the same write grants and re-adds the
+#                          socket deny explicitly; see the comments in ~/.grok/sandbox.toml. It
+#                          must exist there — grok fails closed on an undefined profile name.
 #   workspace (--full-auto): writes confined to CWD (the worktree under --isolate) + /tmp.
+# Neither profile blocks NETWORK on macOS: the Seatbelt profile is process-wide and children
+# inherit it, so grok cannot deny a child's network without denying its own (restrict_network
+# is Linux-seccomp only). Treat a delegated run as network-capable regardless of mode.
 # --yolo auto-approves tool calls so a headless run never blocks on a permission prompt; the
 # sandbox is the real boundary (writes cannot escape it regardless of --yolo).
 if [ "$WRITE_MODE" -eq 1 ]; then
     SANDBOX_ARGS=( --sandbox workspace --yolo )
 else
-    SANDBOX_ARGS=( --sandbox read-only --yolo )
+    SANDBOX_ARGS=( --sandbox readonly-sockdeny --yolo )
 fi
 while true; do
     CMD=( "$GROK_BIN"
@@ -631,6 +691,14 @@ while true; do
 
     while kill -0 "$PID" 2>/dev/null; do
         sleep "$POLL_INTERVAL_SEC"
+
+        _tree_rss=$(wd_tree_rss_kb "$PID")
+        if [ "${_tree_rss:-0}" -gt "$WD_MEM_CEILING_KB" ]; then
+            log_wd "memory ceiling: tree rss ${_tree_rss}KB > ${WD_MEM_CEILING_KB}KB; killing tree PID=$PID"
+            kill_tree "$PID"; wd_verify_dead "$PID"
+            hung_killed=1
+            break
+        fi
 
         # PROGRESS, measured — not assumed. grok streams token-level thought/text deltas and
         # tool-call events, so growth of events.jsonl means the agent is alive and working.

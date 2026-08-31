@@ -5,7 +5,7 @@
 # retired Gemini CLI / Gemini Code Assist for individuals on 2026-06-18 (the
 # OAuth `free-tier` returns IneligibleTierError/UNSUPPORTED_CLIENT). The skill
 # now routes the Gemini family through `agy` (Antigravity), which serves the same
-# Google models (default `gemini-3.6-flash-high`) and preserves the review
+# Google models (default `gemini-3.7-flash-high`) and preserves the review
 # panel's diversity invariant. The `/gemini` name, run-dir contract, status/pid
 # files, and the `GEMINI_MODEL` knob are unchanged so callers (incl. review-panel
 # and already-running sessions) keep working without edits.
@@ -43,7 +43,7 @@
 #   137  watchdog killed last attempt (after exhausting retries on hang)
 #
 # Tunables (env):
-#   GEMINI_MODEL:       agy model id (default "gemini-3.6-flash-high").
+#   GEMINI_MODEL:       agy model id (default "gemini-3.7-flash-high").
 #                       Validated against `agy models`; any unset/legacy/unknown
 #                       value (e.g. a gemini-cli id like gemini-2.5-pro) is
 #                       REMAPPED to the default so stale callers self-heal.
@@ -66,7 +66,7 @@
 #   RETRY_BACKOFF_SEC:  pause (s) before a retry (default 3)
 #   GEMINI_QUOTA_FALLBACK: 1 = on quota, do ONE Gemini-only tier downgrade (default off)
 #   GEMINI_FALLBACK_MODEL: fallback target; must be a Gemini model
-#                       (default "gemini-3.6-flash-high")
+#                       (default "gemini-3.7-flash-high")
 
 set -u
 
@@ -115,7 +115,7 @@ fi
 # display names like "Gemini 3.5 Flash (High)" are now SILENTLY IGNORED by agy (it serves
 # its own default). Bare ids are the only form that binds; display-name callers are
 # normalized below.
-DEFAULT_AGY_MODEL="gemini-3.6-flash-high"
+DEFAULT_AGY_MODEL="${DEFAULT_AGY_MODEL:-gemini-3.7-flash-high}"
 AGY_PRINT_TIMEOUT="${AGY_PRINT_TIMEOUT:-8m}"     # foreground-safe; agy self-timeout fires before HANG_SEC
 HANG_SEC="${HANG_SEC:-540}"                       # 9m backstop, LOWER than the ~10m outer bound so the watchdog wins the race
 MAX_RETRIES="${MAX_RETRIES:-1}"
@@ -271,6 +271,13 @@ get_agy_models() {
 # family, so a loose match can never cross to agy's Claude/GPT-OSS models (the review
 # panel's diversity invariant). No bullet/ANSI stripping (the live output is clean;
 # trimming surrounding whitespace is the only drift we defend without over-reaching).
+bare_model_ids() {   # <models-list> -> one bare id per line
+    # `agy models` prints "<bare-id><TAB><Display Name>"; every matcher below wants the
+    # id alone. Emitting only the first whitespace-delimited field keeps a bare-id-only
+    # listing (agy's older format) working unchanged.
+    printf '%s\n' "$1" | awk '{ if (NF) print $1 }'
+}
+
 model_in_list_tolerant() {   # <requested> <models-list> ; returns 0 on match
     local req="$1" list="$2"
     case "$req" in Gemini* | gemini-*) ;; *) return 1 ;; esac
@@ -373,8 +380,24 @@ sweep_stale_runs() {
             p="$(cat "$d/pid" 2>/dev/null || true)"
             [ -n "${p:-}" ] && kill -0 "$p" 2>/dev/null && continue
         fi
+        # POSITIVE ATTRIBUTION BEFORE DESTRUCTION: a live recorded watchdog means the
+        # run is NOT stale, whatever the log mtime says (a quiet codex-style run was
+        # falsely swept on 2026-08-31 while its supervisor was alive and parenting).
+        _wp="$(cat "$d/wd_pid" 2>/dev/null || true)"
+        [ -n "${_wp:-}" ] && kill -0 "$_wp" 2>/dev/null && continue
         _orphan=""; _op="$(cat "$d/pid" 2>/dev/null || true)"
-        [ -n "${_op:-}" ] && kill -0 "$_op" 2>/dev/null && _orphan=" WARNING: agy pid=$_op may still be running orphaned (a SIGKILLed watchdog cannot reap it); if it was a --full-auto in-repo run, kill it: kill $_op"
+        if [ -n "${_op:-}" ] && kill -0 "$_op" 2>/dev/null && ps -o command= -p "$_op" 2>/dev/null | grep -qE "agy|gemini"; then
+            # An orphan is REAPED, not merely warned about: a swept-but-alive child ran
+            # 5.5h unsupervised on 2026-08-31 (and 130+GB of such orphans crashed the
+            # box on 08-29). Tree-kill (children first), then verify.
+            _okill() { local q c; q="$1"; for c in $(pgrep -P "$q" 2>/dev/null); do _okill "$c"; done; kill -9 "$q" 2>/dev/null; }
+            _okill "$_op"; sleep 1
+            if kill -0 "$_op" 2>/dev/null; then
+                _orphan=" ERROR: orphan pid=$_op SURVIVED the sweep kill"
+            else
+                _orphan=" orphan pid=$_op and its tree were killed by the sweep"
+            fi
+        fi
         printf 'aborted\n' > "$d/status.tmp" 2>/dev/null && mv "$d/status.tmp" "$d/status" 2>/dev/null || true
         printf '[%s] swept: was %s, watchdog.log %ss stale and no live watchdog -> aborted (externally killed; the outer call bound likely SIGKILLed the watchdog mid-run).%s\n' \
             "$(date +%H:%M:%S)" "$st" "$age" "$_orphan" >> "$logf" 2>/dev/null || true
@@ -460,7 +483,9 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Resolve WORK_DIR up-front (agy's workspace is the cwd; --add-dir adds more).
+# Resolve WORK_DIR up-front. The cwd is where agy RUNS, but it does not make files there
+# readable — workspace membership does, and only --add-dir grants that (see the headless
+# workspace-access block below).
 WORK_DIR="${GEMINI_WATCHDOG_CWD:-$PWD}"
 if [ ! -d "$WORK_DIR" ]; then
     log_wd "cwd not found, falling back to current dir: $WORK_DIR"
@@ -610,12 +635,13 @@ display_to_bare_id() {
 log_wd "validating model via agy models (cap ${AGY_MODELS_TIMEOUT}s, ttl ${AGY_MODELS_TTL}s)"
 AGY_MODELS="$(get_agy_models)"
 if [ -n "$AGY_MODELS" ]; then
-    if printf '%s\n' "$AGY_MODELS" | grep -qxF -- "$REQ_MODEL"; then
+    AGY_MODEL_IDS="$(bare_model_ids "$AGY_MODELS")"
+    if printf '%s\n' "$AGY_MODEL_IDS" | grep -qxF -- "$REQ_MODEL"; then
         MODEL="$REQ_MODEL"
-    elif model_in_list_tolerant "$REQ_MODEL" "$AGY_MODELS"; then
+    elif model_in_list_tolerant "$REQ_MODEL" "$AGY_MODEL_IDS"; then
         MODEL="$REQ_MODEL"
         log_wd "model matched via whitespace-tolerant compare: '$REQ_MODEL'"
-    elif printf '%s\n' "$AGY_MODELS" | grep -qxF -- "$(display_to_bare_id "$REQ_MODEL")"; then
+    elif printf '%s\n' "$AGY_MODEL_IDS" | grep -qxF -- "$(display_to_bare_id "$REQ_MODEL")"; then
         MODEL="$(display_to_bare_id "$REQ_MODEL")"
         log_wd "display name '$REQ_MODEL' normalized to bare id '$MODEL' (same tier, not a downgrade)"
     else
@@ -657,6 +683,10 @@ ln -sfn "$RUN_DIR" /tmp/gemini_runs/latest 2>/dev/null || true
 # stderr only — output.md may legitimately discuss these terms.
 AUTH_PATTERN='IneligibleTier|UNSUPPORTED_CLIENT|FatalAuthenticationError|AuthRequired|invalid_token|UNAUTHENTICATED|PERMISSION_DENIED'
 QUOTA_PATTERN='RESOURCE_EXHAUSTED|quota.*exceeded'
+# Headless permission soft-deny: a tool needed a confirmation print mode cannot ask for, so agy
+# denied it, ended the turn and wrote NOTHING. Deterministic — the same run repeats it, so the
+# empty-output retry is wasted and the failure must name the tool instead of reading as "empty".
+PERM_PATTERN='headless mode cannot prompt for'
 # Narration-stall detector (default-mode backstop). agy self-narration is FIRST-PERSON intent to
 # ACT ("I will view/run/wait…") with no actual answer. The gate fires only when _NARR_INTENT matches
 # the tail AND the full output LACKS substantive review markers (_NARR_SUBSTANCE) — so a THIRD-PERSON
@@ -673,7 +703,38 @@ kill_grace() {
     local i=0
     while [ "$i" -lt 3 ] && kill -0 "$1" 2>/dev/null; do sleep 1; i=$((i + 1)); done
     kill_tree "$1"
+    wd_verify_dead "$1"
 }
+
+# Sum RSS (KB) over a pid and all its descendants (recursive pgrep -P — the same
+# traversal kill_tree uses). The memory ceiling gates the whole tree: on
+# 2026-08-29 orphaned/child pythons reached 53+46+33 GB and crashed the machine.
+wd_tree_rss_kb() {
+    local p="$1" total c
+    total=$(ps -o rss= -p "$p" 2>/dev/null | awk '{s+=$1} END {print s+0}')
+    for c in $(pgrep -P "$p" 2>/dev/null); do
+        total=$(( total + $(wd_tree_rss_kb "$c") ))
+    done
+    echo "$total"
+}
+WD_MEM_CEILING_KB="${WD_MEM_CEILING_KB:-12582912}"   # 12 GB default per lane
+
+# A kill is not a kill until verified: re-sweep the descendant tree after
+# kill_tree and log+re-kill any survivor. A yielded/killed child must be PROVEN
+# dead, never assumed (a PID-only kill left a 7h zombie pytest on 2026-08-28).
+wd_verify_dead() {
+    local p="$1" left
+    sleep 1
+    left="$( { pgrep -P "$p" 2>/dev/null; kill -0 "$p" 2>/dev/null && echo "$p"; } | tr '\n' ' ')"
+    if [ -n "${left// /}" ]; then
+        log_wd "WARNING: survivors after kill_tree of $p: $left — re-killing"
+        for c in ${left}; do kill_tree "$c" 2>/dev/null; done
+        sleep 1
+        left="$( { pgrep -P "$p" 2>/dev/null; kill -0 "$p" 2>/dev/null && echo "$p"; } | tr '\n' ' ')"
+        [ -n "${left// /}" ] && log_wd "ERROR: UNKILLABLE survivors of $p: $left"
+    fi
+}
+
 
 retry=0
 hung_killed=0
@@ -693,6 +754,51 @@ fallback_used=0
 # entirely with GEMINI_NO_DIRECTIVE=1.
 WRITE_MODE=0
 for a in ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}; do [ "$a" = "--dangerously-skip-permissions" ] && WRITE_MODE=1; done
+
+# --- headless workspace access -----------------------------------------------------------------
+# agy --print SOFT-DENIES any tool that would need a confirmation, and reading a file outside the
+# CLI WORKSPACE needs one — the process cwd does NOT make a path readable. The denial ends the turn
+# on the spot: exit 0, EMPTY output.md, one line on stderr. So a brief that points the seat at repo
+# files dies as "empty output" with the real cause buried in stderr.log. --add-dir puts a directory
+# in the workspace, which grants READS there; write_file stays soft-denied, so it is safe for a
+# read-only seat. (The stderr hint's other route, a permissions.allow rule, matches a path PREFIX —
+# read_file(/tmp) binds, the glob form read_file(/tmp/**) never matches anything.) WRITE mode
+# auto-approves every tool already, so the grant is built only for read-only runs.
+ACCESS_ARGS=()
+_access_seen=""
+_access_add_one() {
+    local d="$1" depth
+    while [ "${d%/}" != "$d" ]; do d="${d%/}"; done   # /tmp/x/ and /tmp/x are one dir, not two
+    [ -n "$d" ] && [ -d "$d" ] || return 0
+    [ "$d" = "$HOME" ] && { log_wd "access: skipping '$d' (home dir is too broad to hand a seat)"; return 0; }
+    depth=$(printf '%s' "${d#/}" | tr -cd '/' | wc -c | tr -d ' ')
+    [ "${depth:-0}" -lt 1 ] && { log_wd "access: skipping '$d' (top-level dir is too broad to hand a seat)"; return 0; }
+    case " $_access_seen " in *" $d "*) return 0 ;; esac
+    _access_seen="$_access_seen $d"
+    ACCESS_ARGS+=( --add-dir "$d" )
+}
+# Add the literal dir AND its symlink-resolved twin: on macOS /tmp is /private/tmp, and a brief
+# names one form while the seat may open the other.
+_access_add() {
+    local d="$1" rp
+    _access_add_one "$d"
+    rp="$(cd "$d" 2>/dev/null && pwd -P 2>/dev/null)"
+    [ -n "${rp:-}" ] && [ "$rp" != "$d" ] && _access_add_one "$rp"
+}
+if [ "$WRITE_MODE" -eq 0 ]; then
+    _access_add "$WORK_DIR"
+    _access_add "$RUN_DIR"
+    # The absolute paths the brief itself names are exactly what the seat is told to open. Capped so
+    # a path-heavy prompt cannot bloat argv.
+    while read -r _p; do
+        [ "${#ACCESS_ARGS[@]}" -ge 32 ] && { log_wd "access: path-scan cap reached; later prompt paths not added"; break; }
+        [ -n "$_p" ] || continue
+        if [ -d "$_p" ]; then _access_add "$_p"; else _access_add "$(dirname "$_p")"; fi
+    done < <(grep -oE '/(Users|tmp|private|Volumes|opt|home)/[A-Za-z0-9._@+/-]+' "$PROMPT_FILE" 2>/dev/null \
+             | sed -e 's/[.,;:)]*$//' | sort -u)
+    log_wd "access: workspace read grant =${_access_seen:- (none — reads outside the workspace will be soft-denied)}"
+fi
+
 EFFECTIVE_PROMPT="$RUN_DIR/.effective_prompt.txt"
 _DIRECTIVE=""
 if [ "${GEMINI_NO_DIRECTIVE:-0}" = "1" ]; then
@@ -739,6 +845,9 @@ while true; do
     if [ "${#RESUME_ARGS[@]}" -gt 0 ]; then
         CMD+=( "${RESUME_ARGS[@]}" )
     fi
+    if [ "${#ACCESS_ARGS[@]}" -gt 0 ]; then
+        CMD+=( "${ACCESS_ARGS[@]}" )
+    fi
     if [ "${#EXTRA_ARGS[@]}" -gt 0 ]; then
         CMD+=( "${EXTRA_ARGS[@]}" )
     fi
@@ -767,11 +876,21 @@ while true; do
     hung_killed=0
     fast_failed=0
     empty_failed=0
+    perm_failed=0
+    _perm_tool=""
     narration_failed=0
     fail_kind=""
 
     while kill -0 "$PID" 2>/dev/null; do
         sleep "$POLL_INTERVAL_SEC"
+
+        _tree_rss=$(wd_tree_rss_kb "$PID")
+        if [ "${_tree_rss:-0}" -gt "$WD_MEM_CEILING_KB" ]; then
+            log_wd "memory ceiling: tree rss ${_tree_rss}KB > ${WD_MEM_CEILING_KB}KB; killing tree PID=$PID"
+            kill_tree "$PID"; wd_verify_dead "$PID"
+            hung_killed=1
+            break
+        fi
 
         # Heartbeat: record elapsed/cpu/rss every HEARTBEAT_SEC. Gives a live progress signal
         # AND keeps watchdog.log mtime fresh — that freshness is the liveness signal the zombie
@@ -836,6 +955,11 @@ while true; do
         if ! output_has_content; then
             empty_failed=1
             log_wd "empty-output gate: agy exited 0 but output.md has no non-whitespace; treating attempt as failed"
+            if grep -q "$PERM_PATTERN" "$STDERR_FILE" 2>/dev/null; then
+                perm_failed=1
+                _perm_tool=$(grep -oE 'the "[a-z_]+" permission' "$STDERR_FILE" 2>/dev/null | head -1 | tr -d '"' | awk '{print $2}')
+                log_wd "permission gate: agy soft-denied the '${_perm_tool:-?}' tool (headless cannot prompt) and answered nothing; deterministic, so not retried"
+            fi
         fi
     fi
 
@@ -931,7 +1055,7 @@ while true; do
     # bound, so a retry would re-cross it and re-zombie. A SLOW failure (attempt_elapsed >=
     # RETRY_FAST_SEC, e.g. agy's own print-timeout) is also terminal — retrying it would cross
     # the ceiling too. Only a FAST transient/empty failure retries (within the retry budget).
-    if [ "$retry" -ge "$MAX_RETRIES" ] || [ "$fail_kind" = "quota" ] || [ "$hung_killed" -eq 1 ] || [ "$attempt_elapsed" -ge "$RETRY_FAST_SEC" ]; then
+    if [ "$retry" -ge "$MAX_RETRIES" ] || [ "$fail_kind" = "quota" ] || [ "$hung_killed" -eq 1 ] || [ "$perm_failed" -eq 1 ] || [ "$attempt_elapsed" -ge "$RETRY_FAST_SEC" ]; then
         finalize_isolate
         trap - EXIT
         if [ "$hung_killed" -eq 1 ]; then
@@ -944,6 +1068,12 @@ while true; do
             reset_hint=$(grep -oiE 'resets? in [0-9][0-9a-z.: ]*' "$STDERR_FILE" 2>/dev/null | head -1 | tr -s ' ')
             log_wd "giving up (quota on '$CUR_MODEL'): Antigravity quota is ACCOUNT-WIDE (Flash+Pro exhaust together), so switching tier via GEMINI_MODEL will NOT help and the opt-in Pro->Flash fallback is likely futile. ${reset_hint:-no reset window in stderr}. Wait for reset, or run a 3-family panel with the Gemini seat noted down. attempts=$((retry + 1))"
             printf 'GEMINI quota (account-wide): tier-switch will not help. %s\n' "${reset_hint:-(no reset window reported)}" >> "$STDERR_FILE" 2>/dev/null || true
+            exit 1
+        elif [ "$perm_failed" -eq 1 ]; then
+            write_status "failed"
+            mark_degraded "agy soft-denied the '${_perm_tool:-?}' tool in headless mode and returned nothing — the seat could not reach what the brief points at."
+            log_wd "giving up (permission soft-deny): agy --print cannot prompt for the '${_perm_tool:-?}' permission, so the tool was denied and the turn ended empty. READS: the watchdog --add-dir's the work dir, the run dir and the prompt's absolute paths — a path outside those needs its own --add-dir, or a read_file(<prefix>) rule in ~/.gemini/antigravity-cli/settings.json (a PREFIX; a /** glob never matches). COMMANDS: only a command(<prefix>) rule in that file permits one, and the read-only directive tells the seat not to run any. WRITES: read-only runs cannot write; use --full-auto. attempts=$((retry + 1))"
+            printf 'GEMINI permission soft-deny: agy could not use the "%s" tool in headless mode; no answer produced. See watchdog.log.\n' "${_perm_tool:-?}" >> "$STDERR_FILE" 2>/dev/null || true
             exit 1
         elif [ "$empty_failed" -eq 1 ]; then
             write_status "failed"

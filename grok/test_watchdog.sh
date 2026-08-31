@@ -60,7 +60,7 @@ has "success keeps raw events" "$(cat "$RD/events.jsonl" 2>/dev/null)" '"type":"
 
 # 2. default-mode argv: read-only + yolo + default effort + streaming-json + prompt-file + default model
 A="$(cat "$ARGV_FILE")"
-has "argv --sandbox read-only" "$A" "--sandbox read-only"
+has "argv --sandbox readonly-sockdeny" "$A" "--sandbox readonly-sockdeny"
 has "argv --yolo" "$A" "--yolo"
 has "argv --effort xhigh" "$A" "--effort xhigh"
 has "argv --output-format streaming-json" "$A" "--output-format streaming-json"
@@ -118,7 +118,7 @@ PATH="$MOCK_DIR:$PATH" "$WD" "$EMPTY" >/dev/null 2>&1; chk "missing prompt exit"
 RD="$(newrun)"; GROK_MOCK_MODE=ok runwd "$RD" --sandbox workspace --model evil-model --cwd /somewhere/live >/dev/null 2>&1
 A="$(cat "$ARGV_FILE")"
 chk "sanitized run status" "$(cat "$RD/status" 2>/dev/null)" "done"
-has "sanitized keeps read-only" "$A" "--sandbox read-only"
+has "sanitized keeps read-only" "$A" "--sandbox readonly-sockdeny"
 hasnt "sanitized drops caller workspace" "$A" "workspace"
 has "sanitized keeps default model" "$A" "--model grok-4.6"
 hasnt "sanitized drops evil-model" "$A" "evil-model"

@@ -91,6 +91,37 @@ log_wd() {
     printf '[%s] %s\n' "$(date +%H:%M:%S)" "$*" >> "$WATCHDOG_FILE"
 }
 
+# Kill the child's ENTIRE process group and verify it died. The child is spawned
+# under its own group (setsid), so -$pid addresses codex plus everything it
+# forked. TERM first for clean shutdown, then KILL; verified empty afterward
+# because an unreaped child is exactly how 130+ GB of orphaned python survived a
+# PID-only kill on 2026-08-29. Leftovers are logged loudly, never assumed dead.
+wd_kill_group() {
+    local pid=$1 i left
+    kill -TERM -- "-$pid" 2>/dev/null
+    for i in 1 2 3 4; do
+        pgrep -g "$pid" >/dev/null 2>&1 || { log_wd "group $pid terminated cleanly"; return 0; }
+        sleep 2
+    done
+    kill -KILL -- "-$pid" 2>/dev/null
+    sleep 1
+    left=$(pgrep -g "$pid" 2>/dev/null | tr '\n' ' ')
+    if [ -n "$left" ]; then
+        log_wd "ERROR: group $pid SURVIVORS after KILL: $left"
+        return 1
+    fi
+    log_wd "group $pid killed"
+    return 0
+}
+
+# Sum RSS (KB) across the child's process group. The memory ceiling gates the
+# whole tree, not the codex process alone — the runaway growth lives in spawned
+# python children.
+wd_group_rss_kb() {
+    ps -g "$1" -o rss= 2>/dev/null | awk '{s+=$1} END {print s+0}'
+}
+WD_MEM_CEILING_KB="${WD_MEM_CEILING_KB:-12582912}"   # 12 GB default per lane
+
 # True if output.md has at least one non-whitespace byte. `[ -s ]` is WRONG (it passes on a
 # whitespace-only file). codex can exit 0 having written nothing to the agent-message file
 # (-o); only "has non-whitespace" distinguishes a real answer from a blank one. (audit 2e)
@@ -152,18 +183,28 @@ cleanup() {
         local pid
         pid=$(cat "$PID_FILE" 2>/dev/null)
         if [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null; then
-            kill -9 "$pid" 2>/dev/null
-            write_status "aborted"
-            log_wd "aborted: cleanup killed PID=$pid"
+            wd_kill_group "$pid"
+            log_wd "aborted: cleanup killed group PID=$pid"
         fi
         rm -f "$PID_FILE"
     fi
+    # A non-terminal status at cleanup means this exit was not one of the normal
+    # completion paths (done/failed/hung_killed already written). Without this,
+    # a group kill that takes the codex child before the trap runs leaves the
+    # status file claiming "running" forever.
+    case "$(cat "$STATUS_FILE" 2>/dev/null)" in
+        starting|running|retrying)
+            write_status "aborted"
+            log_wd "aborted: cleanup on non-terminal status (rc=$rc)"
+            ;;
+    esac
     finalize_isolate
     exit "$rc"
 }
 trap cleanup EXIT INT TERM
 
 write_status "starting"
+printf '%s\n' "$$" > "$RUN_DIR/wd_pid" 2>/dev/null || true   # sweepers check this + log freshness; heartbeat below keeps the log fresh
 log_wd "start: run_dir=$RUN_DIR model=$CODEX_MODEL reasoning=$CODEX_REASONING"
 
 mkdir -p /tmp/codex_runs
@@ -397,13 +438,19 @@ while true; do
     : > "$STDERR_FILE"
 
     # shellcheck disable=SC2086
-    codex exec $extra_isolation ${NET_FLAGS[@]+"${NET_FLAGS[@]}"} "$@" \
+    # setsid wrapper: the codex child leads its OWN process group, so every kill
+    # site can reap the full tree (codex + any python/pytest it spawned). A bare
+    # kill of the codex PID leaves those children running — three of them reached
+    # 53/46/33 GB RSS and took the machine down on 2026-08-29.
+    /usr/bin/env python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+        codex exec $extra_isolation ${NET_FLAGS[@]+"${NET_FLAGS[@]}"} "$@" \
         --json -o "$OUTPUT_FILE" - \
         < "$PROMPT_FILE" \
         > "$EVENTS_FILE" \
         2> "$STDERR_FILE" &
     PID=$!
     echo "$PID" > "$PID_FILE"
+    spawn_at_hb=$SECONDS
     write_status "running"
     log_wd "spawned PID=$PID"
 
@@ -423,9 +470,21 @@ while true; do
         # that killed codex when the prompt or model output discussed MCP/OAuth.
         if grep -Eqi "$FASTFAIL_PATTERN" "$STDERR_FILE" 2>/dev/null; then
             ctx=$(grep -Ei -A2 -B1 "$FASTFAIL_PATTERN" "$STDERR_FILE" 2>/dev/null | head -10 | tr '\n' '|' | cut -c1-400)
-            log_wd "fast-fail pattern matched in stderr; killing PID=$PID"
+            log_wd "fast-fail pattern matched in stderr; killing group PID=$PID"
             log_wd "stderr context: $ctx"
-            kill -9 "$PID" 2>/dev/null
+            wd_kill_group "$PID"
+            hung_killed=1
+            break
+        fi
+
+        _hbc=$(( ${_hbc:-0} + 1 ))
+        if [ $(( _hbc % 12 )) -eq 0 ]; then
+            log_wd "hb elapsed=$((SECONDS - spawn_at_hb))s group_rss_kb=${group_rss:-?}"
+        fi
+        group_rss=$(wd_group_rss_kb "$PID")
+        if [ "${group_rss:-0}" -gt "$WD_MEM_CEILING_KB" ]; then
+            log_wd "memory ceiling: group rss ${group_rss}KB > ${WD_MEM_CEILING_KB}KB; killing group PID=$PID"
+            wd_kill_group "$PID"
             hung_killed=1
             break
         fi
@@ -464,7 +523,7 @@ while true; do
             cpu_pct=$(ps -o pcpu= -p "$PID" 2>/dev/null | tr -d ' ')
             rss_kb=$(ps -o rss= -p "$PID" 2>/dev/null | tr -d ' ')
             log_wd "hang phase=$phase elapsed=${elapsed}s threshold=${threshold}s cpu%=$cpu_pct rss_kb=$rss_kb"
-            kill -9 "$PID" 2>/dev/null
+            wd_kill_group "$PID"
             hung_killed=1
             break
         fi

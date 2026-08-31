@@ -13,13 +13,37 @@ Delegate a task to **Grok** (xAI's `grok` CLI, model `grok-4.6`, `--effort xhigh
 ## Background any real task
 **A task that reads files, runs commands, or writes code goes `--bg`.** An xhigh agent turn routinely runs 10–45 minutes; the foreground path cannot outlive the outer ~10m call bound, so a foreground run of real work is killed at 9m with nothing to show. Foreground is for a question you expect answered in a minute or two.
 
-**Sibling skill `/composer`** drives the SAME `grok` binary with `GROK_MODEL=grok-composer-2.5-fast` (Cursor's Composer 2.5). Both reuse this watchdog; see `skills/composer/SKILL.md`.
+**Sibling skill `/composer`** drives the SAME `grok` binary with `GROK_MODEL=grok-composer-2.5-fast` (Cursor's Composer 2.5). Both reuse this watchdog; see `skills/composer/SKILL.md`. As of 2026-08-31 grok.com no longer serves that id (`grok models` lists only `grok-4.6` and `grok-4.5`), so `/composer` downgrades to `grok-4.6` and writes a `degraded` note — it is **not** a second model family for panel purposes.
 
 ## What does NOT change
 Every invocation goes through `~/.claude/skills/grok/run_with_watchdog.sh`. Never call `grok` directly — the watchdog pins the model + effort, applies the sandbox, reassembles the event stream, gates empty output, classifies auth/quota, and self-heals zombie runs.
 
 ## Default safety: READ-ONLY
-By default the watchdog runs grok under `--sandbox read-only` (macOS Seatbelt, OS-enforced): reads + read-only shell are allowed, ALL writes outside `/tmp` and `~/.grok` are blocked, network is restricted. So a delegated analysis/review CANNOT mutate the repo. Pass `--full-auto` to allow writes (`--sandbox workspace`: CWD + `/tmp`), and add `--isolate` to confine those writes to a throwaway git worktree.
+By default the watchdog runs grok under `--sandbox readonly-sockdeny` (macOS Seatbelt, OS-enforced): reads + read-only shell are allowed, ALL writes outside `/tmp` and `~/.grok` are blocked, and the container-runtime sockets are read- and write-denied. So a delegated analysis/review CANNOT mutate the repo. Pass `--full-auto` to allow writes (`--sandbox workspace`: CWD + `/tmp`), and add `--isolate` to confine those writes to a throwaway git worktree.
+
+`readonly-sockdeny` is a custom profile defined in `~/.grok/sandbox.toml`; it must exist there or grok fails closed on the unknown profile name. It stands in for grok's built-in `read-only`, which cannot start on a machine where a container runtime has symlinked `/var/run/docker.sock` — the built-in profile's `restrict_network` pulls in a hardcoded container-socket deny list whose resolver rejects a symlinked endpoint. The custom profile inherits the identical write grants and re-adds that deny explicitly. **No profile restricts network on macOS** — Seatbelt is process-wide and children inherit it, so grok cannot deny a child's network without denying its own (`restrict_network` is Linux-seccomp only). Treat every delegated run as network-capable.
+
+Setup — put this in `~/.grok/sandbox.toml`, substituting your own home directory in the two `.docker` entries (TOML does not expand `~` or `$HOME`):
+
+```toml
+[profiles.readonly-sockdeny]
+extends = "read-only"
+restrict_network = false
+deny = [
+  "/var/run/docker.sock",
+  "/private/var/run/docker.sock",
+  "/YOUR/HOME/.docker/run/docker.sock",
+  "/YOUR/HOME/.docker/desktop/docker.sock",
+  "/run/podman/podman.sock",
+  "/var/run/podman/podman.sock",
+  "/private/var/run/podman/podman.sock",
+  "/run/containerd/containerd.sock",
+  "/var/run/containerd/containerd.sock",
+  "/private/var/run/containerd/containerd.sock",
+]
+```
+
+Seatbelt matches the symlink-resolved path, so each macOS entry is listed in both its alias and `/private/…` form; entries that do not exist are inert. Confirm it took effect in `~/.grok/sandbox-events.jsonl` — the `ProfileApplied` record names the profile, `enforced`, the granted `read_write_paths`, and the resolved `deny_paths`.
 
 ## Flags
 - `--bg` — background execution: pass `run_in_background: true` on the Bash tool call **and** `--bg` to the watchdog. The flag removes the wall-clock ceiling (a backgrounded run has no outer call bound to race), leaving progress-based liveness alone in charge. Forgetting it on the watchdog side reinstates the 9-minute guillotine.
@@ -103,3 +127,5 @@ Elapsed time alone never kills a `--bg` run: a working agent and a wedged one ar
 ## Live session (Tier 2 — warm, multi-turn)
 For an ongoing conversation where the agent stays warm in memory and remembers the whole exchange (via `grok agent stdio` / ACP), use the unified dispatcher or this skill's shim:
 `~/.claude/skills/grok/session.sh start --handle H --cwd "$REPO"` → `session.sh send --to H "..."` → `session.sh stop --to H`. Read-only by default; `--full-auto` grants file-write + a terminal bridge. Full docs: `skills/_session/SKILL.md`.
+
+**Memory ceiling (2026-08-31):** every lane enforces `WD_MEM_CEILING_KB` (default 12582912 = 12GB) over the WHOLE process tree; breach = tree-kill + status `hung_killed` with the reason in watchdog.log. Legitimately heavy lanes raise it per call (`WD_MEM_CEILING_KB=25165824 ...`). Keep the SUM of concurrent lane ceilings under ~40GB on this 64GB box.

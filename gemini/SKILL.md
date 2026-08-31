@@ -1,6 +1,6 @@
 ---
 name: gemini
-description: "Delegate a task to a Gemini agent via the Antigravity CLI (`agy`), default gemini-3.6-flash-high. Runs `agy --print` via watchdog, supervises one run per directory, reads result. Background and resume supported."
+description: "Delegate a task to a Gemini agent via the Antigravity CLI (`agy`), default gemini-3.7-flash-high. Runs `agy --print` via watchdog, supervises one run per directory, reads result. Background and resume supported."
 user-invocable: true
 allowed-tools: Read, Write, Bash
 argument-hint: "[--bg] [--resume] [--full-auto] [--run-id <name>] <prompt>"
@@ -274,16 +274,16 @@ GEMINI_MODEL="Gemini 3.1 Pro (High)" \
 | Flag | Purpose |
 |------|---------|
 | `--print` / `-p` / `--prompt` | Headless / non-interactive. Watchdog passes the prompt on stdin. |
-| `--model <name>` | Model (watchdog defaults to `gemini-3.6-flash-high`; validates against `agy models`). |
+| `--model <name>` | Model (watchdog defaults to `gemini-3.7-flash-high`; validates against `agy models`). |
 | `--print-timeout <dur>` | Timeout for the print-mode call (watchdog sets 25m). |
 | `--continue` / `-c` | Continue the most recent conversation (the `--resume latest` path). |
 | `--conversation <id>` | Resume a specific conversation by id (ids not auto-captured in print mode). |
 | `--dangerously-skip-permissions` | Auto-approve all tool permissions (the `--full-auto` / yolo path). |
-| `--add-dir <dir>` | Add a workspace directory (used with `--full-auto`). |
+| `--add-dir <dir>` | Add a workspace directory. Required for READS too, not just writes — see *File access in headless mode*. The watchdog adds the work dir, the run dir and the prompt's absolute paths automatically on read-only runs; pass your own only for a tree none of those cover. |
 | `--sandbox` | Run with terminal restrictions enabled. |
 | `agy models` | List available models (watchdog uses this to validate/remap `GEMINI_MODEL`). |
 
-Available models (from `agy models`, 2026-07-23): `gemini-3.6-flash-{low,medium,high}`, `gemini-3.5-flash-{low,medium,high}`, `gemini-3.1-pro-{low,high}`, `claude-sonnet-4-6`, `claude-opus-4-6-thinking`, `gpt-oss-120b-medium`. The reasoning tier is baked into the model id. **agy binds bare ids only** — as of 2026-07-22 it silently ignores the old display-name form (`Gemini 3.5 Flash (High)`) and serves its own default. The watchdog normalizes any display name a caller passes to the matching bare id (same tier, not a downgrade) before invoking agy, so display-name callers keep working; prefer the bare id in new callers.
+Available models (from `agy models`, 2026-08-24): `gemini-3.7-flash-{low,medium,high}` (the standing default is `gemini-3.7-flash-high`), `gemini-3.6-flash-{low,medium,high}`, `gemini-3.5-flash-{low,medium,high}`, `gemini-3.1-pro-{low,high}`, `claude-sonnet-4-6`, `claude-opus-4-6-thinking`, `gpt-oss-120b-medium`. The reasoning tier is baked into the model id. **agy binds bare ids only** — as of 2026-07-22 it silently ignores the old display-name form (`Gemini 3.5 Flash (High)`) and serves its own default. The watchdog normalizes any display name a caller passes to the matching bare id (same tier, not a downgrade) before invoking agy, so display-name callers keep working; prefer the bare id in new callers.
 
 ## Known Divergences from `/codex`
 
@@ -303,9 +303,12 @@ Available models (from `agy models`, 2026-07-23): `gemini-3.6-flash-{low,medium,
 ## Notes / known limitations
 
 - **Resume is by conversation id.** The watchdog records this run's conversation — the newest `~/.gemini/antigravity-cli/conversations/<uuid>.db` — into `session.txt`, so `resume <uuid>` maps to `--conversation <uuid>` (exact) and `resume latest`/empty maps to `--continue`. For a warm in-memory multi-turn session, see *Live session* below.
+- **File access in headless mode.** `agy --print` cannot ask for a tool confirmation, so it SOFT-DENIES any tool that needs one, ends the turn and writes NOTHING — exit 0, empty `output.md`, one stderr line. Reading a file needs a confirmation unless the path is in the workspace or covered by a `permissions.allow` rule; the process cwd grants nothing on its own. The watchdog therefore `--add-dir`s the work dir, the run dir and every absolute path the prompt names (read-only runs; write mode already auto-approves), and fails a soft-deny LOUDLY — `status=failed`, a `degraded` marker naming the tool — instead of reporting it as empty output. What that cannot cover is a path the seat discovers INSIDE a file it reads (a data root referenced by the code, say), which needs a standing rule in `~/.gemini/antigravity-cli/settings.json`: **`permissions.allow` entries match a path PREFIX** — `read_file(/Volumes)` binds, the glob form `read_file(/Volumes/**)` never matches anything. Read rules there grant reads only; `write_file` stays denied, so they are safe for a review seat. Shell commands are gated the same way and only a `command(<prefix>)` rule permits one.
 - **No MCP allowlist knob.** The old gemini-cli `--allowed-mcp-server-names` isolation is gone; agy manages its own tools. The retry path simply re-runs.
 - **Legacy `GEMINI_MODEL` ids self-heal.** A display name (`Gemini 3.6 Flash (High)`) is normalized to its bare id (`gemini-3.6-flash-high`, same tier); any value with no matching tier (including every gemini-cli id) is remapped to the default. Both are logged in `watchdog.log` — this is what lets already-running sessions adopt agy without an edit.
 
 ## Live session (Tier 2 — warm, multi-turn)
 For an ongoing conversation where gemini stays warm in memory and remembers the whole exchange, use the unified dispatcher or this skill's shim:
 `~/.claude/skills/gemini/session.sh start --handle H --cwd "$REPO"` → `session.sh send --to H "..."` → `session.sh stop --to H`. It keeps `agy -i` alive under a pseudo-terminal and reads each turn's end + reply from the conversation's SQLite store. **Not write-sandboxed** (Antigravity has no enforceable read-only mode): default sessions chat/reason; `--full-auto` lets the agent act. Full docs: `skills/_session/SKILL.md`.
+
+**Memory ceiling (2026-08-31):** every lane enforces `WD_MEM_CEILING_KB` (default 12582912 = 12GB) over the WHOLE process tree; breach = tree-kill + status `hung_killed` with the reason in watchdog.log. Legitimately heavy lanes raise it per call (`WD_MEM_CEILING_KB=25165824 ...`). Keep the SUM of concurrent lane ceilings under ~40GB on this 64GB box.
