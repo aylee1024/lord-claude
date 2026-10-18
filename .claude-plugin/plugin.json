@@ -1,0 +1,11 @@
+{
+  "name": "lord",
+  "displayName": "Lord Claude",
+  "version": "2.0.0",
+  "description": "Run OpenAI GPT, xAI Grok and Google Gemini as native Claude Code agents, each in its own CLI on your own subscription.",
+  "author": { "name": "aylee1024", "url": "https://github.com/aylee1024" },
+  "homepage": "https://github.com/aylee1024/lord-claude",
+  "repository": "https://github.com/aylee1024/lord-claude",
+  "license": "MIT",
+  "keywords": ["agents", "subagents", "codex", "gpt", "grok", "gemini", "antigravity", "orchestration"]
+}

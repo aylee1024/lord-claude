@@ -12,3 +12,6 @@ __pycache__/
 BUILD_LOG.md
 plans/
 private/
+
+# Lord test daemon state
+*.jsonl

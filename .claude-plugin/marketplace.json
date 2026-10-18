@@ -1,0 +1,6 @@
+{
+  "name": "lord-claude",
+  "owner": { "name": "aylee1024", "url": "https://github.com/aylee1024" },
+  "metadata": { "description": "Lord Claude: GPT, Grok and Gemini as native Claude Code agents." },
+  "plugins": [{ "name": "lord", "source": "./", "description": "Run GPT, Grok and Gemini as native Claude Code agents, each in its own CLI on your own subscription." }]
+}
