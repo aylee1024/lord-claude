@@ -1,0 +1,20 @@
+name: release
+# Publishes a GitHub release named after plugin.json's version whenever main carries a version with no release yet.
+on:
+  push:
+    branches: [main]
+    paths: [.claude-plugin/plugin.json]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(jq -r .version .claude-plugin/plugin.json)
+          if gh release view "v$version" >/dev/null 2>&1; then echo "v$version already released"; exit 0; fi
+          gh release create "v$version" --target "$GITHUB_SHA" --title "v$version" --generate-notes
