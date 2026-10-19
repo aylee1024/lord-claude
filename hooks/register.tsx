@@ -6,7 +6,7 @@ type Agent = { family: string; cwd?: string; running?: boolean; model?: string; 
 type Stream = { next: number; live: number; answer: string }
 type Outcome = { tool?: { callId: string; name: string; input: Record<string, unknown> } }
 type Limits = { memory_gb?: number; hang_s?: number; wall_s?: number; tools?: boolean }
-type Task = { text: string; model?: string; effort?: string; readonly?: boolean; net?: boolean; dirs?: string[]; cwd?: string; limits?: Limits }
+type Task = { text: string; error?: string; model?: string; effort?: string; readonly?: boolean; net?: boolean; dirs?: string[]; cwd?: string; limits?: Limits }
 const agents = new Map<string, Agent>()
 const starts = new Map<string, Task>()
 const directories = new Map<string, string>()
@@ -44,6 +44,8 @@ function task(text: string): Task {
     else if (line === '@tools') result.limits = { ...result.limits, tools: true }
     else if (/^@cwd\s+\S/.test(line)) result.cwd = line.replace(/^@cwd\s+/, '')
     else if (/^@dir\s+\S/.test(line)) result.dirs = [...(result.dirs ?? []), line.replace(/^@dir\s+/, '')]
+    // A known option written wrongly would end the options here and leave the rest (an @readonly, say) as task text.
+    else if (/^@(model|effort|readonly|net|memory|hang|wall|tools|cwd|dir)\b/.test(line)) { result.error = `option line not understood: ${line}`; break }
     else break
     lines.shift()
   }
@@ -192,6 +194,7 @@ async function steer($: EngineInterface, agentId: string, text: string): Promise
   if (!agent?.running) return false
   const parsed = task(text)
   // Directives alter the next turn's session options rather than an in-flight request.
+  if (parsed.error) return false
   const { text: _, ...options } = parsed
   agent.pending = merge({ text: '', ...agent.pending }, options)
   try {
@@ -263,11 +266,8 @@ export const register: Register = on => {
   })
 
   on('classic.SubagentStart', async ($, e, next) => {
-    if (e.agent_type.startsWith('lord:')) {
-      directories.set(e.agent_id, e.cwd)
-      const previous = agents.get(e.agent_id)
-      agents.set(e.agent_id, { ...previous, family: e.agent_type.slice(5), cwd: e.cwd })
-    }
+    // Only the start folder is recorded: an opened agent's folder is the daemon's, which lordAgent restores.
+    if (e.agent_type.startsWith('lord:')) directories.set(e.agent_id, e.cwd)
     return next(e)
   })
 
@@ -289,6 +289,7 @@ export const register: Register = on => {
       if (e.index === 0) {
         const started = starts.get(e.turnId)
         if (!started) throw new Error('missing turn.start task')
+        if (started.error) throw new Error(started.error)
         // Directives from this task and from messages steered into the last turn apply only once /open accepts them.
         const input = merge(agent.pending ?? { text: '' }, started)
         input.text = started.text
@@ -353,6 +354,8 @@ export const register: Register = on => {
         return { turnId: e.turnId, index: e.index, answer: '', toolUses: [{ name, input }], stopReason: 'tool_use', usage: null }
       }
       if (!stream.answer.trim()) throw new Error('the vendor finished with an empty answer')
+      // A correction that needed a lord tool ends here; its answer is the next StructuredOutput candidate.
+      if (agent.structured && agent.structured !== 'sent') agent.structured = undefined
       agent.lastAnswer = stream.answer
       agent.running = false
       void refresh($)

@@ -32,10 +32,10 @@ INSTALL = {'gpt': "install OpenAI's codex CLI (brew install --cask codex, or npm
 # grok imports Claude Code's tool servers, hooks and skills by default; a lord agent keeps grok's own setup only.
 GROK_NO_CLAUDE_IMPORTS = {f'GROK_{vendor}_{cell}_ENABLED': 'false' for vendor in ('CLAUDE', 'CURSOR') for cell in ('MCPS', 'HOOKS', 'SKILLS')}
 
-def codex_config(home):
+def codex_config(folder):
     try:
         import tomllib
-        return tomllib.loads((home / '.codex/config.toml').read_text())
+        return tomllib.loads((folder / 'config.toml').read_text())
     except (OSError, ValueError): return {}
 
 def load_config():
@@ -47,6 +47,10 @@ def load_config():
     if not isinstance(user, dict): raise ValueError(f'{HOME / "config.json"} must hold a JSON object')
     for key, value in user.items():
         config[key] = {**config[key], **value} if isinstance(value, dict) and isinstance(config.get(key), dict) else value
+    numbers = [(k, config[k]) for k in ('memory_ceiling_kb', 'idle_exit_s', 'prune_days') if k in config]
+    numbers += [(f'{f}.no_progress_s', config[f]['no_progress_s']) for f in ('gpt', 'grok', 'gemini') if 'no_progress_s' in config.get(f, {})]
+    for key, value in numbers:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0: raise ValueError(f'{key} must be a number of 0 or more')
     return config
 
 # Container sockets grok's built-in read-only profile denies; each symlink hop is denied too, because Seatbelt
@@ -141,7 +145,9 @@ class Redactor:
     def __call__(self, value):
         value = str(value)
         for secret in sorted(self.secrets, key=len, reverse=True): value = value.replace(secret, '[REDACTED]')
-        return re.sub(r'(?i)\bBearer[ \t]+[^\s\"\x27]+|\bsk-[\w-]{16,}|\beyJ[\w-]+\.[\w-]+\.[\w-]+', '[REDACTED]', value)
+        value = re.sub(r'(?i)\b(x-api-key|api[-_]?key|authorization|password|passwd|token)(\s*[:=]\s*)[^\s\"\x27,;]+', r'\1\2[REDACTED]', value)
+        return re.sub(r'(?i)\bBearer[ \t]+[^\s\"\x27]+|\bsk-[\w-]{16,}|\beyJ[\w-]+\.[\w-]+\.[\w-]+|\bgh[pousr]_\w{20,}|\bgithub_pat_\w{20,}'
+                      r'|\bAKIA[0-9A-Z]{16}\b|\bAIza[\w-]{30,}|\bxox[abprs]-[\w-]{10,}|\bxai-\w{20,}', '[REDACTED]', value)
 
 async def process_table():
     ps = await asyncio.create_subprocess_exec('/bin/ps', '-A', '-o', 'pid=,ppid=,rss=', stdout=-1, stderr=-3)
@@ -200,7 +206,7 @@ class Agent:
         self.effort = record.get('effort', 'high')
         self.turn_id, self.answer, self.tokens = None, '', usage({})
         self.cancel_requested, self.turn_task = False, None
-        self.followup, self.earlier, self.carry, self.call_data = None, None, [], {}
+        self.followup, self.earlier, self.carry, self.call_data, self.ended_turns = None, None, [], {}, set()
         self.final_text, self.restart, self.token = '', False, uuid.uuid4().hex
         self.log_path = HOME / 'logs' / f"{record['agentId']}.log"
 
@@ -213,7 +219,7 @@ class Agent:
         if kind == 'activity':
             self.activity = value['text'][:300]
             # The agent's activity log: what the vendor ran and read, for review provenance.
-            self.log_path.parent.mkdir(exist_ok=True, mode=0o700)
+            self.log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             if not self.log_path.exists() or self.log_path.stat().st_size < 4 * 1024 * 1024:
                 with self.log_path.open('a') as file: file.write(f'{datetime.now(timezone.utc).isoformat()} {REDACT(value["text"])[:2000]}\n')
         if kind in ('done', 'error'):
@@ -379,7 +385,7 @@ class Vendor:
                 # Text before a tool call is narration; the answer is what grok says after its last one.
                 a.final_text = ''
                 if kind == 'tool_call' or update.get('title'): a.emit('activity', text=update.get('title') or update.get('kind') or 'tool')
-        elif method == 'turn/started': a.turn_id = p['turn']['id']
+        elif method == 'turn/started' and p['turn']['id'] not in a.ended_turns: a.turn_id = p['turn']['id']
         elif method == 'item/agentMessage/delta':
             a.items[p['itemId']] = a.items.get(p['itemId'], '') + p['delta']
             a.emit('text', text=p['delta'])
@@ -399,7 +405,7 @@ class Vendor:
         elif method == 'turn/completed':
             turn = p['turn']
             # A late completion of an earlier turn must not end the current one.
-            if a.turn_id and turn.get('id') != a.turn_id: return
+            if turn.get('id') in a.ended_turns or (a.turn_id and turn.get('id') != a.turn_id): return
             if turn['status'] == 'completed' and not a.cancel_requested:
                 tokens = {**a.tokens, 'input_tokens': max(0, a.tokens['input_tokens'] - a.tokens['cache_read_input_tokens'])}
                 self.d.record_usage(a, tokens)
@@ -425,7 +431,8 @@ class Daemon:
         self.agents, self.vendors, self.tasks, self.connections = {}, {}, set(), set()
         self.redact, self.stopping, self.last_request = Redactor(), False, time.monotonic()
         self.requests, self.control = 0, None
-        self.stop_event, self.open_lock = asyncio.Event(), asyncio.Lock()
+        # One lock per agent: a slow vendor start delays only its own agent's /open.
+        self.stop_event, self.open_locks, self.prune_lock = asyncio.Event(), {}, asyncio.Lock()
         self.usage_cache, self.agy_registered, self.agy_levels, self.agy_models = (0, {}), False, {}, set()
         self.journal = HOME / 'sessions.jsonl'
         if self.journal.exists():
@@ -495,7 +502,7 @@ class Daemon:
                 server.update(default_tools_approval_mode='approve', required=True, tool_timeout_sec=86400)
                 # The user's codex tool servers would start in every agent's process (about 0.5 GB each);
                 # agents get codex's own tools plus lord's, as the watchdog's --ignore-user-config runs did.
-                user = {} if a.record.get('tools') else codex_config(self.vendor_home)
+                user = {} if a.record.get('tools') else codex_config(Path(os.environ['CODEX_HOME']) if os.environ.get('CODEX_HOME') else self.vendor_home / '.codex')
                 lean = {'mcp_servers': {name: {'enabled': False} for name in user.get('mcp_servers', {}) if name != 'lord'},
                         'plugins': {name: {'enabled': False} for name in user.get('plugins', {})}}
                 if user.get('notify'): lean['notify'] = []
@@ -515,6 +522,7 @@ class Daemon:
                 a.vendorSession = result.get('sessionId', a.vendorSession)
                 options = {o.get('id'): [x['value'] for x in o.get('options', [])] for o in result.get('configOptions', [])}
                 if options.get('reasoning_effort'): vendor.efforts = options['reasoning_effort']
+                if options.get('model'): vendor.grok_models = options['model']
                 if options.get('model') and a.model not in options['model']:
                     raise ValueError(f'unknown grok model {a.model}; grok lists {", ".join(options["model"])}')
                 await self.effort(a)
@@ -554,16 +562,20 @@ class Daemon:
         return self.agy_levels[model]
 
     async def open(self, body):
-        async with self.open_lock:
-            aid, family = body['agentId'], body['family']
-            if not isinstance(aid, str) or not aid or family not in ('gpt', 'grok', 'gemini'): raise ValueError('Invalid agent or family')
+        aid, family = body['agentId'], body['family']
+        if not isinstance(aid, str) or not aid or family not in ('gpt', 'grok', 'gemini'): raise ValueError('Invalid agent or family')
+        async with self.open_locks.setdefault(aid, asyncio.Lock()):
             if body.get('readonly') and family == 'gemini': raise ValueError('readonly is not enforceable for agy; use lord:gpt or lord:grok')
             if body.get('dirs') and family != 'gpt':
                 raise ValueError({'grok': "@dir is not available for grok: its sandbox confines writes to the working folder; use @cwd",
                                   'gemini': '@dir is not needed for gemini: agy has no sandbox and can write outside its folder'}[family])
             cwd = str(Path(body['cwd']).expanduser().resolve(strict=True))
-            if cwd in ('/', str(Path.home())): raise ValueError('refusing / or the home folder as a working folder')
+            if cwd in ('/', str(Path.home())):
+                raise ValueError('refusing / or the home folder as a working folder: start Claude Code in a project folder, or put "@cwd <folder>" on the first line of the task')
             a = self.agents.get(aid)
+            readonly = body.get('readonly') or bool(a and a.record.get('readonly'))
+            if family == 'gpt' and readonly and (body.get('net') or bool(a and a.record.get('net'))):
+                raise ValueError("@readonly with @net is not read-only for gpt: with network on, codex can reach local services, Lord's included; use lord:grok for a read-only agent with network")
             # grok's read-only base profile leaves the temp folders and grok's own folder writable.
             if body.get('readonly') and family == 'grok' and inside(a.cwd if a else cwd, (*TEMP_ROOTS, os.path.realpath(grok_home()))):
                 raise ValueError("grok's read-only profile leaves temp folders and ~/.grok writable; pin a read-only grok outside /tmp, /var/tmp, /var/folders and ~/.grok")
@@ -571,10 +583,10 @@ class Daemon:
             try: return await self.open_agent(aid, family, cwd, body, a)
             except BaseException:
                 # A first /open that fails leaves no agent behind, so a corrected retry starts clean.
-                if new and self.agents.get(aid) is not None and self.agents[aid].vendorSession is None:
-                    self.agents.pop(aid, None)
+                if new and self.agents.pop(aid, None) is not None:
                     vendor = self.vendors.pop(aid, None)
                     if vendor: await vendor.close()
+                    self.compact()
                 raise
 
     async def open_agent(self, aid, family, cwd, body, a):
@@ -587,17 +599,20 @@ class Daemon:
             await self.effort(a)
             self.agents[aid] = a
         elif a.family != family: raise ValueError('agentId already belongs to another family')
-        else:
-            for key in ('readonly', 'net'):
-                if body.get(key) and not a.record.get(key):
-                    # A sandbox change needs a new process (grok) or a reattached thread (codex).
-                    a.record[key] = True
-                    a.restart = True
+        # Everything is checked before anything changes, so a refused /open leaves the agent as it was.
+        for key in ('memory_gb', 'hang_s', 'wall_s'):
+            if body.get(key) is not None and (not isinstance(body[key], (int, float)) or body[key] < 0 or (key == 'memory_gb' and body[key] == 0)):
+                raise ValueError(f'invalid {key}')
+        dirs = [str(Path(x).expanduser().resolve()) for x in body.get('dirs') or []]
+        if any(not Path(x).is_dir() for x in dirs): raise ValueError('every @dir must be an existing directory')
+        for key in ('readonly', 'net'):
+            if body.get(key) and not a.record.get(key):
+                # A sandbox change needs a new process (grok) or a reattached thread (codex).
+                a.record[key] = True
+                a.restart = True
         # Per-agent overrides of the guards and of the lean vendor setup; any later /open may change them.
         for key in ('memory_gb', 'hang_s', 'wall_s'):
-            if body.get(key) is not None:
-                if not isinstance(body[key], (int, float)) or body[key] < 0 or (key == 'memory_gb' and body[key] == 0): raise ValueError(f'invalid {key}')
-                a.record[key] = body[key]
+            if body.get(key) is not None: a.record[key] = body[key]
         if body.get('tools') and not a.record.get('tools'):
             # The user's tool servers load at process start, so the agent gets a new process and resumes.
             a.record['tools'] = True
@@ -606,15 +621,22 @@ class Daemon:
             a.restart = False
             await self.backend(a).close()
             a.generation = 0
-        dirs = [str(Path(x).expanduser().resolve()) for x in body.get('dirs') or []]
-        if any(not Path(x).is_dir() for x in dirs): raise ValueError('every @dir must be an existing directory')
         if set(dirs) - set(a.record.get('dirs', [])):
             # Extra writable folders change the sandbox, so the session reattaches with them.
             a.record['dirs'] = sorted(set(a.record.get('dirs', [])) | set(dirs))
             a.generation = 0
         await self.attach(a)
+        # A model change applies at the next turn; refusing it here keeps the mod from adopting it.
+        if body.get('model') and (models := self.known_models(a)) and body['model'] not in models:
+            raise ValueError(f'unknown {a.family} model {body["model"]}; {a.family} lists {", ".join(models)}')
         if a.state == 'closed': a.state = 'idle'
         return {'vendorSession': a.vendorSession, 'model': a.model, 'effort': a.effort}
+
+    def known_models(self, a):
+        vendor = self.backend(a)
+        if a.family == 'gpt': return [m['id'] for m in vendor.models]
+        if a.family == 'grok': return getattr(vendor, 'grok_models', [])
+        return sorted(self.agy_models)
 
     async def begin(self, a, body):
         async with a.stream_lock: await self.begin_locked(a, body)
@@ -624,18 +646,22 @@ class Daemon:
         if a.turn_task: await asyncio.gather(a.turn_task, return_exceptions=True)
         previous = (a.model, a.effort)
         a.model = body.get('model') or a.model
-        try: await self.effort(a, body.get('effort'))
+        try:
+            await self.effort(a, body.get('effort'))
+            if a.restart:
+                a.restart = False
+                await self.backend(a).close()
+                a.generation = 0
+            if a.family in ('grok', 'gemini') and previous != (a.model, a.effort):
+                if a.family == 'gemini': await self.backend(a).close()
+                a.generation = 0
+            await self.attach(a)
         except BaseException:
-            a.model, a.effort = previous
+            if (a.model, a.effort) != previous:
+                a.model, a.effort = previous
+                a.generation = 0
             raise
-        if a.restart:
-            a.restart = False
-            await self.backend(a).close()
-            a.generation = 0
-        if a.family in ('grok', 'gemini') and previous != (a.model, a.effort):
-            if a.family == 'gemini': await self.backend(a).close()
-            a.generation = 0
-        await self.attach(a)
+        if a.turn_id: a.ended_turns.add(a.turn_id)
         a.state, a.answer, a.final_text, a.items = 'running', '', '', {}
         a.base, a.tokens, a.turn_id = dict(a.total), usage({}), None
         a.finished.clear()
@@ -668,7 +694,7 @@ class Daemon:
                 if result.get('stopReason') != 'end_turn' or a.cancel_requested:
                     a.emit('error', message=str(result.get('stopReason')), retryable=False)
                 else:
-                    path = self.vendor_home / '.grok/sessions' / quote(a.cwd, safe='') / a.vendorSession / 'usage.json'
+                    path = (Path(os.environ['GROK_HOME']) if os.environ.get('GROK_HOME') else self.vendor_home / '.grok') / 'sessions' / quote(a.cwd, safe='') / a.vendorSession / 'usage.json'
                     tokens = json.loads(path.read_text()) if path.exists() else result.get('usage', {})
                     if tokens.get('turns'): tokens = tokens['turns'][-1]
                     self.record_usage(a, usage(tokens))
@@ -715,7 +741,9 @@ class Daemon:
         if token != a.token: raise ValueError('lord tool call from an unknown process')
         if name == 'list_agents':
             self.log(f'MCP list_agents agent={a.agentId}')
-            return {'content': [{'type': 'text', 'text': dumps({'you': a.agentId, 'agents': self.listed()})}], 'isError': False}
+            # Another agent's command lines and folders stay out of a vendor's view.
+            agents = [{k: getattr(b, k) for k in ('agentId', 'family', 'model', 'state')} for b in self.agents.values()]
+            return {'content': [{'type': 'text', 'text': dumps({'you': a.agentId, 'agents': agents})}], 'isError': False}
         if a.state not in ('running', 'waiting_tool') or a.cancel_requested: raise ValueError('No running turn for lord tool')
         if a.record.get('readonly'): raise ValueError('a read-only agent cannot spawn agents or send messages')
         if name == 'spawn_agent':
@@ -805,10 +833,10 @@ class Daemon:
                     if a.state in ('running', 'waiting_tool') or a.undelivered():
                         a.followup = body
                         # A tool call whose client went away is offered again, so the new client can run it.
-                        if a.state == 'waiting_tool' and not any(e['type'] == 'tool' for e in a.carry):
+                        if a.state == 'waiting_tool':
                             queued = []
                             while not a.events.empty(): queued.append(a.events.get_nowait())
-                            offered = {e['callId'] for e in queued if e['type'] == 'tool'}
+                            offered = {e['callId'] for e in [*queued, *a.carry] if e['type'] == 'tool'}
                             a.carry += [{'type': 'tool', 'callId': call, 'name': name, 'input': data}
                                         for call, (name, data) in a.call_data.items() if not a.calls[call].done() and call not in offered]
                             for e in queued: a.events.put_nowait(e)
@@ -924,7 +952,7 @@ class Daemon:
             signal_all(pids, signal.SIGKILL)
 
     async def prune(self, days):
-        async with self.open_lock: return await self.prune_locked(days)
+        async with self.prune_lock: return await self.prune_locked(days)
 
     async def prune_locked(self, days):
         if not isinstance(days, (int, float)) or days < 0: raise ValueError('days must be nonnegative')
@@ -932,6 +960,7 @@ class Daemon:
         removed = []
         for aid, a in list(self.agents.items()):
             if a.stream_lock.locked() or a.state in ('running', 'waiting_tool') or datetime.fromisoformat(a.record.get('used', a.created)) >= cutoff: continue
+            if self.open_locks.get(aid, asyncio.Lock()).locked(): continue
             sid = a.vendorSession
             if not sid or not re.fullmatch(r'[A-Za-z0-9_-]+', sid): continue
             previous, a.state = a.state, 'closed'
@@ -952,10 +981,14 @@ class Daemon:
             removed.append(aid)
             a.log_path.unlink(missing_ok=True)
             del self.agents[aid]
+        self.compact()
+        return {'ok': True, 'pruned': removed}
+
+    def compact(self):
+        # The journal rewritten with one line per agent the daemon still has.
         temporary = self.journal.with_suffix('.tmp')
         temporary.write_text(''.join(dumps(a.record) + '\n' for a in self.agents.values()))
         temporary.replace(self.journal)
-        return {'ok': True, 'pruned': removed}
 
     async def close(self):
         self.stopping = True

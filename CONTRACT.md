@@ -35,7 +35,7 @@ Every request but `GET /health` and `POST /mcp` carries `X-Lord-Control: <key>` 
 | Method | Path | Body | Reply |
 |---|---|---|---|
 | GET | /health | - | `{ok, pid, version}` |
-| POST | /open | `{agentId, family, cwd, model?, effort?, readonly?, net?, dirs?, memory_gb?, hang_s?, wall_s?, tools?}` | `{vendorSession, model, effort}`; idempotent; resumes after a daemon restart from the journal. A later `readonly`, `net`, `tools` or new `dirs` restarts the vendor session before the next turn. Refused with the reason: unknown model (the vendor's list), `dirs` for grok/gemini, `readonly` for gemini or for grok under a temp folder or `~/.grok` (an existing agent is judged by its own folder), `/` or the home folder as cwd |
+| POST | /open | `{agentId, family, cwd, model?, effort?, readonly?, net?, dirs?, memory_gb?, hang_s?, wall_s?, tools?}` | `{vendorSession, model, effort}`; idempotent; resumes after a daemon restart from the journal. A later `readonly`, `net`, `tools` or new `dirs` restarts the vendor session before the next turn. Refused with the reason: unknown model (the vendor's list), `dirs` for grok/gemini, `readonly` for gemini, for gpt with `net`, or for grok under a temp folder or `~/.grok` (an existing agent is judged by its own folder), `/` or the home folder as cwd |
 | POST | /turn | `{agentId, text, model?, effort?}` | NDJSON stream; if the agent has a running or undelivered turn (its client went away), that turn streams first (a pending lord tool call is offered again) and this text starts when it ends, its done text prefixed with the earlier result. An interrupted turn leaves nothing to deliver |
 | POST | /continue | `{agentId}` | NDJSON stream of the same turn after a tool result |
 | POST | /tool_result | `{agentId, callId, text, isError}` | `{ok}` |
@@ -87,7 +87,7 @@ retried once; a crash restarts the vendor on the next turn, never in a loop. A p
 ## Lord tools given to every vendor session (MCP, `lordd.py --mcp [agentId]`)
 `spawn_agent(type, prompt, description, background?, effort?, model?)` becomes an engine Agent call (a non-Claude model
 goes as an `@model` first line); `send_message(to, text)` becomes SendMessage; `list_agents()` returns
-`{you, agents}` from the daemon. Without an agent id the server lists no tools; a read-only agent's server lists only
+`{you, agents}` from the daemon (each agent's id, family, model and state only). A vendor-only effort (`minimal`, `ultra`) goes as an `@effort` first line. Without an agent id the server lists no tools; a read-only agent's server lists only
 `list_agents`, and the daemon refuses spawn and send for it.
 
 ## Mod behaviour

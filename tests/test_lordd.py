@@ -23,8 +23,10 @@ DAEMON = ROOT / 'lordd.py'
 
 @pytest.fixture(autouse=True)
 def grok_home(tmp_path, monkeypatch):
-    # The daemon writes grok sandbox profiles under GROK_HOME; tests never touch the user's ~/.grok.
+    # The daemon writes grok sandbox profiles under GROK_HOME and its own files under LORD_HOME; tests never touch
+    # the user's ~/.grok or ~/.claude/lord.
     monkeypatch.setenv('GROK_HOME', str(tmp_path / 'grok-home'))
+    monkeypatch.setenv('LORD_HOME', str(tmp_path / 'lord-home'))
 
 
 def test_daemon_exists():
@@ -132,7 +134,8 @@ class Rig(Client):
 
 @pytest.fixture
 def rig():
-    base = Path.home() / '.claude/lord'
+    # Not under a temp folder: read-only grok is refused there.
+    base = Path.home() / '.cache/lord-tests'
     base.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix='test-', dir=base) as folder:
         item = Rig(Path(folder))
@@ -288,7 +291,7 @@ def test_prune_only_owned_sessions(rig):
         if row['agentId'] != 'recent':
             row['created'] = row['used'] = '2000-01-01T00:00:00+00:00'
     path.write_text(''.join(json.dumps(row) + '\n' for row in records))
-    grok_root = rig.data / '.grok/sessions' / quote(str(rig.home), safe='')
+    grok_root = rig.home / 'grok/sessions' / quote(str(rig.home), safe='')
     stranger = grok_root / 'unowned'; stranger.mkdir(parents=True)
     (stranger / 'keep').write_text('keep')
     agy_root = rig.data / '.gemini/antigravity-cli/conversations'
@@ -508,6 +511,12 @@ def test_environment_scrub_applies_to_every_vendor(rig, family):
 @pytest.mark.parametrize('readonly', [False, True])
 @pytest.mark.parametrize('net', [False, True])
 def test_codex_permission_policy_applies_to_every_turn(rig, readonly, net):
+    if readonly and net:
+        # With network on, codex can reach local services, so read-only would not hold.
+        conn, file, status, _ = rig.connect('/open', {'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home), 'readonly': True, 'net': True})
+        reply = json.loads(file.read()); file.close(); conn.close()
+        assert status == 400 and 'not read-only' in reply['error']
+        return
     rig.open('gpt', readonly=readonly, net=net)
     rig.turn('PING')
     params = next(e['params'] for e in rig.audit() if e.get('method') == 'turn/start')
@@ -1009,3 +1018,83 @@ def test_agy_narration_before_a_tool_step_is_not_the_answer():
     events = []
     while not a.events.empty(): events.append(a.events.get_nowait())
     assert events[-1] == {**events[-1], 'type': 'done', 'text': ''}
+
+
+def test_a_refused_open_changes_nothing(rig):
+    rig.open('gpt')
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home), 'net': True, 'dirs': [str(rig.home / 'missing')]})
+    file.close(); conn.close()
+    assert status == 400
+    rig.turn('PING')
+    params = [e['params'] for e in rig.audit() if e.get('method') == 'turn/start'][-1]
+    assert params['sandboxPolicy']['networkAccess'] is False
+
+
+def test_an_unknown_model_for_an_existing_agent_is_refused_at_open(rig):
+    rig.open('gpt')
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home), 'model': 'no-such-model'})
+    reply = json.loads(file.read()); file.close(); conn.close()
+    assert status == 400 and 'unknown gpt model no-such-model' in reply['error']
+    assert rig.turn('PING')[-1]['text'] == 'PONG'
+
+
+def test_list_agents_shows_other_agents_without_their_commands_or_folders():
+    m = load('lordd_list')
+    async def main():
+        a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '/secret/folder', 'model': 'gpt-6.1-sol'})
+        a.activity = '$ curl -H "token: abc"'
+        d = object.__new__(m.Daemon); d.agents = {'a': a}; d.log = lambda text: None
+        return json.loads((await d.mcp_call(a, 'list_agents', {}, a.token))['content'][0]['text'])
+    listed = asyncio.run(main())
+    assert listed == {'you': 'a', 'agents': [{'agentId': 'a', 'family': 'gpt', 'model': 'gpt-6.1-sol', 'state': 'idle'}]}
+
+
+def test_common_token_shapes_are_redacted():
+    m = load('lordd_redact')
+    text = m.Redactor()('ghp_' + 'a' * 36 + ' AKIA' + 'B' * 16 + ' x-api-key: k123 password=hunter2 keep')
+    assert 'ghp_' not in text and 'AKIA' not in text and 'k123' not in text and 'hunter2' not in text and text.endswith('keep')
+
+
+def test_a_user_config_value_of_the_wrong_type_is_refused(tmp_path, monkeypatch):
+    m = load('lordd_types')
+    (tmp_path / 'config.json').write_text(json.dumps({'grok': {'no_progress_s': '2400'}}))
+    monkeypatch.setattr(m, 'HOME', tmp_path)
+    with pytest.raises(ValueError, match='grok.no_progress_s'): m.load_config()
+
+
+def test_a_reconnect_offers_every_unresolved_tool_call():
+    m = load('lordd_calls')
+    async def main():
+        a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6.1-sol'})
+        a.state = 'waiting_tool'
+        for call in ('c1', 'c2'):
+            a.calls[call] = asyncio.get_running_loop().create_future(); a.call_data[call] = ('Agent', {'prompt': call})
+        a.carry = [{'type': 'tool', 'callId': 'c2', 'name': 'Agent', 'input': {'prompt': 'c2'}}]
+        d = object.__new__(m.Daemon); d.agents = {'a': a}; d.connections = set(); d.requests = 0; d.redact = str; d.control = 'k'
+        class Writer:
+            data = b''
+            def write(self, data): self.data += data
+            async def drain(self): pass
+            def close(self): pass
+            async def wait_closed(self): pass
+        reader, writer = asyncio.StreamReader(), Writer()
+        payload = json.dumps({'agentId': 'a', 'text': 'next'}).encode()
+        reader.feed_data(b'POST /turn HTTP/1.1\r\nX-Lord-Control: k\r\nContent-Length: ' + str(len(payload)).encode() + b'\r\n\r\n' + payload)
+        await d.http(reader, writer)
+        return sorted(e['callId'] for e in a.carry) + [c for c in ('c1', 'c2') if f'"callId":"{c}"'.encode() in writer.data]
+    assert sorted(asyncio.run(main())) == ['c1', 'c2']
+
+
+def test_an_earlier_codex_turn_completing_before_the_new_turn_id_is_ignored():
+    m = load('lordd_turn_ids')
+    from unittest.mock import AsyncMock
+    async def main():
+        a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6.1-sol', 'vendorSession': 's'})
+        a.turn_id = 'old'
+        d = object.__new__(m.Daemon); d.agents = {'a': a}; d.redact = str; d.save = lambda a: None
+        d.effort, d.attach = AsyncMock(), AsyncMock()
+        d.task = lambda coroutine: coroutine.close()
+        await d.begin_locked(a, {'text': 'new'})
+        m.Vendor(d, 'gpt', a).notification({'method': 'turn/completed', 'params': {'threadId': 's', 'turn': {'id': 'old', 'status': 'interrupted'}}})
+        return a.state, a.events.empty()
+    assert asyncio.run(main()) == ('running', True)

@@ -13,7 +13,7 @@ The vendor program can read and act on files in the agent's working folder with 
 **What stays on your computer**, under `~/.claude/lord/`:
 
 - `sessions.jsonl`: one line per agent (agent id, vendor session id, model, effort, working folder, options, last token counts). Task text is never stored here. Lines unused for 14 days are removed.
-- `logs/<agentId>.log`: the commands and file actions the vendor reported for that agent, with secrets redacted, at most 4 MB each, removed with the agent's line.
+- `logs/<agentId>.log`: the commands and file actions the vendor reported for that agent, with secret values and common token shapes redacted, at most 4 MB each, removed with the agent's line.
 - `lordd.log`: the daemon's own log, at most 1 MB plus one older copy.
 
 Vendor conversation history is kept by each vendor program in its usual place, as when you use it directly.

@@ -424,3 +424,18 @@ test('a rejected StructuredOutput object is corrected once, then ends with a vis
   expect(last.result.answer).toMatch(/^lord: error: the vendor's JSON was rejected again: word is required/)
   expect(w.requests.filter(x => x.path === '/turn' && x.body.text.startsWith('That JSON was rejected')).length).toBe(1)
 })
+
+test('a known option written wrongly ends the turn with an error instead of dropping later options', async ($, on) => {
+  const w = world(on)
+  await spawn($)
+  const { result } = await step($, '@hang 600s\n@readonly\nreview the repo')
+  expect(result.answer).toBe('lord: error: option line not understood: @hang 600s')
+  expect(w.requests.some(x => x.path === '/open' || x.path === '/turn')).toBe(false)
+})
+
+test('a SubagentStart after a reload does not replace the folder the daemon keeps', async ($, on) => {
+  const w = world(on)
+  await $.classic.SubagentStart({ agent_id: 'a1', agent_type: 'lord:gpt', cwd: '/repo' } as any)
+  await step($, 'continue')
+  expect(w.requests.find(x => x.path === '/open')!.body.cwd).toBe('/pinned')
+})

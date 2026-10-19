@@ -35,49 +35,51 @@ Lord never reads or copies vendor login files and never uses API keys: it strips
 
 ## Use
 
-Ask Claude in plain words ("have gpt fix this test in a worktree and grok review it read-only"). Claude reads each agent's description and launches it. Options go on separate lines at the start of a task or a later message, and are removed before the vendor sees the text:
+Ask Claude in plain words ("have gpt fix this test in a worktree and grok review it read-only"). Claude reads each agent's description and launches it. Start Claude Code in a project folder: an agent's working folder is never `/` or your home folder (give `@cwd <folder>` instead). Options go on separate lines at the start of a task or a later message, and are removed before the vendor sees the text; a known option written wrongly (`@hang 600s`) ends the turn with an error rather than being passed on:
 
 | Option | Meaning |
 |---|---|
 | `@model <id>` | Vendor model for this and later turns. An unknown id is refused with the vendor's list. |
 | `@effort <level>` | Reasoning level, `minimal` to `ultra`. Overrides the Agent call's `effort` (default `high`). The nearest level the vendor lists for the model is used. |
-| `@readonly` | gpt: codex read-only sandbox. grok: Lord's read-only profile (refused for a folder under `/tmp`, `/var/tmp`, `/var/folders` or `~/.grok`, which that profile leaves writable). Not available for gemini. |
-| `@net` | gpt: network on (off by default), which also lets it reach local services, Lord's own included. grok and gemini always have network. |
+| `@readonly` | gpt: codex read-only sandbox (refused together with `@net`). grok: Lord's read-only profile (refused for a folder under `/tmp`, `/var/tmp`, `/var/folders` or `~/.grok`, which that profile leaves writable). Not available for gemini. |
+| `@net` | gpt: network on (off by default). grok and gemini always have network. |
 | `@cwd <path>` | The vendor's working folder; first turn only. |
 | `@dir <path>` | gpt: an extra writable folder (repeatable). |
 | `@memory <GB>` | Memory ceiling over the agent's whole process tree (default 12). |
 | `@hang <seconds>` | Stop the turn after this much silence (grok and gemini default 2400; gpt off; 0 turns it off). |
 | `@wall <seconds>` | Stop the turn after this much time (off by default). |
-| `@tools` | Load your own vendor setup (codex MCP servers and plugins, grok's imports of Claude Code and Cursor tools), which Lord leaves out by default. |
+| `@tools` | gpt and grok: load your own vendor setup (codex MCP servers and plugins, grok's imports of Claude Code and Cursor tools), which Lord leaves out by default. agy always loads your own setup. |
 
 What each vendor enforces:
 
 | | gpt (codex) | grok | gemini (agy) |
 |---|---|---|---|
-| writes | working folder and `@dir` folders | working folder, temp folders and `~/.grok` | anywhere (agy has no sandbox) |
+| writes | working folder, `@dir` folders and temp folders | working folder, temp folders and `~/.grok` | anywhere (agy has no sandbox) |
 | `@readonly` | codex read-only sandbox | Lord's custom Seatbelt profile | refused |
 | network | off unless `@net` | on | on |
 | effort | low to max, and ultra on models that list it | low to xhigh | low to high |
 
 An agent's reply is the vendor's final answer only; its narration and tool activity show live in the agent's view but are not recorded. In a Workflow with `schema`, describe the fields in the prompt: Claude Code shows the schema only to its own model, so Lord turns the vendor's JSON into the structured result and passes any validation error back once for a corrected object.
 
-Agents can start their own agents and message others through three Lord tools (`spawn_agent`, `send_message`, `list_agents`); Claude Code runs and shows every child. A read-only agent gets only `list_agents`, so it cannot hand writes to another agent.
+Agents can start their own agents and message others through three Lord tools (`spawn_agent`, `send_message`, `list_agents`); Claude Code runs and shows every child. `list_agents` shows each agent's id, vendor, model and state, not its commands or folder. A read-only agent gets only `list_agents`, so it cannot hand writes to another agent.
 
 `/lord` lists agents with the model that ran, effort, state, the vendor's token counts and the agent's activity log (`~/.claude/lord/logs/<agentId>.log`: every command and file action the vendor reported). `/lord model <agentId> <model>` selects an agent's next model. The status line shows working agents and, while gpt agents work, your ChatGPT usage.
 
 ## How it works
 
-The plugin's hooks module answers each Lord agent turn. It talks to `lordd.py`, a small daemon it starts on first use, over the Unix socket `~/.claude/lord/lordd.sock`. The daemon runs one vendor CLI process per agent (`codex app-server`, `grok agent stdio`, `agy` in stream-json mode), keeps each agent's vendor session for later messages, and stops the process when the agent is stopped. It outlives the Claude Code session, so a long turn keeps running and its result reaches the next session; it exits after 10 idle minutes.
+The plugin's hooks module answers each Lord agent turn. It talks to `lordd.py`, a small daemon it starts on first use, over the Unix socket `~/.claude/lord/lordd.sock`. The daemon runs one vendor CLI process per agent (`codex app-server`, `grok agent stdio`, `agy` in stream-json mode), keeps each agent's vendor session for later messages, and stops the process when the agent is stopped. It outlives the Claude Code session, so a long turn keeps running; its result is delivered with the next message you send that agent. It exits after 10 minutes with no request and no running turn, or after up to a day while a finished result waits to be delivered.
 
 Guards: an agent whose processes exceed the memory ceiling, stay silent past `@hang`, or run past `@wall` is stopped with the reason as its reply, without touching other agents. A failed vendor start is retried once; a crashed vendor restarts on the next turn.
+
+Worktree isolation needs Lord's `SubagentStart` hook, which reports the worktree's path; where an organization manages Claude Code and runs only managed hooks, an agent launched with `isolation: "worktree"` refuses to run rather than work in the main tree.
 
 Settings: `~/.claude/lord/config.json` is merged over the plugin's [`config.json`](config.json), one vendor at a time, for example `{"grok": {"model": "grok-4.7"}}`.
 
 ## What Lord runs, stores and sends
 
-- **Runs:** `lordd.py` (Python), `/usr/bin/curl` (to read the daemon's streams), `/bin/ps` (every 5 seconds while an agent works, for the memory guard), and the vendor CLIs you installed. Nothing is downloaded.
+- **Runs:** `lordd.py` (Python), `/usr/bin/curl` (to read the daemon's streams), `/bin/ps` (every 5 seconds while any vendor process is running, for the memory guard), and the vendor CLIs you installed. Nothing is downloaded.
 - **Sends:** a task's text goes only to the vendor CLI you chose, which sends it to that vendor under your account. Lord itself makes no network requests. See [PRIVACY.md](PRIVACY.md).
-- **Stores, all under `~/.claude/lord/`:** the socket and lock, `control.header` (a key that every request except a vendor's own tool calls must carry; grok's Lord profiles cannot read it, codex's sandbox cannot reach the socket without `@net`, and gemini has no sandbox), `sessions.jsonl` (one line per agent: ids, vendor session id, model, effort, folder and options, never task text), `logs/<agentId>.log` (the vendor's commands and file actions, with secrets redacted, at most 4 MB each), and `lordd.log` (at most 1 MB). Records unused for 14 days are removed; vendor history stays with each vendor, and codex threads are moved to codex's archive.
+- **Stores, all under `~/.claude/lord/`:** the socket and lock, `control.header` (a key that every request except a vendor's own tool calls must carry; grok's Lord profiles cannot read it, codex's sandbox cannot reach the socket without `@net`, which read-only gpt refuses, and gemini has no sandbox), `sessions.jsonl` (one line per agent: ids, vendor session id, model, effort, folder, options, last token counts and times, never task text), `logs/<agentId>.log` (the vendor's commands and file actions, with secrets redacted, at most 4 MB each), and `lordd.log` (at most 1 MB). Records unused for 14 days are removed; vendor history stays with each vendor, and codex threads are moved to codex's archive.
 - **Two changes outside that folder:**
   - an MCP entry named `lord` in agy's user settings (agy has no per-run option for it; outside a Lord agent it lists no tools);
   - two sandbox profiles, `lord-workspace` and `lord-readonly`, between `# lord: begin` and `# lord: end` lines in `~/.grok/sandbox.toml`. Lord uses custom profiles because grok refuses to start when a custom profile cannot be applied, whereas a built-in profile that fails only prints a warning and runs unconfined. Your own profiles in that file are left as they are; if the file cannot take Lord's tables (for example an inline `profiles = {...}`), grok agents are refused with the reason and the file is not changed.

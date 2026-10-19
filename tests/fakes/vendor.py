@@ -140,7 +140,7 @@ async def turn(sid, text, request_id=None):
         send({'method': 'turn/completed', 'params': {'threadId': sid, 'turn': {'id': tid, 'status': 'interrupted' if live['cancel'] else 'completed'}}})
     elif FAMILY == 'grok':
         row = {'inputTokens': 10, 'outputTokens': 5, 'cachedReadTokens': 2}
-        folder = DATA / '.grok/sessions' / quote(session['cwd'], safe='') / sid
+        folder = (Path(os.environ['GROK_HOME']) if os.environ.get('GROK_HOME') else DATA / '.grok') / 'sessions' / quote(session['cwd'], safe='') / sid
         folder.mkdir(parents=True, exist_ok=True)
         (folder / 'usage.json').write_text(json.dumps({'session': row, 'turns': [row]}))
         send({'id': request_id, 'result': {'stopReason': 'cancelled' if live['cancel'] else 'end_turn'}})
