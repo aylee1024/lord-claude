@@ -27,7 +27,7 @@ Runtime files only in `~/.claude/lord/`: `lordd.sock` (600, folder 700), `lordd.
 agent save: ids, vendor session, model, effort, cwd, options, last usage, created, used; never task text),
 `logs/<agentId>.log` (the agent's activity: vendor commands and file actions, redacted, 4 MB cap, removed with the
 record; agy tool steps are logged once each, as the tool's name and parameters), `logs/<agentId>.answer.md` (the
-agent's latest final answer, redacted, rewritten each turn, removed with the record), `lordd.log` (1 MB, one rotation). Two global side effects: an agy MCP entry `lord` while the daemon runs (added
+agent's latest non-empty final answer, redacted, removed with the record), `lordd.log` (1 MB, one rotation). Two global side effects: an agy MCP entry `lord` while the daemon runs (added
 before its first gemini agent, removed when it exits; agy has no per-run MCP option) and the `lord-workspace` and `lord-readonly` profiles between `# lord: begin` and `# lord: end` in
 `$GROK_HOME/sandbox.toml` (default `~/.grok`), rewritten only when they differ.
 
@@ -105,7 +105,11 @@ goes as an `@model` first line); `send_message(to, text)` becomes SendMessage; `
   makes Claude Code's progress-summary requests fail (404), so summaries never replace the label.
 - At `session.start` and each main-loop `turn.complete`, a Lord newer than the loaded one in Claude Code's
   `installed_plugins.json` (same install folder) runs `/reload-plugins --force` once per version, a second later, when no
-  Lord turn of the session is running; a refused reload says to run it by hand.
+  turn of the session is running (the main loop's, and any agent's in `$.agent.list()`, Claude or Lord), checked both
+  when the main turn ends and a second later; a refused reload says to run it by hand. Each Lord agent's record, each
+  agent turn's task and each Lord agent's start folder are also kept in the session's `$.state` (`lord.agent`,
+  `lord.start`, `lord.dir`), so a reload that lands mid-turn anyway (a person's `/reload-plugins`) continues the turn:
+  a newer kept record replaces the module's copy, and a kept tool call still gets its result.
 - Each agent file's own prompt, used only when no Lord hook answers a turn, makes Claude reply with a two-line
   `lord: error:` message. Claude Code's progress summaries run that prompt too and drop a multi-line reply, so an
   agent's row never shows the error while the vendor works.
@@ -123,7 +127,8 @@ goes as an `@model` first line); `send_message(to, text)` becomes SendMessage; `
   the engine asking for StructuredOutput (Workflow schema): the mod emits it from the vendor's last answer's JSON, asks
   the vendor for JSON when there is none, and passes a validation error back for a corrected object.
 - Streamed vendor text and activity are shown as thinking (not recorded); the done text is recorded once as the last
-  text block, which the engine uses as the agent's result. An empty answer or any failure ends the turn with only a
+  text block, which the engine uses as the agent's result. An empty answer on a run woken only by a background task's
+  notification keeps the agent's previous answer as its result. Any other empty answer or failure ends the turn with only a
   `lord: error: ...` line carrying the daemon's reason. Steps report no usage: the engine would read the vendor's
   token count as this agent's context and auto-compact it with a Claude model.
 - Task notifications from children are unwrapped with their result verbatim.

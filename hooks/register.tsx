@@ -1,12 +1,8 @@
 import type { EngineInterface, Register, TurnStepInput, TurnStepResult } from 'claude-code'
+import type { LordAgent as Agent, LordTask as Task } from '../types'
 
-type Verdict = 'sent' | { isError: boolean; text: string }
-type Agent = { family: string; cwd?: string; running?: boolean; model?: string; effort?: string; readonly?: boolean; net?: boolean; nosandbox?: boolean; dirs?: string[]; limits?: Limits; opened?: boolean; error?: string
-  continuing?: boolean; lastAnswer?: string; structured?: Verdict; corrected?: boolean; worktree?: boolean; pending?: Task }
 type Stream = { next: number; live: number; answer: string }
 type Outcome = { tool?: { callId: string; name: string; input: Record<string, unknown> } }
-type Limits = { memory_gb?: number; hang_s?: number; wall_s?: number; tools?: boolean }
-type Task = { text: string; error?: string; model?: string; effort?: string; readonly?: boolean; net?: boolean; nosandbox?: boolean; dirs?: string[]; cwd?: string; limits?: Limits }
 const agents = new Map<string, Agent>()
 const starts = new Map<string, Task>()
 const directories = new Map<string, string>()
@@ -16,6 +12,21 @@ const isolated = new Set<string>()
 const callEfforts = new Map<string, string>()
 // Quitting aborts the session's agent turns; the daemon keeps those turns running for the next session.
 let ending = false
+let mainTurns = 0
+// A reload of this code (an update) starts the module variables over, even mid-turn; the session's state keeps
+// what the next step of a turn in flight needs: each Lord agent's record, each agent turn's task, each start folder.
+const agentState = { plugin: 'lord', key: 'agent' } as const
+const startState = { plugin: 'lord', key: 'start' } as const
+const dirState = { plugin: 'lord', key: 'dir' } as const
+
+// The version of each record this copy of the code last wrote or read: a newer one was written by the other copy (the
+// one before a reload, finishing its step) and replaces this copy's.
+const versions = new Map<string, number>()
+
+async function keep($: EngineInterface, agentId: string): Promise<void> {
+  const agent = agents.get(agentId)
+  if (agent) versions.set(agentId, (await $.state.set({ ...agentState, id: agentId }, agent)).version)
+}
 
 function task(text: string): Task {
   const coordinator = /^The coordinator sent a message while you were working:\r?\n([\s\S]*)\r?\n\r?\nAddress this before completing your current task\.$/.exec(text)
@@ -118,6 +129,13 @@ async function defaultModel($: EngineInterface, family: string): Promise<string 
   return await read(`${await $.env.get('HOME')}/.claude/lord/config.json`) ?? await read(`${$.plugin.root}/config.json`)
 }
 
+async function working($: EngineInterface): Promise<boolean> {
+  // A reload is queued only while no turn runs, the main loop's or any agent's, Lord's or Claude's.
+  if (mainTurns || [...agents.values()].some(agent => agent.running)) return true
+  const roster = await $.agent.list().catch(() => undefined)
+  return !roster || roster.some(agent => agent.status === 'pending' || agent.status === 'running')
+}
+
 let reloading: string | undefined
 async function reloadIfUpdated($: EngineInterface): Promise<void> {
   // Claude Code keeps the plugin version a session started with; a newer installed copy loads through /reload-plugins.
@@ -126,13 +144,16 @@ async function reloadIfUpdated($: EngineInterface): Promise<void> {
   const installed = await $.fs.read(`${await $.env.get('HOME')}/.claude/plugins/installed_plugins.json`).then(text =>
     Object.values(JSON.parse(String(text)).plugins ?? {}).flat().find((entry: any) => String(entry?.installPath ?? '').replace(/\/[^/]+$/, '') === base) as any, () => undefined)
   if (!installed?.version || !loaded || !newer(String(installed.version), loaded) || reloading === installed.version) return
-  // A reload mid-turn would cut a vendor's stream; the next check runs once no Lord agent is working.
-  if ([...agents.values()].some(agent => agent.running)) return
+  if (await working($)) return
   reloading = String(installed.version)
-  $.ui.toast(`Lord Claude ${reloading} installed; reloading plugins`)
-  // The command queues until the session is idle; run from inside a hook the turn waits on, it would be refused.
-  void $.clock.sleep(1000).then(() => $.command.run({ command: 'reload-plugins', args: '--force' }))
-    .catch(() => $.ui.toast(`Lord Claude ${reloading} is installed: run /reload-plugins --force to load it`))
+  // Run from inside a hook the turn waits on, the command would be refused; a second later the turn has ended. A turn
+  // started meanwhile (a queued message) leaves it for the next check, since a queued command would wait for that
+  // turn and could follow agents it starts.
+  void $.clock.sleep(1000).then(async () => {
+    if (await working($)) { reloading = undefined; return }
+    $.ui.toast(`Lord Claude ${reloading} installed; reloading plugins`)
+    await $.command.run({ command: 'reload-plugins', args: '--force' })
+  }).catch(() => $.ui.toast(`Lord Claude ${reloading} is installed: run /reload-plugins --force to load it`))
 }
 
 async function request($: EngineInterface, path: string, body?: unknown): Promise<string> {
@@ -235,13 +256,14 @@ async function connect($: EngineInterface, signal: AbortSignal): Promise<void> {
 }
 
 async function steer($: EngineInterface, agentId: string, text: string): Promise<boolean> {
-  const agent = agents.get(agentId)
+  const agent = await lordAgent($, agentId)
   if (!agent?.running) return false
   const parsed = task(text)
   // Directives alter the next turn's session options rather than an in-flight request.
   if (parsed.error) return false
   const { text: _, ...options } = parsed
   agent.pending = merge({ text: '', ...agent.pending }, options)
+  await keep($, agentId)
   try {
     const response = JSON.parse(await request($, '/steer', { agentId, text: parsed.text }))
     return response.steered === true
@@ -250,7 +272,15 @@ async function steer($: EngineInterface, agentId: string, text: string): Promise
 
 async function lordAgent($: EngineInterface, agentId: string): Promise<Agent | undefined> {
   // Module state starts empty after a reload; the engine's roster still names each agent's type.
-  if (agents.has(agentId) || others.has(agentId)) return agents.get(agentId)
+  if (others.has(agentId)) return undefined
+  const kept = await $.state.get({ ...agentState, id: agentId })
+  if (kept.value && kept.version !== versions.get(agentId)) {
+    agents.set(agentId, { ...kept.value })
+    versions.set(agentId, kept.version)
+  }
+  if (agents.has(agentId)) return agents.get(agentId)
+  const directory = (await $.state.get({ ...dirState, id: agentId })).value
+  if (directory && !directories.has(agentId)) directories.set(agentId, directory)
   const listed = await $.agent.list().then(list => list.find(agent => agent.id === agentId), () => undefined)
   if (listed && !listed.type.startsWith('lord:')) { others.add(agentId); return undefined }
   let family = listed?.type.slice(5), cwd = directories.get(agentId)
@@ -319,19 +349,28 @@ export const register: Register = on => {
       agents.set(r.agentId, { ...previous, family: e.subagentType.slice(5), cwd: previous?.opened ? previous.cwd : directories.get(r.agentId) ?? e.cwd ?? previous?.cwd,
         worktree: previous?.worktree || isolated.has(e.tool_use_id) })
       isolated.delete(e.tool_use_id)
+      await keep($, r.agentId)
     }
     return r
   })
 
   on('classic.SubagentStart', async ($, e, next) => {
     // Only the start folder is recorded: an opened agent's folder is the daemon's, which lordAgent restores.
-    if (e.agent_type.startsWith('lord:')) directories.set(e.agent_id, e.cwd)
+    if (e.agent_type.startsWith('lord:')) {
+      directories.set(e.agent_id, e.cwd)
+      await $.state.set({ ...dirState, id: e.agent_id }, e.cwd)
+    }
     return next(e)
   })
 
-  on('turn.start', ($, e, next) => {
+  on('turn.start', async ($, e, next) => {
     // A new agent's start can precede the spawn result that identifies its type.
-    if (e.agentId) starts.set(e.turnId, task(e.text))
+    if (e.agentId) {
+      // A run woken only by a background task's notification, as Claude Code words it.
+      const notice = /^\[SYSTEM NOTIFICATION[^\]]*\]/.test(e.text) && e.text.includes('<task-notification>')
+      starts.set(e.turnId, { ...task(e.text), ...(notice ? { notice } : {}) })
+      await $.state.set({ ...startState, id: e.turnId }, starts.get(e.turnId)!)
+    } else mainTurns++
     return next(e)
   })
 
@@ -344,14 +383,16 @@ export const register: Register = on => {
       if (agent.error) { const error = agent.error; delete agent.error; throw new Error(error.replace(/^lord: error: /, '')) }
       let outcome: Outcome | undefined
       agent.running = true
+      await keep($, agentId)
       if (e.index === 0) {
-        const started = starts.get(e.turnId)
+        const started = starts.get(e.turnId) ?? (await $.state.get({ ...startState, id: e.turnId })).value ?? undefined
         if (!started) throw new Error('missing turn.start task')
         if (started.error) throw new Error(started.error)
         // Directives from this task and from messages steered into the last turn apply only once /open accepts them.
         const input = merge(agent.pending ?? { text: '' }, started)
         input.text = started.text
         delete agent.pending
+        agent.notice = started.notice
         agent.structured = undefined
         agent.corrected = false
         await connect($, next.signal)
@@ -385,6 +426,7 @@ export const register: Register = on => {
         if (verdict === 'sent' || (verdict && !verdict.isError)) {
           agent.structured = undefined
           agent.running = false
+          await keep($, agentId)
           yield { kind: 'stop', stopReason: 'end_turn', usage: null }
           return result(e, '')
         }
@@ -405,6 +447,7 @@ export const register: Register = on => {
         }
         if (value) {
           agent.structured = 'sent'
+          await keep($, agentId)
           const id = `lord_structured_${e.turnId}_${e.index}`
           yield { kind: 'tool', index: stream.next, id, name: 'StructuredOutput' }
           yield { kind: 'input', index: stream.next, json: JSON.stringify(value) }
@@ -416,22 +459,28 @@ export const register: Register = on => {
       if (outcome!.tool) {
         const { callId, name, input } = outcome!.tool
         pending.set(callId, agentId)
+        agent.call = callId
+        await keep($, agentId)
         yield { kind: 'tool', index: stream.next, id: callId, name }
         yield { kind: 'input', index: stream.next, json: JSON.stringify(input) }
         yield { kind: 'stop', stopReason: 'tool_use', usage: null }
         return { turnId: e.turnId, index: e.index, answer: '', toolUses: [{ name, input }], stopReason: 'tool_use', usage: null }
       }
+      // A vendor with nothing to add to a notification says nothing; the agent's answer stays its last one.
+      if (!stream.answer.trim() && agent.notice && agent.lastAnswer) stream.answer = agent.lastAnswer
       if (!stream.answer.trim()) throw new Error('the vendor finished with an empty answer')
       // A correction that needed a lord tool ends here; its answer is the next StructuredOutput candidate.
       if (agent.structured && agent.structured !== 'sent') agent.structured = undefined
       agent.lastAnswer = stream.answer
       agent.running = false
+      await keep($, agentId)
       yield { kind: 'text', index: stream.next++, text: stream.answer }
       yield { kind: 'stop', stopReason: 'end_turn', usage: null }
       return result(e, stream.answer)
     } catch (error) {
       agent.running = false
       agent.continuing = false
+      await keep($, agentId).catch(() => {})
       if (next.signal.aborted) {
         if (!ending) try { await request($, '/interrupt', { agentId }) } catch {}
         throw error
@@ -471,19 +520,24 @@ export const register: Register = on => {
       if (effort !== input.effort && ['low', 'medium', 'high', 'xhigh', 'max'].includes(effort)) call = { ...e, effort } as typeof e
     }
     const r = await next(call)
-    const agent = e.agentId ? agents.get(e.agentId) : undefined
+    const agent = e.agentId ? await lordAgent($, e.agentId) : undefined
     if (e.tool === 'StructuredOutput') {
-      if (agent?.structured === 'sent') agent.structured = { isError: !!(r.isError || r.deny), text: String(r.text ?? r.deny ?? '') }
-    } else if (e.agentId && pending.get(e.tool_use_id) === e.agentId) {
+      if (agent?.structured === 'sent') {
+        agent.structured = { isError: !!(r.isError || r.deny), text: String(r.text ?? r.deny ?? '') }
+        await keep($, e.agentId!)
+      }
+    } else if (agent && (pending.get(e.tool_use_id) === e.agentId || agent.call === e.tool_use_id)) {
       pending.delete(e.tool_use_id)
+      delete agent.call
       try { await request($, '/tool_result', { agentId: e.agentId, callId: e.tool_use_id, text: r.text ?? r.deny ?? JSON.stringify(r.result), isError: !!(r.isError || r.deny) }) }
-      catch (error) { agents.get(e.agentId)!.error = errorLine(error) }
+      catch (error) { agent.error = errorLine(error) }
+      await keep($, e.agentId!)
     }
     return r
   })
 
   on('session.send', async ($, e, next) => {
-    let agentId = agents.has(e.to) ? e.to : undefined
+    let agentId = agents.has(e.to) || await lordAgent($, e.to) ? e.to : undefined
     if (!agentId && [...agents.values()].some(agent => agent.running)) {
       agentId = (await $.agent.list()).find(agent => agent.name === e.to || agent.teammateId === e.to)?.id
     }
@@ -498,13 +552,18 @@ export const register: Register = on => {
 
   on('turn.complete', async ($, e, next) => {
     starts.delete(e.turnId)
-    if (!e.agentId) void reloadIfUpdated($).catch(() => {})
-    if (e.agentId && agents.has(e.agentId)) {
-      const agent = agents.get(e.agentId)!
+    if (e.agentId) await $.state.set({ ...startState, id: e.turnId }, null)
+    else {
+      mainTurns = Math.max(0, mainTurns - 1)
+      void reloadIfUpdated($).catch(() => {})
+    }
+    const agent = e.agentId ? await lordAgent($, e.agentId) : undefined
+    if (agent) {
       // Aborting a dispatch also aborts its HTTP calls; completion has a fresh dispatch.
       if ((e.isAborted || agent.running) && !ending) {
         try { await request($, '/interrupt', { agentId: e.agentId }) } catch {}
         agent.running = false
+        await keep($, e.agentId)
       }
     }
     return next(e)
@@ -530,6 +589,7 @@ export const register: Register = on => {
         // Staged like an @model line: it applies only once /open accepts it.
         agent.pending = merge({ text: '', ...agent.pending }, { model: args[2] })
         agents.set(args[1], agent)
+        await keep($, args[1])
         return { text: `lord: ${args[1]} will use ${args[2]} next turn.` }
       }
       if (args[0]) return { text: 'Usage: /lord [model <agentId> <model>]' }

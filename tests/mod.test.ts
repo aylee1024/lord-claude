@@ -44,7 +44,8 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.send', (_, e) => { deliveries.push(e.text); return { isDelivered: true } })
   on('session.receive', (_, e) => ({ text: e.text }))
-  on('agent.list', () => ({ value: [{ id: 'a1', type: spawned }] as any }))
+  const roster: any[] = []
+  on('agent.list', () => ({ value: [{ id: 'a1', type: spawned }, ...roster] as any }))
   const tools = { answer: { result: {}, text: 'child result', ref: 9 } as any }
   const toolCalls: any[] = []
   on('tool.call', (_, e) => { toolCalls.push(e); return tools.answer })
@@ -74,7 +75,17 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
     modelCalls++
     return { turnId: e.turnId, index: e.index, answer: 'MODEL CALLED', toolUses: [], stopReason: 'end_turn', usage: null }
   })
-  return { events, tools, requests, statuses, processes, deliveries, clock, spawnInputs, toolCalls, commands, toasts, modelCalls: () => modelCalls, streamFinished: () => streamFinished }
+  return { events, tools, requests, statuses, processes, deliveries, clock, spawnInputs, toolCalls, commands, toasts, roster, modelCalls: () => modelCalls, streamFinished: () => streamFinished }
+}
+
+// The session's state as the host keeps it, which a test writes as the copy of the code before a reload would.
+function sessionState(on: On) {
+  const values = new Map<string, { value: unknown; version: number }>()
+  const name = (e: any) => `${e.key}/${e.id ?? ''}`
+  const write = (e: any) => { const version = (values.get(name(e))?.version ?? 0) + 1; values.set(name(e), { value: e.value, version }); return version }
+  on('state.get', (_, e: any) => ({ value: values.get(name(e)) ?? { value: undefined, version: 0 } }) as any)
+  on('state.set', (_, e: any) => ({ value: { isSet: true, version: write(e) } }) as any)
+  return { put: (key: string, id: string, value: unknown) => write({ key, id, value }), get: (key: string, id: string) => values.get(`${key}/${id}`)?.value as any }
 }
 
 async function spawn($: any, type = 'lord:gpt') {
@@ -653,4 +664,76 @@ test('/lord model with a model the daemon refuses is not kept for later turns', 
   w.requests.length = 0
   expect((await step($, 'third')).result.answer).toBe('fake answer')
   expect(w.requests.find(x => x.path === '/turn')!.body.model).toBeUndefined()
+})
+
+test('a turn in flight when this code is reloaded continues from the record the earlier copy kept', async ($, on) => {
+  const w = world(on, [{ type: 'done', text: 'after the tool' }])
+  const state = sessionState(on)
+  // The earlier copy yielded a tool call for a1 and kept its record; this copy has never seen a1.
+  state.put('agent', 'a1', { family: 'gpt', opened: true, cwd: '/work', running: true, continuing: true, call: 'call7' })
+  await $.tool.call({ tool: 'SendMessage', tool_use_id: 'call7', agentId: 'a1', to: 'b', message: 'hi' } as any)
+  expect(w.requests.find(x => x.path === '/tool_result')?.body).toEqual({ agentId: 'a1', callId: 'call7', text: 'child result', isError: false })
+  const stream = $.turn.step({ agentId: 'a1', turnId: 't1', index: 1, model: 'haiku', messageCount: 3 })
+  let item
+  while (!(item = await stream.next()).done) {}
+  expect(w.requests.filter(x => x.path === '/turn' || x.path === '/continue').map(x => x.path)).toEqual(['/continue'])
+  expect(item.value.answer).toBe('after the tool')
+  expect(state.get('agent', 'a1')).toMatchObject({ running: false, continuing: false })
+})
+
+test('a first step after a reload of this code finds the task the earlier copy kept', async ($, on) => {
+  const w = world(on)
+  const state = sessionState(on)
+  await spawn($)
+  state.put('start', 't9', { text: 'kept task', model: 'gpt-6-astra' })
+  const stream = $.turn.step({ agentId: 'a1', turnId: 't9', index: 0, model: 'haiku', messageCount: 1 })
+  while (!(await stream.next()).done) {}
+  expect(w.requests.find(x => x.path === '/turn')?.body).toMatchObject({ agentId: 'a1', text: 'kept task', model: 'gpt-6-astra' })
+})
+
+test('a record the earlier copy wrote after this copy read it replaces this copy\'s', async ($, on) => {
+  const w = world(on)
+  const state = sessionState(on)
+  await spawn($)
+  await step($, 'hello')
+  // The earlier copy, still finishing a step, kept a1 as waiting on a tool call.
+  state.put('agent', 'a1', { ...state.get('agent', 'a1'), running: true, continuing: true, call: 'call8' })
+  await $.tool.call({ tool: 'Agent', tool_use_id: 'call8', agentId: 'a1', subagent_type: 'general-purpose', prompt: 'p', description: 'd' } as any)
+  expect(w.requests.find(x => x.path === '/tool_result')?.body).toMatchObject({ agentId: 'a1', callId: 'call8' })
+})
+
+test('the reload waits while the main loop or any agent has a turn running', async ($, on) => {
+  const w = world(on)
+  let root = ''
+  on('fs.read', (_, e) => {
+    if (e.path.endsWith('/.claude-plugin/plugin.json')) { root = e.path.replace('/.claude-plugin/plugin.json', ''); return { value: JSON.stringify({ name: 'lord', version: '9.0.0' }) } }
+    if (e.path.endsWith('/installed_plugins.json')) return { value: JSON.stringify({ version: 2, plugins: { 'lord@x': [{ installPath: root.replace(/\/[^/]+$/, '') + '/9.0.1', version: '9.0.1' }] } }) }
+    return { deny: 'no such file' }
+  })
+  // A queued message starts the next main turn within the second the reload waits.
+  await $.turn.complete({ turnId: 'm1', answer: '', isAborted: false } as any)
+  await w.clock.advance(500)
+  await $.turn.start({ turnId: 'm2', text: 'queued' } as any)
+  await w.clock.advance(500)
+  expect(w.commands).toEqual([])
+  // A Claude agent's turn is still running.
+  w.roster.push({ id: 'c1', type: 'general-purpose', status: 'running' })
+  await $.turn.complete({ turnId: 'm2', answer: '', isAborted: false } as any)
+  await w.clock.advance(1000)
+  expect(w.commands).toEqual([])
+  w.roster[0].status = 'completed'
+  await $.turn.complete({ turnId: 'm3', answer: '', isAborted: false } as any)
+  await w.clock.advance(1000)
+  expect(w.commands.map(c => [c.command, c.args])).toEqual([['reload-plugins', '--force']])
+})
+
+test('a vendor silent on a run woken only by a notification keeps the agent\'s last answer', async ($, on) => {
+  const w = world(on, [{ type: 'done', text: 'GPT-DONE' }])
+  await spawn($)
+  expect((await step($, 'task')).result.answer).toBe('GPT-DONE')
+  w.events.splice(0, w.events.length, { type: 'done', text: '' })
+  const notice = '[SYSTEM NOTIFICATION - NOT USER INPUT]\nThis is an automated background-task event.\n\n<task-notification>\n<task-id>c1</task-id>\n<status>completed</status>\n<result>PONG</result>\n</task-notification>'
+  expect((await step($, notice)).result.answer).toBe('GPT-DONE')
+  // A silent vendor on any other run is still an error.
+  expect((await step($, 'another task')).result.answer).toBe('lord: error: the vendor finished with an empty answer')
 })

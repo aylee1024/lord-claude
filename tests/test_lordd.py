@@ -820,6 +820,9 @@ def test_each_turn_saves_its_final_answer_to_a_file(rig):
     assert path.read_text() == 'PONG'
     rig.turn('second answer')
     assert path.read_text() == 'second answer'
+    # A turn with an empty answer keeps the last one.
+    rig.turn(' ')
+    assert path.read_text() == 'second answer'
 
 
 def test_a_later_readonly_reattaches_with_the_read_only_sandbox(rig):

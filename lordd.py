@@ -292,7 +292,7 @@ class Agent:
             for future in self.calls.values():
                 if not future.done(): future.set_result({'content': [{'type': 'text', 'text': 'Turn ended'}], 'isError': True})
         self.events.put_nowait({'type': kind, **value})
-        if kind == 'done':
+        if kind == 'done' and value['text'].strip():
             # The latest turn's final answer, kept beside the activity log, so a read-only agent's findings
             # still land in a file.
             self.answer_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
