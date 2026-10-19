@@ -195,7 +195,7 @@ async function refresh($: EngineInterface): Promise<void> {
       if (typeof usage.chatgpt?.usedPercent === 'number') labels.push(`ChatGPT ${usage.chatgpt.usedPercent}%`)
     } catch {}
   }
-  $.ui.status(labels.length ? 'lord: ' + labels.join(' · ') : undefined)
+  $.ui.status(labels.length ? labels.join(' · ') : undefined)
 }
 
 async function steer($: EngineInterface, agentId: string, text: string): Promise<boolean> {

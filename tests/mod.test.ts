@@ -208,7 +208,7 @@ test('ordinary agents retain their own model step', async ($, on) => {
 test('status refresh and slash model override apply without polling', async ($, on) => {
   const w = world(on)
   await $.session.start({ cwd: '/repo' })
-  expect(w.statuses).toContain('lord: 1 gpt · ChatGPT 47%')
+  expect(w.statuses).toContain('1 gpt · ChatGPT 47%')
   await spawn($)
   await step($, 'hello')
   const changed = await $.command.run({ command: 'lord', args: 'model a1 chosen-model' })
