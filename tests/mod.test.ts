@@ -32,7 +32,6 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
   let fresh = false
   on('agent.spawn', (_, e) => { spawned = e.subagentType; fresh = true; return { agentId: 'a1', model: 'haiku' } })
   on('classic.SubagentStart', () => ({}))
-  on('classic.SubagentStop', () => ({}))
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', (_, e) => ({ text: e.answer }))
   on('session.cwd', () => ({ value: '/repo' }))
@@ -41,8 +40,7 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.send', (_, e) => { deliveries.push(e.text); return { isDelivered: true } })
   on('session.receive', (_, e) => ({ text: e.text }))
-  const roster = [{ id: 'a1', type: spawned, status: 'running' }, { id: 'c1', type: 'general-purpose', status: 'running' }, { id: 'c2', type: 'Explore', status: 'completed' }]
-  on('agent.list', () => ({ value: roster.map(agent => agent.id === 'a1' ? { ...agent, type: spawned } : agent) as any }))
+  on('agent.list', () => ({ value: [{ id: 'a1', type: spawned }] as any }))
   const tools = { answer: { result: {}, text: 'child result', ref: 9 } as any }
   on('tool.call', () => tools.answer)
   on('http.fetch', (_, e) => {
@@ -59,8 +57,7 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
     if (path === '/open' && JSON.parse(e.init!.body!).dirs?.includes('/bad')) return { value: { ok: false, status: 400, headers: {}, text: JSON.stringify({ error: 'every @dir must be an existing directory' }) } }
     if (path === '/health' && failures-- > 0) return { deny: 'socket unavailable' }
     if (path === '/agents' && failures > 0) return { deny: 'socket unavailable' }
-    // 'elsewhere' is another session's agent on the shared daemon.
-    const result = path === '/agents' ? (!fresh ? [{ agentId: 'a1', family: 'gpt', state: 'running', effort: 'ultra', model: 'fake-gpt', cwd: '/pinned' }, { agentId: 'elsewhere', family: 'grok', state: 'running' }]
+    const result = path === '/agents' ? (!fresh ? [{ agentId: 'a1', family: 'gpt', state: 'running', effort: 'ultra', model: 'fake-gpt', cwd: '/pinned' }]
         : requests.some(x => x.path === '/open') ? [{ agentId: 'a1', family: 'gpt', state: 'running' }] : [])
       : path === '/health' ? { ok: true }
       : path === '/open' ? { vendorSession: 'v1', model: 'fake-gpt', effort: 'high' }
@@ -72,7 +69,7 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
     modelCalls++
     return { turnId: e.turnId, index: e.index, answer: 'MODEL CALLED', toolUses: [], stopReason: 'end_turn', usage: null }
   })
-  return { events, tools, requests, statuses, processes, deliveries, clock, roster, modelCalls: () => modelCalls, streamFinished: () => streamFinished }
+  return { events, tools, requests, statuses, processes, deliveries, clock, modelCalls: () => modelCalls, streamFinished: () => streamFinished }
 }
 
 async function spawn($: any, type = 'lord:gpt') {
@@ -207,28 +204,10 @@ test('ordinary agents retain their own model step', async ($, on) => {
   expect(w.modelCalls()).toBe(1)
 })
 
-test('status refresh and slash model override apply without polling', async ($, on) => {
+test('the slash model override applies without polling, and no status line is set', async ($, on) => {
   const w = world(on)
   await $.session.start({ cwd: '/repo' })
-  // The row above the prompt names the product and counts this session's agents; no status line, no usage figure.
-  const ui = await $.ui.mount({ plugin: 'lord', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false, isWorking: false, maxRows: 10 } } as any)
-  expect((await ui.find({ type: 'Text', text: /Lord Claude/ }))?.text).toBe('Lord Claude: 1 claude · 1 gpt')
-  await ui.unmount()
-  const row = async () => {
-    const band = await $.ui.mount({ plugin: 'lord', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false, isWorking: false, maxRows: 10 } } as any)
-    const text = (await band.find({ type: 'Text', text: /Lord Claude/ }))?.text
-    await band.unmount()
-    return text
-  }
-  // A stop reported for a progress-summary fork leaves the running Claude agent counted.
-  await $.classic.SubagentStop({ agent_id: 'c1', agent_type: 'general-purpose' } as any)
-  await w.clock.advance(1000)
-  expect(await row()).toBe('Lord Claude: 1 claude · 1 gpt')
-  // A real stop: the agent still reads as running when its stop is reported, and finished a moment later.
-  await $.classic.SubagentStop({ agent_id: 'c1', agent_type: 'general-purpose' } as any)
-  w.roster[1].status = 'completed'
-  await w.clock.advance(1000)
-  expect(await row()).toBe('Lord Claude: 1 gpt')
+  // Lord sets no status line.
   expect(w.statuses).toEqual([])
   await spawn($)
   await step($, 'hello')

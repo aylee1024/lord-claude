@@ -119,5 +119,4 @@ goes as an `@model` first line); `send_message(to, text)` becomes SendMessage; `
 - Task notifications from children are unwrapped with their result verbatim.
 - TaskStop or Esc sends /interrupt; once `session.end` fires for a quit (not `/clear` or a resume), aborted turns are
   left running in the daemon.
-- A row above the prompt (`ui.render` for `AbovePrompt`) reads `Lord Claude: <n> gpt · <n> grok · <n> gemini` for this session's working agents (the daemon serves every session); nothing when none work or the daemon is down.
   `/lord` lists agents with the model that ran, tokens and log; `/lord model <id> <model>`.
