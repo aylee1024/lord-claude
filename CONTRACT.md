@@ -29,10 +29,13 @@ option) and the `lord-workspace` and `lord-readonly` profiles between `# lord: b
 `$GROK_HOME/sandbox.toml` (default `~/.grok`), rewritten only when they differ.
 
 ## Daemon HTTP API (JSON bodies)
+Every request but `GET /health` and `POST /mcp` carries `X-Lord-Control: <key>` from `~/.claude/lord/control.header`
+(0600, new at each daemon start; grok's Lord profiles deny reading it); without it the reply is 403.
+
 | Method | Path | Body | Reply |
 |---|---|---|---|
 | GET | /health | - | `{ok, pid, version}` |
-| POST | /open | `{agentId, family, cwd, model?, effort?, readonly?, net?, dirs?, memory_gb?, hang_s?, wall_s?, tools?}` | `{vendorSession, model, effort}`; idempotent; resumes after a daemon restart from the journal. A later `readonly`, `net`, `tools` or new `dirs` restarts the vendor session before the next turn. Refused with the reason: unknown model (the vendor's list), `dirs` for grok/gemini, `readonly` for gemini or for grok under a temp folder, `/` or the home folder as cwd |
+| POST | /open | `{agentId, family, cwd, model?, effort?, readonly?, net?, dirs?, memory_gb?, hang_s?, wall_s?, tools?}` | `{vendorSession, model, effort}`; idempotent; resumes after a daemon restart from the journal. A later `readonly`, `net`, `tools` or new `dirs` restarts the vendor session before the next turn. Refused with the reason: unknown model (the vendor's list), `dirs` for grok/gemini, `readonly` for gemini or for grok under a temp folder or `~/.grok` (an existing agent is judged by its own folder), `/` or the home folder as cwd |
 | POST | /turn | `{agentId, text, model?, effort?}` | NDJSON stream; if the agent has a running or undelivered turn (its client went away), that turn streams first (a pending lord tool call is offered again) and this text starts when it ends, its done text prefixed with the earlier result. An interrupted turn leaves nothing to deliver |
 | POST | /continue | `{agentId}` | NDJSON stream of the same turn after a tool result |
 | POST | /tool_result | `{agentId, callId, text, isError}` | `{ok}` |
@@ -68,8 +71,9 @@ waits undelivered, for up to `keep_undelivered_s` (a day).
 - Effort: the request (`minimal` to `ultra`), else the nearest level the vendor lists for the model (codex model/list,
   grok configOptions, agy models).
 - A vendor program that is not found ends the request with an error naming how to install and sign in.
-- Environment scrub for every vendor: no `*KEY*`, `*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*CREDENTIAL*`, `ANTHROPIC_*`,
-  `CLAUDE_CODE_*`, bearer values (the daemon's own `LORD_*`, `GROK_*` pass). Subscription logins only; auth files are
+- Environment scrub for every vendor: no inherited `*KEY*`, `*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*CREDENTIAL*`,
+  `ANTHROPIC_*`, `CLAUDE_CODE_*`, bearer values, whatever their prefix; the daemon's own settings (agent id, MCP token,
+  grok import switches) are added after the scrub. Subscription logins only; auth files are
   never read.
 
 ## Guards (config.json)

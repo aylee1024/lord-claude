@@ -1,7 +1,7 @@
 import { test, expect, mock } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer', model: 'fake-gpt', usage: { input_tokens: 3, output_tokens: 2, cache_read_input_tokens: 1 } }], failures = 0, socket: string | null = '/test/lord.sock', badPythons: string[] = []) {
+function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer', model: 'fake-gpt', usage: { input_tokens: 3, output_tokens: 2, cache_read_input_tokens: 1 } }], failures = 0, socket: string | null = '/test/lord.sock', pythonExits: Record<string, number> = {}) {
   const requests: { path: string; body: any }[] = []
   const statuses: string[] = []
   const processes: string[][] = []
@@ -14,7 +14,9 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
   on('process.spawn', async function* (_, e) {
     if (String(e.argv[1]).endsWith('/lordd.py')) {
       processes.push([...e.argv])
-      if (badPythons.includes(e.argv[0])) return { value: { code: 1, signal: null } }
+      const code = pythonExits[e.argv[0]]
+      if (code === 2) yield { stream: 'stderr', text: '/test/.claude/lord/config.json is not valid JSON: line 1\n' }
+      if (code !== undefined) return { value: { code, signal: null } }
     } else {
       const path = e.argv[e.argv.length - 1].replace('http://lord', '')
       requests.push({ path, body: JSON.parse(e.input ?? '{}') })
@@ -35,12 +37,15 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
   on('session.send', (_, e) => { deliveries.push(e.text); return { isDelivered: true } })
   on('session.receive', (_, e) => ({ text: e.text }))
   on('agent.list', () => ({ value: [{ id: 'a1', type: spawned }] as any }))
-  on('tool.call', () => ({ result: {}, text: 'child result', ref: 9 }))
+  const tools = { answer: { result: {}, text: 'child result', ref: 9 } as any }
+  on('tool.call', () => tools.answer)
   on('http.fetch', (_, e) => {
     const path = e.url.replace('http://lord', '')
     requests.push({ path, body: e.init?.body ? JSON.parse(e.init.body) : undefined })
+    if (socket === '/down.sock') return { deny: 'socket unavailable' }
+    if (path === '/open' && JSON.parse(e.init!.body!).dirs?.includes('/bad')) return { value: { ok: false, status: 400, headers: {}, text: JSON.stringify({ error: 'every @dir must be an existing directory' }) } }
     if (path === '/health' && failures-- > 0) return { deny: 'socket unavailable' }
-    const result = path === '/agents' ? [{ agentId: 'a1', family: 'gpt', state: 'running' }]
+    const result = path === '/agents' ? [{ agentId: 'a1', family: 'gpt', state: 'running', effort: 'ultra', model: 'fake-gpt', cwd: '/pinned' }]
       : path === '/usage' ? { chatgpt: { usedPercent: 47 } }
       : path === '/health' ? { ok: true }
       : path === '/open' ? { vendorSession: 'v1', model: 'fake-gpt', effort: 'high' }
@@ -52,7 +57,7 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
     modelCalls++
     return { turnId: e.turnId, index: e.index, answer: 'MODEL CALLED', toolUses: [], stopReason: 'end_turn', usage: null }
   })
-  return { requests, statuses, processes, deliveries, clock, modelCalls: () => modelCalls, streamFinished: () => streamFinished }
+  return { tools, requests, statuses, processes, deliveries, clock, modelCalls: () => modelCalls, streamFinished: () => streamFinished }
 }
 
 async function spawn($: any, type = 'lord:gpt') {
@@ -348,7 +353,7 @@ test('worktree isolation without a reported worktree path refuses to run in the 
 })
 
 test('a Python that is missing or too old is skipped for the next one', async ($, on) => {
-  const w = world(on, [{ type: 'done', text: 'connected' }], 2, null, ['/opt/homebrew/bin/python3'])
+  const w = world(on, [{ type: 'done', text: 'connected' }], 2, null, { '/opt/homebrew/bin/python3': 3 })
   await spawn($)
   const response = step($, 'hello')
   await w.clock.advance(1000)
@@ -364,4 +369,58 @@ test('@effort sets a vendor level beyond the Agent field and persists', async ($
   const turn = w.requests.find(x => x.path === '/turn')!.body
   expect(turn.effort).toBe('ultra')
   expect(turn.text).toBe('build it')
+})
+
+test('a broken settings file is reported instead of a connection timeout', async ($, on) => {
+  const w = world(on, [], 1000, null, { '/opt/homebrew/bin/python3': 2 })
+  await spawn($)
+  const { result } = await step($, 'hello')
+  expect(result.answer).toMatch(/^lord: error: .*config\.json is not valid JSON/)
+  expect(w.processes.length).toBe(1)
+})
+
+test('an option the daemon refuses is not kept for later turns', async ($, on) => {
+  const w = world(on)
+  await spawn($)
+  expect((await step($, '@dir /bad\nfirst')).result.answer).toMatch(/every @dir must be an existing directory/)
+  expect((await step($, 'second')).result.answer).toBe('fake answer')
+  expect(w.requests.filter(x => x.path === '/open').at(-1)!.body.dirs).toBeUndefined()
+})
+
+test('/lord answers before the daemon has started', async ($, on) => {
+  world(on, [], 0, '/down.sock')
+  await $.session.start({ cwd: '/repo' } as any)
+  expect(await $.command.run({ command: 'lord', args: '' } as any)).toMatchObject({ text: 'lord: no agents' })
+})
+
+test('after a reload the daemon keeps an agent\'s @effort level and folder', async ($, on) => {
+  const w = world(on)
+  await step($, 'continue the work')
+  const open = w.requests.find(x => x.path === '/open')!.body
+  expect([open.effort, open.cwd]).toEqual(['ultra', '/pinned'])
+  expect(w.requests.find(x => x.path === '/turn')!.body.effort).toBe('ultra')
+})
+
+test('the first turn\'s @cwd stays the folder for later turns', async ($, on) => {
+  const w = world(on)
+  await spawn($)
+  await $.classic.SubagentStart({ agent_id: 'a1', agent_type: 'lord:gpt', cwd: '/repo' } as any)
+  await step($, '@cwd /pins/r1\nfirst')
+  await step($, 'second')
+  expect((await step($, '@cwd /pins/r1\nthird')).result.answer).toBe('fake answer')
+  expect(w.requests.filter(x => x.path === '/open').map(x => x.body.cwd)).toEqual(['/pins/r1', '/pins/r1', '/pins/r1'])
+})
+
+test('a rejected StructuredOutput object is corrected once, then ends with a visible error', async ($, on) => {
+  const w = world(on, [{ type: 'done', text: '{"bad":true}' }])
+  await spawn($)
+  await step($, 'task')
+  await step($, '', 1)
+  w.tools.answer = { result: {}, isError: true, text: 'word is required', ref: 9 }
+  await $.tool.call({ tool: 'StructuredOutput', tool_use_id: 'lord_structured_t1_1', agentId: 'a1', bad: true } as any)
+  expect((await step($, '', 2)).result.toolUses[0].name).toBe('StructuredOutput')
+  await $.tool.call({ tool: 'StructuredOutput', tool_use_id: 'lord_structured_t1_2', agentId: 'a1', bad: true } as any)
+  const last = await step($, '', 3)
+  expect(last.result.answer).toMatch(/^lord: error: the vendor's JSON was rejected again: word is required/)
+  expect(w.requests.filter(x => x.path === '/turn' && x.body.text.startsWith('That JSON was rejected')).length).toBe(1)
 })

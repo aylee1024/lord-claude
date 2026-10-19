@@ -2,7 +2,7 @@ import type { EngineInterface, Register, TurnStepInput, TurnStepResult } from 'c
 
 type Verdict = 'sent' | { isError: boolean; text: string }
 type Agent = { family: string; cwd?: string; running?: boolean; model?: string; effort?: string; readonly?: boolean; net?: boolean; dirs?: string[]; limits?: Limits; opened?: boolean; error?: string
-  continuing?: boolean; lastAnswer?: string; structured?: Verdict; worktree?: boolean }
+  continuing?: boolean; lastAnswer?: string; structured?: Verdict; corrected?: boolean; worktree?: boolean; pending?: Task }
 type Stream = { next: number; live: number; answer: string }
 type Outcome = { tool?: { callId: string; name: string; input: Record<string, unknown> } }
 type Limits = { memory_gb?: number; hang_s?: number; wall_s?: number; tools?: boolean }
@@ -51,6 +51,11 @@ function task(text: string): Task {
   return result
 }
 
+function merge(base: Task, more: Partial<Task>): Task {
+  return { ...base, ...more, dirs: more.dirs ? [...new Set([...(base.dirs ?? []), ...more.dirs])] : base.dirs,
+    limits: more.limits ? { ...base.limits, ...more.limits } : base.limits }
+}
+
 function errorLine(error: unknown): string {
   return 'lord: error: ' + String(error instanceof Error ? error.message : error).replace(/\s+/g, ' ').trim()
 }
@@ -65,10 +70,16 @@ async function socket($: EngineInterface): Promise<string> {
   return await $.env.get('LORD_DAEMON_SOCKET') || `${await $.env.get('HOME')}/.claude/lord/lordd.sock`
 }
 
+async function keyFile($: EngineInterface): Promise<string> {
+  // The daemon writes its control key next to its socket; vendor sandboxes cannot read it.
+  return (await socket($)).replace(/[^/]*$/, 'control.header')
+}
+
 async function request($: EngineInterface, path: string, body?: unknown): Promise<string> {
+  const key = await $.fs.read(await keyFile($)).then(text => /^X-Lord-Control:\s*(\S+)/.exec(String(text))?.[1], () => undefined)
   const response = await $.http.fetch('http://lord' + path, {
     socketPath: await socket($), method: body === undefined ? 'GET' : 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', ...(key ? { 'X-Lord-Control': key } : {}) },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   })
   if (!response.ok) {
@@ -96,7 +107,7 @@ async function* events($: EngineInterface, path: string, body: unknown): AsyncGe
   const child = $.process.spawn({
     argv: ['/usr/bin/curl', '--disable', '--silent', '--show-error', '--no-buffer', '--fail-with-body', '--noproxy', '*',
       '--connect-timeout', '5', '--unix-socket', await socket($), '--request', 'POST',
-      '--header', 'Content-Type: application/json', '--data-binary', '@-', 'http://lord' + path],
+      '--header', 'Content-Type: application/json', '--header', '@' + await keyFile($), '--data-binary', '@-', 'http://lord' + path],
     input: JSON.stringify(body),
   })
   let buffer = ''
@@ -136,16 +147,20 @@ async function connect($: EngineInterface, signal: AbortSignal): Promise<void> {
     // Only the default socket belongs to the daemon this plugin starts; a test socket is never auto-started.
     if (signal.aborted || await socket($) !== `${await $.env.get('HOME')}/.claude/lord/lordd.sock`) throw error
   }
-  // The daemon forks and exits 0 at once; an interpreter that is missing or older than 3.11 fails and the next is tried.
+  // The daemon forks and exits 0 at once. A missing interpreter, or exit 3 (older than 3.11), tries the next one;
+  // any other failure (a broken ~/.claude/lord/config.json) is reported with the daemon's message.
   const pythons = [await $.env.get('LORD_PYTHON'), '/opt/homebrew/bin/python3', '/usr/local/bin/python3', '/usr/bin/python3']
   let started = false
   for (const python of pythons.filter(Boolean) as string[]) {
+    let code: number | null = null, stderr = ''
     try {
       const child = $.process.spawn({ argv: [python, `${$.plugin.root}/lordd.py`, '--daemon'] })
       let piece
-      while (!(piece = await child.next()).done) {}
-      if (piece.value.code === 0) { started = true; break }
-    } catch {}
+      while (!(piece = await child.next()).done) if (piece.value.stream === 'stderr') stderr += piece.value.text
+      code = piece.value.code
+    } catch { continue }
+    if (code === 0) { started = true; break }
+    if (code !== 3) throw new Error(stderr.trim() || `the daemon exited with code ${code}`)
   }
   if (!started) throw new Error('no Python 3.11 or later found (set LORD_PYTHON to its path)')
   const deadline = await $.clock.now() + 5000
@@ -177,12 +192,8 @@ async function steer($: EngineInterface, agentId: string, text: string): Promise
   if (!agent?.running) return false
   const parsed = task(text)
   // Directives alter the next turn's session options rather than an in-flight request.
-  if (parsed.model) agent.model = parsed.model
-  if (parsed.effort) agent.effort = parsed.effort
-  if (parsed.readonly) agent.readonly = true
-  if (parsed.net) agent.net = true
-  if (parsed.dirs) agent.dirs = [...new Set([...(agent.dirs ?? []), ...parsed.dirs])]
-  if (parsed.limits) agent.limits = { ...agent.limits, ...parsed.limits }
+  const { text: _, ...options } = parsed
+  agent.pending = merge({ text: '', ...agent.pending }, options)
   try {
     const response = JSON.parse(await request($, '/steer', { agentId, text: parsed.text }))
     return response.steered === true
@@ -195,13 +206,14 @@ async function lordAgent($: EngineInterface, agentId: string): Promise<Agent | u
   const listed = await $.agent.list().then(list => list.find(agent => agent.id === agentId), () => undefined)
   if (listed && !listed.type.startsWith('lord:')) { others.add(agentId); return undefined }
   let family = listed?.type.slice(5), cwd = directories.get(agentId)
+  // The daemon keeps an opened agent's settings, such as an @effort level beyond the Agent call's.
+  const known = await request($, '/agents').then(text => JSON.parse(text).find((a: any) => a.agentId === agentId), () => undefined)
   if (!family) {
     // An id the roster does not name may still be a lord agent the daemon opened before a reload.
-    const known = await request($, '/agents').then(text => JSON.parse(text).find((a: any) => a.agentId === agentId), () => undefined)
     if (!known) { others.add(agentId); return undefined }
-    family = known.family; cwd = cwd ?? known.cwd
+    family = known.family
   }
-  agents.set(agentId, { family: family!, cwd, opened: !listed })
+  agents.set(agentId, { family: family!, cwd: known?.cwd ?? cwd, opened: !!known, effort: known?.effort, model: known?.model })
   return agents.get(agentId)
 }
 
@@ -275,22 +287,22 @@ export const register: Register = on => {
       let outcome: Outcome | undefined
       agent.running = true
       if (e.index === 0) {
-        const input = starts.get(e.turnId)
-        if (!input) throw new Error('missing turn.start task')
-        if (input.model) agent.model = input.model
-        if (input.effort) agent.effort = input.effort
-        if (input.readonly) agent.readonly = true
-        if (input.net) agent.net = true
-        if (input.dirs) agent.dirs = [...new Set([...(agent.dirs ?? []), ...input.dirs])]
-        if (input.limits) agent.limits = { ...agent.limits, ...input.limits }
+        const started = starts.get(e.turnId)
+        if (!started) throw new Error('missing turn.start task')
+        // Directives from this task and from messages steered into the last turn apply only once /open accepts them.
+        const input = merge(agent.pending ?? { text: '' }, started)
+        input.text = started.text
+        delete agent.pending
+        const chosen = merge({ text: '', model: agent.model, effort: agent.effort, readonly: agent.readonly, net: agent.net, dirs: agent.dirs, limits: agent.limits }, input)
         agent.structured = undefined
+        agent.corrected = false
         await connect($, next.signal)
         // A task can name the vendor's working folder; it is fixed at the first turn.
         if (input.cwd && agent.opened && input.cwd !== agent.cwd) throw new Error(`@cwd is fixed at the first turn (${agent.cwd})`)
-        if (input.cwd) agent.cwd = input.cwd
         if (agent.worktree && !input.cwd && !directories.get(agentId)) throw new Error('worktree isolation was requested but Claude Code reported no worktree path; refusing to run in the main tree')
-        const cwd = input.cwd ?? directories.get(agentId) ?? agent.cwd ?? await $.session.cwd()
-        await request($, '/open', { agentId, family: agent.family, cwd, model: agent.model, effort: agent.effort ?? e.effort, readonly: agent.readonly, net: agent.net, dirs: agent.dirs, ...agent.limits })
+        const cwd = input.cwd ?? (agent.opened ? agent.cwd : undefined) ?? directories.get(agentId) ?? agent.cwd ?? await $.session.cwd()
+        await request($, '/open', { agentId, family: agent.family, cwd, model: chosen.model, effort: chosen.effort ?? e.effort, readonly: chosen.readonly, net: chosen.net, dirs: chosen.dirs, ...chosen.limits })
+        Object.assign(agent, { model: chosen.model, effort: chosen.effort, readonly: chosen.readonly, net: chosen.net, dirs: chosen.dirs, limits: chosen.limits })
         agent.opened = true
         agent.cwd = cwd
         void refresh($)
@@ -309,8 +321,10 @@ export const register: Register = on => {
           yield { kind: 'stop', stopReason: 'end_turn', usage: null }
           return result(e, '')
         }
+        if (verdict && agent.corrected) throw new Error(`the vendor's JSON was rejected again: ${verdict.text}`)
         let value = verdict ? undefined : json(agent.lastAnswer ?? '')
         if (!value) {
+          if (verdict) agent.corrected = true
           const text = verdict ? `That JSON was rejected: ${verdict.text}\nReply with only the corrected JSON object.`
             : 'Reply with only a JSON object holding your answer, with no other text.'
           outcome = yield* vendorTurn($, '/turn', { agentId, text, model: agent.model, effort: agent.effort ?? e.effort }, stream)
@@ -424,8 +438,11 @@ export const register: Register = on => {
 
   on('command.run', { command: 'lord' }, async ($, e) => {
     try {
-      const list = JSON.parse(await request($, '/agents'))
       const args = e.args.trim().split(/\s+/)
+      const listing = await request($, '/agents').catch(() => undefined)
+      // Nothing is listening before the first Lord turn starts the daemon.
+      if (listing === undefined) return { text: args[0] ? 'lord: no agents are running' : 'lord: no agents' }
+      const list = JSON.parse(listing)
       if (args[0] === 'model' && args.length === 3) {
         const known = list.find((agent: any) => agent.agentId === args[1])
         if (!known) return { text: `lord: unknown agent ${args[1]}` }

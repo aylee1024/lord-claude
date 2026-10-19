@@ -41,8 +41,8 @@ Ask Claude in plain words ("have gpt fix this test in a worktree and grok review
 |---|---|
 | `@model <id>` | Vendor model for this and later turns. An unknown id is refused with the vendor's list. |
 | `@effort <level>` | Reasoning level, `minimal` to `ultra`. Overrides the Agent call's `effort` (default `high`). The nearest level the vendor lists for the model is used. |
-| `@readonly` | gpt: codex read-only sandbox. grok: Lord's read-only profile (refused for a folder under `/tmp` or `/var/folders`, which it cannot protect). Not available for gemini. |
-| `@net` | gpt: network on (off by default). grok and gemini always have network. |
+| `@readonly` | gpt: codex read-only sandbox. grok: Lord's read-only profile (refused for a folder under `/tmp`, `/var/tmp`, `/var/folders` or `~/.grok`, which that profile leaves writable). Not available for gemini. |
+| `@net` | gpt: network on (off by default), which also lets it reach local services, Lord's own included. grok and gemini always have network. |
 | `@cwd <path>` | The vendor's working folder; first turn only. |
 | `@dir <path>` | gpt: an extra writable folder (repeatable). |
 | `@memory <GB>` | Memory ceiling over the agent's whole process tree (default 12). |
@@ -54,7 +54,7 @@ What each vendor enforces:
 
 | | gpt (codex) | grok | gemini (agy) |
 |---|---|---|---|
-| writes | working folder and `@dir` folders | working folder and temp folders | anywhere (agy has no sandbox) |
+| writes | working folder and `@dir` folders | working folder, temp folders and `~/.grok` | anywhere (agy has no sandbox) |
 | `@readonly` | codex read-only sandbox | Lord's custom Seatbelt profile | refused |
 | network | off unless `@net` | on | on |
 | effort | low to max, and ultra on models that list it | low to xhigh | low to high |
@@ -75,12 +75,12 @@ Settings: `~/.claude/lord/config.json` is merged over the plugin's [`config.json
 
 ## What Lord runs, stores and sends
 
-- **Runs:** `lordd.py` (Python), `/usr/bin/curl` (to read the daemon's streams), and the vendor CLIs you installed. Nothing is downloaded.
+- **Runs:** `lordd.py` (Python), `/usr/bin/curl` (to read the daemon's streams), `/bin/ps` (every 5 seconds while an agent works, for the memory guard), and the vendor CLIs you installed. Nothing is downloaded.
 - **Sends:** a task's text goes only to the vendor CLI you chose, which sends it to that vendor under your account. Lord itself makes no network requests. See [PRIVACY.md](PRIVACY.md).
-- **Stores, all under `~/.claude/lord/`:** the socket and lock, `sessions.jsonl` (one line per agent: ids, vendor session id, model, effort, folder and options, never task text), `logs/<agentId>.log` (the vendor's commands and file actions, with secrets redacted, at most 4 MB each), and `lordd.log` (at most 1 MB). Records unused for 14 days are removed; vendor history stays with each vendor, and codex threads are moved to codex's archive.
+- **Stores, all under `~/.claude/lord/`:** the socket and lock, `control.header` (a key that every request except a vendor's own tool calls must carry; grok's Lord profiles cannot read it, codex's sandbox cannot reach the socket without `@net`, and gemini has no sandbox), `sessions.jsonl` (one line per agent: ids, vendor session id, model, effort, folder and options, never task text), `logs/<agentId>.log` (the vendor's commands and file actions, with secrets redacted, at most 4 MB each), and `lordd.log` (at most 1 MB). Records unused for 14 days are removed; vendor history stays with each vendor, and codex threads are moved to codex's archive.
 - **Two changes outside that folder:**
   - an MCP entry named `lord` in agy's user settings (agy has no per-run option for it; outside a Lord agent it lists no tools);
-  - two sandbox profiles, `lord-workspace` and `lord-readonly`, between `# lord: begin` and `# lord: end` lines in `~/.grok/sandbox.toml`. Lord uses custom profiles because grok refuses to start when a custom profile cannot be applied, whereas a built-in profile that fails only prints a warning and runs unconfined. Your own profiles in that file are left as they are.
+  - two sandbox profiles, `lord-workspace` and `lord-readonly`, between `# lord: begin` and `# lord: end` lines in `~/.grok/sandbox.toml`. Lord uses custom profiles because grok refuses to start when a custom profile cannot be applied, whereas a built-in profile that fails only prints a warning and runs unconfined. Your own profiles in that file are left as they are; if the file cannot take Lord's tables (for example an inline `profiles = {...}`), grok agents are refused with the reason and the file is not changed.
 
 ## Coming from the v1 skills
 

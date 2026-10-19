@@ -12,7 +12,9 @@ import signal
 import sys
 import time
 
-if sys.version_info < (3, 11): sys.exit('lordd needs Python 3.11 or later')
+if sys.version_info < (3, 11):
+    print('lordd needs Python 3.11 or later', file=sys.stderr)
+    sys.exit(3)
 from urllib.parse import quote
 import uuid
 
@@ -41,6 +43,8 @@ def load_config():
     config = json.loads(Path(os.environ.get('LORD_CONFIG', HERE.with_name('config.json'))).read_text())
     try: user = json.loads((HOME / 'config.json').read_text())
     except FileNotFoundError: return config
+    except ValueError as error: raise ValueError(f'{HOME / "config.json"} is not valid JSON: {error}') from None
+    if not isinstance(user, dict): raise ValueError(f'{HOME / "config.json"} must hold a JSON object')
     for key, value in user.items():
         config[key] = {**config[key], **value} if isinstance(value, dict) and isinstance(config.get(key), dict) else value
     return config
@@ -58,35 +62,49 @@ def link_chain(path):
     seen.append(os.path.realpath(seen[0]))
     return seen
 
+def grok_home():
+    return Path(os.environ.get('GROK_HOME', Path.home() / '.grok'))
+
+LORD_BLOCK = re.compile(r'^# lord: begin[^\n]*\n.*?^# lord: end[^\n]*(?:\n|\Z)', re.M | re.S)
+
 def grok_profiles():
     # grok runs unconfined, with only a warning, when a built-in profile fails to apply, but refuses to start
     # when a custom profile fails. Lord therefore runs grok only under its own custom profiles. lord-readonly
     # drops restrict_network, whose socket resolver refuses symlinked endpoints (Docker Desktop's
-    # /var/run/docker.sock), and denies the sockets explicitly instead.
-    path = Path(os.environ.get('GROK_HOME', Path.home() / '.grok')) / 'sandbox.toml'
-    path = Path(os.path.realpath(path))
-    deny = sorted({p for s in SOCKETS for p in link_chain(s)})
+    # /var/run/docker.sock), and denies the sockets explicitly instead. Neither profile can read Lord's control
+    # key, without which a grok agent cannot ask the daemon for a less confined agent.
+    import tomllib
+    path = Path(os.path.realpath(grok_home() / 'sandbox.toml'))
+    key = os.path.realpath(HOME / 'control.header')
+    sockets = sorted({p for s in SOCKETS for p in link_chain(s)})
+    listed = lambda paths: '[' + ', '.join(json.dumps(p) for p in paths) + ']'
     block = ('# lord: begin (written by the lord plugin; edits between these lines are replaced)\n'
-             '[profiles.lord-workspace]\nextends = "workspace"\n\n'
-             '[profiles.lord-readonly]\nextends = "read-only"\nrestrict_network = false\n'
-             'deny = [' + ', '.join(json.dumps(p) for p in deny) + ']\n# lord: end\n')
-    text = path.read_text() if path.exists() else ''
-    start, end = text.find('# lord: begin'), text.find('# lord: end\n')
-    current = text[start:end + len('# lord: end\n')] if start >= 0 and end > start else None
-    if current == block: return
-    text = text.replace(current, block) if current else text + ('\n' if text and not text.endswith('\n') else '') + ('\n' if text else '') + block
+             f'[profiles.lord-workspace]\nextends = "workspace"\ndeny = {listed([key])}\n\n'
+             f'[profiles.lord-readonly]\nextends = "read-only"\nrestrict_network = false\ndeny = {listed([*sockets, key])}\n# lord: end\n')
+    original = path.read_text() if path.exists() else ''
+    kept = LORD_BLOCK.sub('', original).rstrip('\n')
+    text = (kept + '\n\n' if kept else '') + block
+    if text == original: return
+    try: tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:
+        raise RuntimeError(f"{path} cannot take Lord's grok profiles ({error}); fix that file and try again") from None
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f'.{path.name}.lord')
     temporary.write_text(text)
     if path.exists(): temporary.chmod(path.stat().st_mode & 0o777)
     temporary.replace(path)
 
-TEMP_ROOTS = ('/tmp', '/private/tmp', '/var/folders', '/private/var/folders')
+TEMP_ROOTS = ('/tmp', '/private/tmp', '/var/tmp', '/private/var/tmp', '/var/folders', '/private/var/folders')
+
+def inside(path, roots):
+    return any(path == root or path.startswith(root.rstrip('/') + '/') for root in roots)
 
 async def run_quick(argv, timeout=20):
     # Helper CLI calls are bounded: a wedged one must not hold the daemon.
-    process = await asyncio.create_subprocess_exec(*argv, env=subscription_env(), start_new_session=True,
-        stdin=asyncio.subprocess.DEVNULL, stdout=-1, stderr=-1)
+    try:
+        process = await asyncio.create_subprocess_exec(*argv, env=subscription_env(), start_new_session=True,
+            stdin=asyncio.subprocess.DEVNULL, stdout=-1, stderr=-1)
+    except FileNotFoundError: return 127, f'{argv[0]} was not found'
     try: out, err = await asyncio.wait_for(process.communicate(), timeout)
     except TimeoutError:
         await kill_tree(process)
@@ -109,12 +127,11 @@ def dumps(value):
 SECRET_NAMES = ('KEY', 'TOKEN', 'SECRET', 'PASSWORD', 'CREDENTIAL')
 
 def subscription_env(extra=None):
-    # Every secret-like name is dropped; the daemon's own LORD_ and GROK_ settings pass.
-    return {k: v for k, v in {**os.environ, **(extra or {})}.items()
-            if k.startswith(('LORD_', 'GROK_')) or (
-                not k.upper().startswith(('CLAUDECODE', 'CLAUDE_CODE_', 'ANTHROPIC_'))
-                and not any(s in k.upper() for s in SECRET_NAMES)
-                and k.upper() not in ('OPENAI_BASE_URL', 'RUST_LOG') and not v.lower().startswith('bearer '))}
+    # Every secret-like name in the inherited environment is dropped; the daemon's own settings (extra) are added after.
+    return {**{k: v for k, v in os.environ.items()
+               if not k.upper().startswith(('CLAUDECODE', 'CLAUDE_CODE_', 'ANTHROPIC_'))
+               and not any(s in k.upper() for s in SECRET_NAMES)
+               and k.upper() not in ('OPENAI_BASE_URL', 'RUST_LOG') and not v.lower().startswith('bearer ')}, **(extra or {})}
 
 class Redactor:
     def __init__(self):
@@ -339,13 +356,15 @@ class Vendor:
             elif event == 'step_update':
                 if payload.get('step_type') == 'agent_response' and payload.get('text_delta'): a.emit('text', text=payload['text_delta'])
                 elif payload.get('step_type') != 'agent_response':
+                    # Text before a tool step is narration; the answer is what agy says after its last one.
+                    a.answer = ''
                     a.emit('activity', text=str(payload.get('command') or payload.get('step_type', 'Working')))
             elif event == 'result' and a.state in ('running', 'waiting_tool'):
                 if payload.get('status') != 'SUCCESS' or payload.get('error'):
                     a.emit('error', message=self.d.redact(payload.get('error') or payload.get('status')), retryable=True)
                 else:
                     self.d.record_usage(a, usage(payload.get('usage', {})))
-                    a.emit('done', text=payload.get('response') or a.answer, usage=usage(payload.get('usage', {})), model=a.model)
+                    a.emit('done', text=payload['response'] if isinstance(payload.get('response'), str) else a.answer, usage=usage(payload.get('usage', {})), model=a.model)
             return
         sid = p.get('threadId') or p.get('sessionId')
         a = next((a for a in self.d.agents.values() if a.family == self.family and a.vendorSession == sid), None)
@@ -370,17 +389,21 @@ class Vendor:
             if item['text'].startswith(seen) and len(item['text']) > len(seen): a.emit('text', text=item['text'][len(seen):])
             a.items[item['id']] = item['text']
             a.final_text = item['text']
-        elif method == 'item/started' and (line := codex_activity(p['item'])): a.emit('activity', text=line)
+        elif method == 'item/started' and (line := codex_activity(p['item'])):
+            # A message before a tool action is narration; the answer is the agent message after the last action.
+            a.final_text = ''
+            a.emit('activity', text=line)
         elif method == 'thread/tokenUsage/updated':
             a.total = p['tokenUsage']['total']
             a.tokens = usage({k: max(0, v - a.base.get(k, 0)) for k, v in a.total.items() if isinstance(v, int)})
         elif method == 'turn/completed':
             turn = p['turn']
+            # A late completion of an earlier turn must not end the current one.
+            if a.turn_id and turn.get('id') != a.turn_id: return
             if turn['status'] == 'completed' and not a.cancel_requested:
                 tokens = {**a.tokens, 'input_tokens': max(0, a.tokens['input_tokens'] - a.tokens['cache_read_input_tokens'])}
                 self.d.record_usage(a, tokens)
                 a.emit('done', text=a.final_text, usage=tokens, model=a.model)
-                self.d.save(a)
             else:
                 a.emit('error', message=self.d.redact('interrupted' if a.cancel_requested else turn.get('error') or turn['status']), retryable=not a.cancel_requested and turn['status'] != 'interrupted')
         elif method == 'error' and not p.get('willRetry', False): a.emit('error', message=self.d.redact(p.get('error', p)), retryable=True)
@@ -401,7 +424,7 @@ class Daemon:
         self.config = load_config()
         self.agents, self.vendors, self.tasks, self.connections = {}, {}, set(), set()
         self.redact, self.stopping, self.last_request = Redactor(), False, time.monotonic()
-        self.requests = 0
+        self.requests, self.control = 0, None
         self.stop_event, self.open_lock = asyncio.Event(), asyncio.Lock()
         self.usage_cache, self.agy_registered, self.agy_levels, self.agy_models = (0, {}), False, {}, set()
         self.journal = HOME / 'sessions.jsonl'
@@ -446,6 +469,7 @@ class Daemon:
 
     def record_usage(self, a, tokens):
         a.record['usage'] = tokens
+        self.save(a)
 
     def save(self, a):
         a.record.update({k: getattr(a, k) for k in ('vendorSession', 'model', 'effort', 'total')}, used=datetime.now(timezone.utc).isoformat())
@@ -539,46 +563,58 @@ class Daemon:
                                   'gemini': '@dir is not needed for gemini: agy has no sandbox and can write outside its folder'}[family])
             cwd = str(Path(body['cwd']).expanduser().resolve(strict=True))
             if cwd in ('/', str(Path.home())): raise ValueError('refusing / or the home folder as a working folder')
-            if body.get('readonly') and family == 'grok' and cwd.startswith(TEMP_ROOTS):
-                raise ValueError("grok's read-only profile leaves temp folders writable; pin a read-only grok outside /tmp and /var/folders")
             a = self.agents.get(aid)
-            if a is None:
-                if not Path(cwd).is_dir(): raise ValueError('cwd must be a directory')
-                config = self.config[family]
-                a = Agent({**{k: body[k] for k in ('readonly', 'net') if k in body}, 'agentId': aid,
-                    'family': family, 'cwd': cwd, 'model': body.get('model') or config['model'],
-                    'effort': body.get('effort') or config['effort'], 'created': datetime.now(timezone.utc).isoformat()})
-                await self.effort(a)
-                self.agents[aid] = a
-            elif a.family != family: raise ValueError('agentId already belongs to another family')
-            else:
-                for key in ('readonly', 'net'):
-                    if body.get(key) and not a.record.get(key):
-                        # A sandbox change needs a new process (grok) or a reattached thread (codex).
-                        a.record[key] = True
-                        a.restart = True
-            # Per-agent overrides of the guards and of the lean vendor setup; any later /open may change them.
-            for key in ('memory_gb', 'hang_s', 'wall_s'):
-                if body.get(key) is not None:
-                    if not isinstance(body[key], (int, float)) or body[key] < 0 or (key == 'memory_gb' and body[key] == 0): raise ValueError(f'invalid {key}')
-                    a.record[key] = body[key]
-            if body.get('tools') and not a.record.get('tools'):
-                # The user's tool servers load at process start, so the agent gets a new process and resumes.
-                a.record['tools'] = True
-                a.restart = True
-            if a.restart and a.state not in ('running', 'waiting_tool'):
-                a.restart = False
-                await self.backend(a).close()
-                a.generation = 0
-            dirs = [str(Path(x).expanduser().resolve()) for x in body.get('dirs') or []]
-            if any(not Path(x).is_dir() for x in dirs): raise ValueError('every @dir must be an existing directory')
-            if set(dirs) - set(a.record.get('dirs', [])):
-                # Extra writable folders change the sandbox, so the session reattaches with them.
-                a.record['dirs'] = sorted(set(a.record.get('dirs', [])) | set(dirs))
-                a.generation = 0
-            await self.attach(a)
-            if a.state == 'closed': a.state = 'idle'
-            return {'vendorSession': a.vendorSession, 'model': a.model, 'effort': a.effort}
+            # grok's read-only base profile leaves the temp folders and grok's own folder writable.
+            if body.get('readonly') and family == 'grok' and inside(a.cwd if a else cwd, (*TEMP_ROOTS, os.path.realpath(grok_home()))):
+                raise ValueError("grok's read-only profile leaves temp folders and ~/.grok writable; pin a read-only grok outside /tmp, /var/tmp, /var/folders and ~/.grok")
+            new = a is None
+            try: return await self.open_agent(aid, family, cwd, body, a)
+            except BaseException:
+                # A first /open that fails leaves no agent behind, so a corrected retry starts clean.
+                if new and self.agents.get(aid) is not None and self.agents[aid].vendorSession is None:
+                    self.agents.pop(aid, None)
+                    vendor = self.vendors.pop(aid, None)
+                    if vendor: await vendor.close()
+                raise
+
+    async def open_agent(self, aid, family, cwd, body, a):
+        if a is None:
+            if not Path(cwd).is_dir(): raise ValueError('cwd must be a directory')
+            config = self.config[family]
+            a = Agent({**{k: body[k] for k in ('readonly', 'net') if k in body}, 'agentId': aid,
+                'family': family, 'cwd': cwd, 'model': body.get('model') or config['model'],
+                'effort': body.get('effort') or config['effort'], 'created': datetime.now(timezone.utc).isoformat()})
+            await self.effort(a)
+            self.agents[aid] = a
+        elif a.family != family: raise ValueError('agentId already belongs to another family')
+        else:
+            for key in ('readonly', 'net'):
+                if body.get(key) and not a.record.get(key):
+                    # A sandbox change needs a new process (grok) or a reattached thread (codex).
+                    a.record[key] = True
+                    a.restart = True
+        # Per-agent overrides of the guards and of the lean vendor setup; any later /open may change them.
+        for key in ('memory_gb', 'hang_s', 'wall_s'):
+            if body.get(key) is not None:
+                if not isinstance(body[key], (int, float)) or body[key] < 0 or (key == 'memory_gb' and body[key] == 0): raise ValueError(f'invalid {key}')
+                a.record[key] = body[key]
+        if body.get('tools') and not a.record.get('tools'):
+            # The user's tool servers load at process start, so the agent gets a new process and resumes.
+            a.record['tools'] = True
+            a.restart = True
+        if a.restart and a.state not in ('running', 'waiting_tool'):
+            a.restart = False
+            await self.backend(a).close()
+            a.generation = 0
+        dirs = [str(Path(x).expanduser().resolve()) for x in body.get('dirs') or []]
+        if any(not Path(x).is_dir() for x in dirs): raise ValueError('every @dir must be an existing directory')
+        if set(dirs) - set(a.record.get('dirs', [])):
+            # Extra writable folders change the sandbox, so the session reattaches with them.
+            a.record['dirs'] = sorted(set(a.record.get('dirs', [])) | set(dirs))
+            a.generation = 0
+        await self.attach(a)
+        if a.state == 'closed': a.state = 'idle'
+        return {'vendorSession': a.vendorSession, 'model': a.model, 'effort': a.effort}
 
     async def begin(self, a, body):
         async with a.stream_lock: await self.begin_locked(a, body)
@@ -588,7 +624,10 @@ class Daemon:
         if a.turn_task: await asyncio.gather(a.turn_task, return_exceptions=True)
         previous = (a.model, a.effort)
         a.model = body.get('model') or a.model
-        await self.effort(a, body.get('effort'))
+        try: await self.effort(a, body.get('effort'))
+        except BaseException:
+            a.model, a.effort = previous
+            raise
         if a.restart:
             a.restart = False
             await self.backend(a).close()
@@ -652,11 +691,10 @@ class Daemon:
             for future in list(a.calls.values()):
                 if not future.done(): future.set_result({'content': [{'type': 'text', 'text': 'interrupted'}], 'isError': True})
             if a.family == 'gpt':
-                if not a.turn_id: return
-                await v.rpc('turn/interrupt', {'threadId': a.vendorSession, 'turnId': a.turn_id})
+                # Before dispatch run_turn sees cancel_requested and ends the turn itself.
+                if a.turn_id: await v.rpc('turn/interrupt', {'threadId': a.vendorSession, 'turnId': a.turn_id})
             elif a.family == 'grok':
-                if not a.dispatched: return
-                await v.send({'method': 'session/cancel', 'params': {'sessionId': a.vendorSession}})
+                if a.dispatched: await v.send({'method': 'session/cancel', 'params': {'sessionId': a.vendorSession}})
             else:
                 await v.close()
                 a.generation = 0
@@ -683,7 +721,8 @@ class Daemon:
         if name == 'spawn_agent':
             data = {'subagent_type': args['type'], 'prompt': args['prompt'], 'description': args['description'],
                     'run_in_background': bool(args.get('background', False))}
-            if args.get('effort'): data['effort'] = args['effort']
+            if args.get('effort') in EFFORTS: data['effort'] = args['effort']
+            elif args.get('effort'): data['prompt'] = '@effort ' + args['effort'] + '\n' + data['prompt']
             if args.get('model'):
                 model = args['model']
                 if model in ('haiku', 'sonnet', 'opus', 'inherit') or model.startswith('claude-'): data['model'] = model
@@ -722,6 +761,8 @@ class Daemon:
                 future = a.calls.get(body['callId'])
                 if future is None or future.done(): raise ValueError('No matching pending tool call')
                 a.state = 'waiting_tool' if any(not f.done() for k, f in a.calls.items() if k != body['callId']) else 'running'
+                # Time spent waiting for the tool is not vendor silence.
+                if a.agentId in self.vendors: self.vendors[a.agentId].last = time.monotonic()
                 future.set_result({'content': [{'type': 'text', 'text': body['text']}], 'isError': bool(body.get('isError'))})
             elif path == '/mcp': return await self.mcp_call(a, body['name'], body.get('arguments', {}), body.get('token'))
             elif path == '/steer':
@@ -751,6 +792,8 @@ class Daemon:
             headers = dict(line.lower().split(':', 1) for line in lines if ':' in line)
             length = int(headers.get('content-length', '0'))
             if protocol != 'HTTP/1.1' or not 0 <= length <= LIMIT or 'transfer-encoding' in headers: raise ValueError('Invalid HTTP request framing')
+            if (method, path) not in (('GET', '/health'), ('POST', '/mcp')) and (not self.control or headers.get('x-lord-control', '').strip() != self.control):
+                raise PermissionError("this request needs Lord's control key")
             body = json.loads(await asyncio.wait_for(reader.readexactly(length), 30)) if length else {}
             if method == 'POST' and path in ('/turn', '/continue'):
                 a = self.agents[body['agentId']]
@@ -763,8 +806,12 @@ class Daemon:
                         a.followup = body
                         # A tool call whose client went away is offered again, so the new client can run it.
                         if a.state == 'waiting_tool' and not any(e['type'] == 'tool' for e in a.carry):
+                            queued = []
+                            while not a.events.empty(): queued.append(a.events.get_nowait())
+                            offered = {e['callId'] for e in queued if e['type'] == 'tool'}
                             a.carry += [{'type': 'tool', 'callId': call, 'name': name, 'input': data}
-                                        for call, (name, data) in a.call_data.items() if not a.calls[call].done()]
+                                        for call, (name, data) in a.call_data.items() if not a.calls[call].done() and call not in offered]
+                            for e in queued: a.events.put_nowait(e)
                     else: await self.begin(a, body)
                 elif not a.undelivered() and a.state not in ('running', 'waiting_tool'): raise ValueError('No turn to continue')
                 async with a.stream_lock:
@@ -786,10 +833,14 @@ class Daemon:
                             if event['type'] in ('done', 'error') and a.followup:
                                 body, a.followup = a.followup, None
                                 a.earlier = event['text'] if event['type'] == 'done' else 'lord: error: ' + event['message']
-                                await self.begin_locked(a, body)
-                                continue
-                            if event['type'] == 'done' and a.earlier:
-                                event = {**event, 'text': f'Result of the earlier task, which finished while Claude Code was disconnected:\n{a.earlier}\n\nReply to the new message:\n{event["text"]}'}
+                                try:
+                                    await self.begin_locked(a, body)
+                                    continue
+                                except Exception as error: event = {'type': 'error', 'message': self.redact(error), 'retryable': False}
+                            if event['type'] in ('done', 'error') and a.earlier:
+                                earlier = f'Result of the earlier task, which finished while Claude Code was disconnected:\n{a.earlier}\n\n'
+                                event = ({**event, 'text': f'{earlier}Reply to the new message:\n{event["text"]}'} if event['type'] == 'done'
+                                         else {**event, 'message': f'{earlier}The new message failed: {event["message"]}'})
                                 a.earlier = None
                             line = (dumps(event) + '\n').encode()
                             try:
@@ -809,7 +860,7 @@ class Daemon:
                 await self.response(writer, 200, result)
         except (BrokenPipeError, ConnectionResetError): pass
         except Exception as error:
-            if not streaming: await self.response(writer, 400 if isinstance(error, (ValueError, KeyError)) else 503, {'error': self.redact(error)})
+            if not streaming: await self.response(writer, 400 if isinstance(error, (ValueError, KeyError)) else 403 if isinstance(error, PermissionError) else 503, {'error': self.redact(error)})
         finally:
             self.connections.discard(writer)
             self.requests -= 1
@@ -891,8 +942,10 @@ class Daemon:
                 # Vendor history is kept (it is review and build evidence); codex's archive only moves it aside.
                 if a.family == 'gpt':
                     v = self.service()
-                    await v.ensure()
-                    await v.rpc('thread/archive', {'threadId': sid})
+                    try:
+                        await v.ensure()
+                        await v.rpc('thread/archive', {'threadId': sid})
+                    except Exception as error: self.log(f'codex thread {sid} not archived: {error}')
             except BaseException:
                 a.state = previous
                 raise
@@ -927,6 +980,13 @@ class Daemon:
                 writer.close()
                 await writer.wait_closed()
                 return
+            # Every request but /health and /mcp (which carries a per-agent token) needs this key. Vendor sandboxes
+            # cannot read the file (grok's profiles deny it; codex's sandbox cannot reach the socket without @net).
+            self.control = uuid.uuid4().hex
+            temporary = HOME / '.control.header'
+            temporary.write_text(f'X-Lord-Control: {self.control}\n')
+            temporary.chmod(0o600)
+            temporary.replace(HOME / 'control.header')
             SOCKET.unlink(missing_ok=True)
             server = await asyncio.start_unix_server(self.http, str(SOCKET), limit=LIMIT)
             bound = True
@@ -945,7 +1005,9 @@ class Daemon:
 async def relay(path, body=None):
     reader, writer = await asyncio.open_unix_connection(str(SOCKET), limit=LIMIT)
     payload = dumps(body).encode() if body is not None else b''
-    writer.write(f'{"POST" if body is not None else "GET"} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {len(payload)}\r\nConnection: close\r\n\r\n'.encode() + payload)
+    try: key = (HOME / 'control.header').read_text().strip() + '\r\n'
+    except OSError: key = ''
+    writer.write(f'{"POST" if body is not None else "GET"} {path} HTTP/1.1\r\nHost: localhost\r\n{key}Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n'.encode() + payload)
     try:
         await writer.drain()
         header = await reader.readuntil(b'\r\n\r\n')
@@ -1006,6 +1068,11 @@ def main():
         asyncio.run(mcp(args.mcp))
         return
     if args.daemon:
+        # A broken settings file is reported to the starting process; after the fork nothing can see it.
+        try: load_config()
+        except ValueError as error:
+            print(error, file=sys.stderr)
+            sys.exit(2)
         if os.fork(): return
         os.setsid()
         with open(os.devnull, 'r+b', buffering=0) as null:

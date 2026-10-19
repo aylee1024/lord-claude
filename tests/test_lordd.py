@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 from urllib.parse import quote
 
 import pytest
@@ -34,12 +35,13 @@ class Client:
     def __init__(self, home):
         self.home = home
 
-    def connect(self, path, body=None):
+    def connect(self, path, body=None, key=True):
         conn = socket.socket(socket.AF_UNIX)
         conn.settimeout(float(os.environ.get('LORD_TEST_TIMEOUT', '12')))
         conn.connect(str(self.home / 'lordd.sock'))
         payload = json.dumps(body).encode() if body is not None else b''
-        conn.sendall((f'{"POST" if body is not None else "GET"} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {len(payload)}\r\nConnection: close\r\n\r\n').encode() + payload)
+        header = (self.home / 'control.header').read_text().strip() + '\r\n' if key and (self.home / 'control.header').exists() else ''
+        conn.sendall((f'{"POST" if body is not None else "GET"} {path} HTTP/1.1\r\nHost: localhost\r\n{header}Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n').encode() + payload)
         file = conn.makefile('rb')
         status = int(file.readline().split()[1])
         headers = {}
@@ -83,7 +85,7 @@ class Rig(Client):
                         OPENAI_API_KEY='must-not-reach-vendor', SOME_TOKEN='must-not-reach-vendor',
                         ANTHROPIC_BASE_URL='must-not-reach-vendor', CLAUDE_CODE_FLAG='must-not-reach-vendor',
                         RANDOM_SECRET='must-not-reach-vendor', CUSTOM_BEARER='Bearer must-not-reach-vendor',
-                        S3_ACCESS_KEY='must-not-reach-vendor', DB_PASSWORD='must-not-reach-vendor', CLOUD_CREDENTIAL='must-not-reach-vendor')
+                        S3_ACCESS_KEY='must-not-reach-vendor', GROK_API_KEY='must-not-reach-vendor', LORD_SECRET='must-not-reach-vendor', DB_PASSWORD='must-not-reach-vendor', CLOUD_CREDENTIAL='must-not-reach-vendor')
         config = {family: {'model': model, 'effort': 'high', 'program': [PYTHON, str(ROOT / 'tests/fakes/vendor.py'), family, str(self.data)]}
                   for family, model in [('gpt', 'gpt-6.1-sol'), ('grok', 'grok-4.7'), ('gemini', 'gemini-3.8-flash')]}
         config['grok'].update(write_sandbox='lord-workspace', readonly_sandbox='test-readonly')
@@ -307,12 +309,16 @@ def test_daemon_fork_returns_silently_and_singleton(rig):
     assert rig.request('/health')['pid'] == first
 
 
-def test_redactor_and_environment_scrub_without_credentials(rig):
+def test_redactor_and_environment_scrub_without_credentials(rig, monkeypatch):
     spec = importlib.util.spec_from_file_location('lordd', DAEMON)
     module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
     assert module.Redactor()('trace Bearer credential-value rest') == 'trace [REDACTED] rest'
-    env = module.subscription_env({'ordinary': 'ok', 'HARNESS_API_KEY': 'bad', 'ANTHROPIC_BASE_URL': 'bad', 'SNEAKY': 'Bearer bad'})
-    assert env['ordinary'] == 'ok' and 'HARNESS_API_KEY' not in env and 'ANTHROPIC_BASE_URL' not in env and 'SNEAKY' not in env
+    inherited = {'ordinary': 'ok', 'HARNESS_API_KEY': 'bad', 'ANTHROPIC_BASE_URL': 'bad', 'SNEAKY': 'Bearer bad',
+                 'GROK_API_KEY': 'bad', 'LORD_SECRET': 'bad', 'GROK_HOME': '/g'}
+    for key, value in inherited.items(): monkeypatch.setenv(key, value)
+    env = module.subscription_env({'LORD_MCP_TOKEN': 'own'})
+    assert env['ordinary'] == 'ok' and env['GROK_HOME'] == '/g' and env['LORD_MCP_TOKEN'] == 'own'
+    assert not {'HARNESS_API_KEY', 'ANTHROPIC_BASE_URL', 'SNEAKY', 'GROK_API_KEY', 'LORD_SECRET'} & set(env)
 
 
 @pytest.mark.parametrize('family', ['gpt', 'grok'])
@@ -804,12 +810,106 @@ def test_grok_runs_only_under_lord_custom_profiles_that_fail_closed(rig):
     import tomllib
     profiles = tomllib.loads(sandbox.read_text())['profiles']
     assert profiles['mine'] == {'extends': 'strict'}
-    assert profiles['lord-workspace'] == {'extends': 'workspace'}
+    key = str((rig.home / 'control.header').resolve())
+    assert profiles['lord-workspace'] == {'extends': 'workspace', 'deny': [key]}
     assert profiles['lord-readonly']['extends'] == 'read-only' and profiles['lord-readonly']['restrict_network'] is False
-    assert '/var/run/docker.sock' in profiles['lord-readonly']['deny']
+    assert '/var/run/docker.sock' in profiles['lord-readonly']['deny'] and key in profiles['lord-readonly']['deny']
     first = sandbox.read_text()
     rig.open('grok', agent='x')
     assert sandbox.read_text() == first
+    # An end marker that lost its newline is still recognised: the block is replaced, never duplicated.
+    sandbox.write_text(first.rstrip('\n'))
+    rig.open('grok', agent='y')
+    assert sandbox.read_text() == first
+
+
+def test_a_sandbox_file_that_cannot_take_the_profiles_is_refused_unchanged(rig):
+    sandbox = rig.home / 'grok/sandbox.toml'
+    sandbox.parent.mkdir()
+    sandbox.write_text('profiles = {mine = {extends = "strict"}}\n')
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'k', 'family': 'grok', 'cwd': str(rig.home)})
+    body = json.loads(file.read()); file.close(); conn.close()
+    assert status != 200 and "cannot take Lord's grok profiles" in body['error']
+    assert sandbox.read_text() == 'profiles = {mine = {extends = "strict"}}\n'
+
+
+def test_requests_without_the_control_key_are_refused_except_health_and_mcp(rig):
+    for path, body in [('/agents', None), ('/open', {'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home)})]:
+        conn, file, status, _ = rig.connect(path, body, key=False)
+        reply = json.loads(file.read()); file.close(); conn.close()
+        assert status == 403 and 'control key' in reply['error']
+    conn, file, status, _ = rig.connect('/health', key=False)
+    file.close(); conn.close()
+    assert status == 200
+    assert (rig.home / 'control.header').stat().st_mode & 0o777 == 0o600
+
+
+def test_read_only_grok_is_refused_where_its_profile_leaves_writes(rig):
+    var_tmp = Path(tempfile.mkdtemp(dir='/var/tmp'))
+    grok_home = rig.home / 'grok'
+    grok_home.mkdir()
+    try:
+        for cwd in (var_tmp, grok_home):
+            conn, file, status, _ = rig.connect('/open', {'agentId': f'r{len(str(cwd))}', 'family': 'grok', 'cwd': str(cwd), 'readonly': True})
+            reply = json.loads(file.read()); file.close(); conn.close()
+            assert status == 400 and 'read-only profile' in reply['error']
+        # An agent opened writable in a temp folder cannot become read-only there by naming another folder.
+        rig.request('/open', {'agentId': 'w', 'family': 'grok', 'cwd': str(var_tmp)})
+        conn, file, status, _ = rig.connect('/open', {'agentId': 'w', 'family': 'grok', 'cwd': str(rig.home), 'readonly': True})
+        file.close(); conn.close()
+        assert status == 400
+    finally: var_tmp.rmdir()
+
+
+def test_a_failed_first_open_leaves_no_agent_behind(rig):
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'm', 'family': 'gpt', 'cwd': str(rig.home), 'model': 'no-such-model'})
+    file.close(); conn.close()
+    assert status == 400
+    assert rig.open('gpt', agent='m', model='gpt-6.1-sol')['model'] == 'gpt-6.1-sol'
+
+
+def test_a_missing_agy_names_how_to_install_it(rig):
+    config = json.loads(rig.config.read_text())
+    config['gemini']['program'] = [str(rig.home / 'no-such-agy')]
+    rig.config.write_text(json.dumps(config))
+    rig.stop(); rig.start()
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'g', 'family': 'gemini', 'cwd': str(rig.home)})
+    body = json.loads(file.read()); file.close(); conn.close()
+    assert status != 200 and 'antigravity.google' in body['error']
+
+
+def test_grok_and_gemini_usage_is_saved_when_the_turn_ends(rig):
+    for family in ('grok', 'gemini'):
+        rig.open(family, agent=family)
+        assert rig.turn('PING', agent=family)[-1]['type'] == 'done'
+    rig.stop(); rig.start()
+    usage = {a['agentId']: a['usage'] for a in rig.request('/agents')}
+    assert usage['grok'] is not None and usage['gemini'] is not None
+
+
+def test_spawned_vendor_only_effort_goes_as_a_directive(monkeypatch):
+    spec = importlib.util.spec_from_file_location('lordd_effort', DAEMON)
+    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+    async def main():
+        a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6.1-sol'}); a.state = 'running'
+        d = object.__new__(m.Daemon); d.log = lambda text: None
+        task = asyncio.create_task(d.mcp_call(a, 'spawn_agent', {'type': 'lord:gpt', 'prompt': 'work', 'description': 'd', 'effort': 'ultra'}, a.token))
+        event = await asyncio.wait_for(a.events.get(), 2); task.cancel()
+        return event['input']
+    data = asyncio.run(main())
+    assert data['prompt'] == '@effort ultra\nwork' and 'effort' not in data
+
+
+def test_a_late_completion_of_an_earlier_codex_turn_is_ignored():
+    spec = importlib.util.spec_from_file_location('lordd_late', DAEMON)
+    m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+    async def main():
+        a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6.1-sol', 'vendorSession': 's'})
+        a.state, a.turn_id = 'running', 'new'
+        d = object.__new__(m.Daemon); d.agents = {'a': a}; d.redact = str
+        m.Vendor(d, 'gpt', a).notification({'method': 'turn/completed', 'params': {'threadId': 's', 'turn': {'id': 'old', 'status': 'interrupted'}}})
+        return a.state, a.events.empty()
+    assert asyncio.run(main()) == ('running', True)
 
 
 def test_user_config_is_merged_over_the_bundled_defaults(tmp_path, monkeypatch):
@@ -831,3 +931,81 @@ def test_a_missing_vendor_program_names_how_to_install_it(rig):
     conn, file, status, _ = rig.connect('/open', {'agentId': 'm', 'family': 'gpt', 'cwd': str(rig.home)})
     body = json.loads(file.read()); file.close(); conn.close()
     assert status != 200 and 'was not found' in body['error'] and 'codex login' in body['error']
+
+
+def load(name):
+    spec = importlib.util.spec_from_file_location(name, DAEMON)
+    module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+    return module
+
+
+def test_a_refused_followup_ends_the_stream_with_the_earlier_result_and_the_reason(rig):
+    rig.open('gpt')
+    stream = rig.stream('/turn', {'agentId': 'a', 'text': 'SLOW'})
+    assert next(stream)['type'] == 'activity'
+    stream.close()
+    time.sleep(.3)
+    assert rig.request('/steer', {'agentId': 'a', 'text': 'detached-result'})['steered']
+    last = rig.turn('PING', model='no-such-model')[-1]
+    assert last['type'] == 'error' and 'detached-result' in last['message'] and 'no-such-model' in last['message']
+    assert rig.turn('PING')[-1]['text'] == 'PONG'
+
+
+def test_an_interrupt_before_dispatch_leaves_nothing_to_deliver():
+    m = load('lordd_dispatch')
+    async def main():
+        a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6.1-sol'})
+        a.state = 'running'; a.finished.clear()
+        d = object.__new__(m.Daemon); d.backend = lambda a: None; d.redact = str
+        asyncio.create_task(d.run_turn(a, {'text': 'cancelled'}))
+        await d.interrupt(a)
+        await asyncio.sleep(.05)
+        return a.undelivered()
+    assert asyncio.run(main()) is False
+
+
+def test_a_reconnect_offers_a_queued_tool_call_once():
+    m = load('lordd_reconnect')
+    async def main():
+        a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6.1-sol'})
+        a.state = 'waiting_tool'; a.calls['c'] = asyncio.get_running_loop().create_future(); a.call_data['c'] = ('Agent', {'prompt': 'child'})
+        a.events.put_nowait({'type': 'tool', 'callId': 'c', 'name': 'Agent', 'input': {'prompt': 'child'}})
+        d = object.__new__(m.Daemon); d.agents = {'a': a}; d.connections = set(); d.requests = 0; d.redact = str; d.control = 'k'
+        class Writer:
+            data = b''
+            def write(self, data): self.data += data
+            async def drain(self): pass
+            def close(self): pass
+            async def wait_closed(self): pass
+        reader, writer = asyncio.StreamReader(), Writer()
+        payload = json.dumps({'agentId': 'a', 'text': 'next'}).encode()
+        reader.feed_data(b'POST /turn HTTP/1.1\r\nX-Lord-Control: k\r\nContent-Length: ' + str(len(payload)).encode() + b'\r\n\r\n' + payload)
+        await d.http(reader, writer)
+        return writer.data.count(b'"callId":"c"'), a.events.empty(), a.carry
+    assert asyncio.run(main()) == (1, True, [])
+
+
+def test_waiting_for_a_lord_tool_does_not_count_as_vendor_silence():
+    m = load('lordd_silence')
+    async def main():
+        a = m.Agent({'agentId': 'a', 'family': 'grok', 'cwd': '.', 'model': 'grok-4.7'})
+        a.state = 'waiting_tool'; a.calls['c'] = asyncio.get_running_loop().create_future()
+        d = object.__new__(m.Daemon); d.config = {'idle_exit_s': 600, 'grok': {'no_progress_s': 1}}; d.log = lambda t: None
+        v = m.Vendor(d, 'grok', a); v.process = types.SimpleNamespace(pid=123456789, returncode=None); v.last = time.monotonic() - 10
+        d.agents, d.vendors = {'a': a}, {'a': v}
+        await d.route('POST', '/tool_result', {'agentId': 'a', 'callId': 'c', 'text': 'child finished'})
+        return time.monotonic() - v.last < 1
+    assert asyncio.run(main())
+
+
+def test_agy_narration_before_a_tool_step_is_not_the_answer():
+    m = load('lordd_agy')
+    a = m.Agent({'agentId': 'g', 'family': 'gemini', 'cwd': '.', 'model': 'gemini-4-argon'}); a.state = 'running'
+    d = object.__new__(m.Daemon); d.agents = {'g': a}; d.redact = str; d.save = lambda a: None
+    v = m.Vendor(d, 'gemini', a)
+    v.notification({'event': 'step_update', 'step_update': {'step_type': 'agent_response', 'text_delta': 'narration'}})
+    v.notification({'event': 'step_update', 'step_update': {'step_type': 'run_command', 'command': 'ls'}})
+    v.notification({'event': 'result', 'result': {'status': 'SUCCESS', 'response': '', 'usage': {}}})
+    events = []
+    while not a.events.empty(): events.append(a.events.get_nowait())
+    assert events[-1] == {**events[-1], 'type': 'done', 'text': ''}
