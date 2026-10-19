@@ -443,6 +443,27 @@ test('the first turn\'s @cwd stays the folder for later turns', async ($, on) =>
   expect(w.requests.filter(x => x.path === '/open').map(x => x.body.cwd)).toEqual(['/pins/r1', '/pins/r1', '/pins/r1'])
 })
 
+test('a named lord launch is refused, since it would start a Claude teammate instead of the vendor', async ($, on) => {
+  const w = world(on)
+  const named = await $.tool.call({ tool: 'Agent', tool_use_id: 'n1', subagent_type: 'lord:gpt', name: 'builder', prompt: 'task', description: 'test' } as any)
+  expect(named.deny).toMatch(/^lord agents cannot be named/)
+  const unnamed = await $.tool.call({ tool: 'Agent', tool_use_id: 'n2', subagent_type: 'lord:gpt', prompt: 'task', description: 'test' } as any)
+  expect(unnamed.deny).toBeUndefined()
+  // Claude's own named agents are left alone.
+  expect((await $.tool.call({ tool: 'Agent', tool_use_id: 'n3', subagent_type: 'general-purpose', name: 'helper', prompt: 'task', description: 'test' } as any)).deny).toBeUndefined()
+})
+
+test('a resumed agent keeps the folder it opened in, not the session folder', async ($, on) => {
+  const w = world(on)
+  await spawn($)
+  await $.classic.SubagentStart({ agent_id: 'a1', agent_type: 'lord:gpt', cwd: '/home' } as any)
+  await step($, '@cwd /pins/r1\nfirst')
+  // A message to an agent whose turn ended resumes it through agent.spawn, with the session's folder.
+  await $.agent.spawn({ tool_use_id: 'resume1', prompt: 'continue', description: 'test', subagentType: 'lord:gpt', provider: { plugin: 'lord', tier: 'user' }, parentModel: 'haiku', background: true, fork: false, cwd: '/home', resume: { agentId: 'a1' } } as any)
+  await step($, 'continue')
+  expect(w.requests.filter(x => x.path === '/open').map(x => x.body.cwd)).toEqual(['/pins/r1', '/pins/r1'])
+})
+
 test('a rejected StructuredOutput object is corrected once, then ends with a visible error', async ($, on) => {
   const w = world(on, [{ type: 'done', text: '{"bad":true}' }])
   await spawn($)

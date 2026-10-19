@@ -249,6 +249,7 @@ def test_a_failed_gpt_turn_gives_the_next_turn_a_new_codex_on_the_same_thread(ri
     rig.turn('persistent-word')
     failed = rig.turn('FAIL')[-1]
     assert failed['type'] == 'error' and 'failed to load workspace requirements' in failed['message']
+    assert 'the next turn starts a new codex' in failed['message']
     assert rig.turn('REMEMBER')[-1]['text'] == 'persistent-word'
     assert rig.open('gpt')['vendorSession'] == session
     assert len([e for e in rig.audit() if e.get('launch')]) == 2
@@ -792,6 +793,8 @@ def test_activity_is_logged_per_agent_and_listed(rig):
     rig.turn('PING')
     entry = rig.request('/agents')[0]
     assert 'fake work' in Path(entry['log']).read_text() and entry['usage']['output_tokens'] >= 0
+    # Each turn's log names the model and effort that ran.
+    assert f"turn: gpt {entry['model']} effort {entry['effort']}" in Path(entry['log']).read_text()
 
 
 def test_a_later_readonly_reattaches_with_the_read_only_sandbox(rig):

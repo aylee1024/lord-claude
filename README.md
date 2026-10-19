@@ -44,6 +44,8 @@ You can also put options on their own lines at the start of a task or message:
 
 Where each agent can write: gpt in its folder, `@dir` folders and temp folders; grok in its folder, temp folders and `~/.grok`; gemini anywhere, because agy has no sandbox. A sandbox limits one agent, not the agents it starts, so use `@readonly` when an agent must not change anything. A read-only agent cannot start or message other agents.
 
+Launch Lord agents without a `name`: a named launch would start a separate Claude process instead of the vendor, so Lord refuses it. Message an agent by the id its launch returns; it keeps its working folder across messages.
+
 Type `/lord` to see your agents, the model and effort each ran with, their token use, and each agent's activity log.
 
 ## How it works

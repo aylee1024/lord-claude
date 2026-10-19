@@ -75,7 +75,8 @@ waits undelivered, for up to `keep_undelivered_s` (a day).
 - A vendor program that is not found on the session PATH ends the request with an error naming how to install and sign
   in, before Lord writes anything for it (grok profiles, the agy entry).
 - A vendor that is not signed in (codex answers a turn with 401 Unauthorized, grok a new session with "Authentication
-  required") gets the sign-in step added to its error.
+  required") gets the sign-in step added to its error; codex's "failed to load workspace requirements" says the
+  settings reload failed and that the next turn starts a new codex.
 - Environment scrub for every vendor: no inherited `*KEY*`, `*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*CREDENTIAL*`,
   `ANTHROPIC_*`, `CLAUDE_CODE_*`, bearer values, whatever their prefix; the daemon's own settings (agent id, MCP token,
   grok import switches) are added after the scrub. Subscription logins only; auth files are
@@ -86,7 +87,7 @@ Every `guard_interval_s` (5 s): an agent's whole process tree over `memory_ceili
 the family's `no_progress_s` while running (grok and gemini 2400 s, gpt off), is killed (per agent: `memory_gb`,
 `hang_s`), or a turn past its `wall_s`; progress is vendor stdout since the turn's dispatch (stderr is logging); the turn ends with an error naming
 the reason. Every stop kills the vendor's whole process tree by pid as well as its group. A failed vendor start is
-retried once; a crash, or a codex turn that ends failed, restarts the vendor on the next turn, never in a loop. A process idle for `process_idle_s`
+retried once; a crash, or a codex turn that ends failed, restarts the vendor on the next turn, never in a loop. Each turn's activity log starts with a `turn: <family> <model> effort <effort>` line. A process idle for `process_idle_s`
 (default `idle_exit_s`) is closed, the account-usage codex process included, and its session resumed on the next turn.
 
 ## Lord tools given to every vendor session (MCP, `lordd.py --mcp [agentId]`)
@@ -98,7 +99,9 @@ goes as an `@model` first line); `send_message(to, text)` becomes SendMessage; `
 ## Mod behaviour
 - Agent ids map to families from `agent.spawn`, or after a module reload from `$.agent.list()`, else the daemon's
   `/agents`; cwd from `classic.SubagentStart` (worktrees included). An Agent call with `isolation: "worktree"` whose
-  worktree path never arrives ends with an error instead of running in the main tree.
+  worktree path never arrives ends with an error instead of running in the main tree. A resumed run (`agent.spawn`
+  with `resume`) keeps the folder an opened agent already has. A lord Agent call with `name` is denied: it would
+  start an agent-team teammate in its own Claude process.
 - Turn text from `turn.start`, with the Workflow header, the coordinator envelope and task notifications unwrapped.
   First-line directives, removed before the vendor reads the text: `@model <id>`, `@effort <level>` (persists; beats
   the Agent call's effort, which only reaches low to max), `@readonly`, `@net`, `@cwd <path>`

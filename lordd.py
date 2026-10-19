@@ -46,6 +46,9 @@ def sign_in_hint(family, text):
     # Without a login codex answers a turn with "401 Unauthorized" and grok a new session with "Authentication required";
     # neither says how to sign in.
     text = str(text)
+    if family == 'gpt' and 'failed to load workspace requirements' in text:
+        # A running codex fails every later turn once a reload of its settings fails, as after an edit to its config.
+        return f'{text} (codex could not reload its settings, as after an edit to ~/.codex/config.toml; the next turn starts a new codex on the same conversation)'
     return f'{text} ({SIGN_IN[family]})' if re.search(r'\b401\b|Unauthorized|Authentication required', text) else text
 
 # grok imports Claude Code's tool servers, hooks and skills by default; a lord agent keeps grok's own setup only.
@@ -259,6 +262,12 @@ class Agent:
         self.default_model = False
         self.log_path = HOME / 'logs' / f"{record['agentId']}.log"
 
+    def note(self, text):
+        # The agent's activity log: what the vendor ran and read, for review provenance.
+        self.log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not self.log_path.exists() or self.log_path.stat().st_size < 4 * 1024 * 1024:
+            with self.log_path.open('a') as file: file.write(f'{datetime.now(timezone.utc).isoformat()} {REDACT(text)[:2000]}\n')
+
     def undelivered(self):
         return bool(self.carry) or not self.events.empty()
 
@@ -267,10 +276,7 @@ class Agent:
         if kind == 'text': self.answer += value['text']
         if kind == 'activity':
             self.activity = value['text'][:300]
-            # The agent's activity log: what the vendor ran and read, for review provenance.
-            self.log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            if not self.log_path.exists() or self.log_path.stat().st_size < 4 * 1024 * 1024:
-                with self.log_path.open('a') as file: file.write(f'{datetime.now(timezone.utc).isoformat()} {REDACT(value["text"])[:2000]}\n')
+            self.note(value['text'])
         if kind == 'error': value['message'] = sign_in_hint(self.family, value['message'])
         if kind in ('done', 'error'):
             self.state, self.activity = 'idle', ''
@@ -777,6 +783,7 @@ class Daemon:
         a.base, a.tokens, a.turn_id = dict(a.total), usage({}), None
         a.finished.clear()
         a.dispatched = False
+        a.note(f'turn: {a.family} {a.model} effort {a.effort}')
         self.save(a)
         a.turn_task = self.task(self.run_turn(a, body))
 

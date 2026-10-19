@@ -267,7 +267,8 @@ export const register: Register = on => {
     const r = await next(e)
     if (e.subagentType.startsWith('lord:') && r.agentId) {
       const previous = agents.get(r.agentId)
-      agents.set(r.agentId, { ...previous, family: e.subagentType.slice(5), cwd: directories.get(r.agentId) ?? e.cwd ?? previous?.cwd,
+      // A resumed run arrives with the session's folder; an agent that already opened keeps its own.
+      agents.set(r.agentId, { ...previous, family: e.subagentType.slice(5), cwd: previous?.opened ? previous.cwd : directories.get(r.agentId) ?? e.cwd ?? previous?.cwd,
         worktree: previous?.worktree || isolated.has(e.tool_use_id) })
       isolated.delete(e.tool_use_id)
     }
@@ -412,6 +413,9 @@ export const register: Register = on => {
   })
 
   on('tool.call', { tool: ['Agent', 'SendMessage', 'StructuredOutput'] }, async ($, e, next) => {
+    // A named Agent call starts an agent-team teammate in its own Claude process, whose turns no Lord hook answers.
+    if (e.tool === 'Agent' && String((e as any).subagent_type ?? '').startsWith('lord:') && (e as any).name)
+      return { deny: `lord agents cannot be named: a named Agent call starts a separate Claude process instead of ${String((e as any).subagent_type).slice(5)}. Launch it without name and message it by the agent id the launch returns.` }
     if (e.tool === 'Agent' && String((e as any).subagent_type ?? '').startsWith('lord:') && (e as any).isolation === 'worktree') isolated.add(e.tool_use_id)
     const r = await next(e)
     const agent = e.agentId ? agents.get(e.agentId) : undefined
