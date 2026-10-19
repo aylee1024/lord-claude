@@ -15,3 +15,7 @@ private/
 
 # Lord test daemon state
 *.jsonl
+
+# Written by Claude Code when it loads the plugin from this folder
+/tsconfig.json
+.claude-plugin/types/
