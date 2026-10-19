@@ -73,7 +73,7 @@ Guards: an agent whose processes exceed the memory ceiling, stay silent past `@h
 
 Worktree isolation needs Lord's `SubagentStart` hook, which reports the worktree's path; where an organization manages Claude Code and runs only managed hooks, an agent launched with `isolation: "worktree"` refuses to run rather than work in the main tree.
 
-Settings: `~/.claude/lord/config.json` is merged over the plugin's [`config.json`](config.json), one vendor at a time, for example `{"grok": {"model": "grok-4.7"}}`.
+Settings: `~/.claude/lord/config.json` is merged over the plugin's [`config.json`](config.json), one vendor at a time, for example `{"grok": {"model": "grok-4.7"}}`. A vendor's `effort` there applies only when Claude Code sends no effort of its own (the agent definitions send `high`).
 
 ## What Lord runs, stores and sends
 

@@ -1129,3 +1129,16 @@ def test_a_failed_agy_listing_is_not_cached_and_ultra_stays_in_range():
         await d.effort(a, 'ultra')
         return first, second, a.effort
     assert asyncio.run(main()) == (m.EFFORTS, ['low', 'high'], 'max')
+
+
+def test_an_interrupt_after_a_detached_turn_finished_discards_its_result(rig):
+    rig.open('gpt')
+    stream = rig.stream('/turn', {'agentId': 'a', 'text': 'SLOW'})
+    assert next(stream)['type'] == 'activity'
+    stream.close()
+    time.sleep(.3)
+    assert rig.request('/steer', {'agentId': 'a', 'text': 'detached-result'})['steered']
+    deadline = time.monotonic() + 5
+    while rig.request('/agents')[0]['state'] != 'idle' and time.monotonic() < deadline: time.sleep(.05)
+    rig.request('/interrupt', {'agentId': 'a'})
+    assert rig.turn('PING')[-1]['text'] == 'PONG'

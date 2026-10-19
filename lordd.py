@@ -736,9 +736,10 @@ class Daemon:
             except TimeoutError:
                 await kill_tree(v.process)
                 a.emit('error', message='interrupted', retryable=False)
-            if not a.stream_lock.locked():
-                a.carry.clear()
-                while not a.events.empty(): a.events.get_nowait()
+        # An interrupted turn leaves nothing to deliver, also when it finished just before the interrupt arrived.
+        if not a.stream_lock.locked():
+            a.carry.clear()
+            while not a.events.empty(): a.events.get_nowait()
 
     def listed(self):
         return [{**{k: getattr(a, k) for k in ('agentId', 'family', 'model', 'effort', 'state', 'activity', 'cwd')},
