@@ -1098,3 +1098,34 @@ def test_an_earlier_codex_turn_completing_before_the_new_turn_id_is_ignored():
         m.Vendor(d, 'gpt', a).notification({'method': 'turn/completed', 'params': {'threadId': 's', 'turn': {'id': 'old', 'status': 'interrupted'}}})
         return a.state, a.events.empty()
     assert asyncio.run(main()) == ('running', True)
+
+
+def test_path_refusals_ignore_letter_case_on_macos(rig):
+    if sys.platform != 'darwin': pytest.skip('case-insensitive volumes are the macOS default')
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'h', 'family': 'gpt', 'cwd': str(Path.home()).upper()})
+    reply = json.loads(file.read()); file.close(); conn.close()
+    assert status == 400 and 'home folder' in reply['error']
+    grok_home = rig.home / 'grok'
+    grok_home.mkdir()
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'r', 'family': 'grok', 'cwd': str(grok_home).upper(), 'readonly': True})
+    reply = json.loads(file.read()); file.close(); conn.close()
+    assert status == 400 and 'read-only profile' in reply['error']
+
+
+def test_a_failed_agy_listing_is_not_cached_and_ultra_stays_in_range():
+    m = load('lordd_agy_list')
+    async def main():
+        d = object.__new__(m.Daemon); d.agy_levels, d.agy_models = {}, set(); d.config = {'gemini': {'program': 'agy'}}; d.log = lambda t: None
+        calls = []
+        async def quick(argv, timeout=20):
+            calls.append(argv)
+            return (1, 'down') if len(calls) == 1 else (0, 'gemini-4-argon-low\ngemini-4-argon-high\n')
+        m.run_quick = quick
+        first = await d.agy_efforts('gemini-4-argon')
+        second = await d.agy_efforts('gemini-4-argon')
+        a = m.Agent({'agentId': 'g', 'family': 'gemini', 'cwd': '.', 'model': 'gemini-4-argon'})
+        d.agy_levels = {}
+        m.run_quick = lambda argv, timeout=20: asyncio.sleep(0, (1, 'down'))
+        await d.effort(a, 'ultra')
+        return first, second, a.effort
+    assert asyncio.run(main()) == (m.EFFORTS, ['low', 'high'], 'max')

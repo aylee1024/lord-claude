@@ -26,7 +26,10 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
     }
     return { value: { code: 0, signal: null } }
   })
-  on('agent.spawn', (_, e) => { spawned = e.subagentType; return { agentId: 'a1', model: 'haiku' } })
+  // Like the real daemon, an agent spawned in this session is listed only after its /open; without a spawn the
+  // test stands for a module reload and the daemon already holds the agent's settings.
+  let fresh = false
+  on('agent.spawn', (_, e) => { spawned = e.subagentType; fresh = true; return { agentId: 'a1', model: 'haiku' } })
   on('classic.SubagentStart', () => ({}))
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', (_, e) => ({ text: e.answer }))
@@ -45,7 +48,9 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
     if (socket === '/down.sock') return { deny: 'socket unavailable' }
     if (path === '/open' && JSON.parse(e.init!.body!).dirs?.includes('/bad')) return { value: { ok: false, status: 400, headers: {}, text: JSON.stringify({ error: 'every @dir must be an existing directory' }) } }
     if (path === '/health' && failures-- > 0) return { deny: 'socket unavailable' }
-    const result = path === '/agents' ? [{ agentId: 'a1', family: 'gpt', state: 'running', effort: 'ultra', model: 'fake-gpt', cwd: '/pinned' }]
+    if (path === '/agents' && failures > 0) return { deny: 'socket unavailable' }
+    const result = path === '/agents' ? (!fresh ? [{ agentId: 'a1', family: 'gpt', state: 'running', effort: 'ultra', model: 'fake-gpt', cwd: '/pinned' }]
+        : requests.some(x => x.path === '/open') ? [{ agentId: 'a1', family: 'gpt', state: 'running' }] : [])
       : path === '/usage' ? { chatgpt: { usedPercent: 47 } }
       : path === '/health' ? { ok: true }
       : path === '/open' ? { vendorSession: 'v1', model: 'fake-gpt', effort: 'high' }
@@ -197,10 +202,11 @@ test('status refresh and slash model override apply without polling', async ($, 
   await $.session.start({ cwd: '/repo' })
   expect(w.statuses).toContain('lord: 1 gpt · ChatGPT 47%')
   await spawn($)
+  await step($, 'hello')
   const changed = await $.command.run({ command: 'lord', args: 'model a1 chosen-model' })
   expect(changed.text).toMatch(/chosen-model/)
-  await step($, 'hello')
-  expect(w.requests.find(x => x.path === '/turn')?.body.model).toBe('chosen-model')
+  await step($, 'again')
+  expect(w.requests.filter(x => x.path === '/turn').at(-1)?.body.model).toBe('chosen-model')
   const listed = await $.command.run({ command: 'lord', args: '' })
   expect(listed.text).toMatch(/a1/)
   const count = w.requests.length
@@ -438,4 +444,13 @@ test('a SubagentStart after a reload does not replace the folder the daemon keep
   await $.classic.SubagentStart({ agent_id: 'a1', agent_type: 'lord:gpt', cwd: '/repo' } as any)
   await step($, 'continue')
   expect(w.requests.find(x => x.path === '/open')!.body.cwd).toBe('/pinned')
+})
+
+test('an agent restored while the daemon was down gets its settings once the daemon starts', async ($, on) => {
+  const w = world(on, [{ type: 'done', text: 'connected' }], 2, null)
+  const response = step($, 'continue')
+  await w.clock.advance(1000)
+  expect((await response).result.answer).toBe('connected')
+  const open = w.requests.find(x => x.path === '/open')!.body
+  expect([open.effort, open.cwd]).toEqual(['ultra', '/pinned'])
 })

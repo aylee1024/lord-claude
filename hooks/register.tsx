@@ -294,10 +294,15 @@ export const register: Register = on => {
         const input = merge(agent.pending ?? { text: '' }, started)
         input.text = started.text
         delete agent.pending
-        const chosen = merge({ text: '', model: agent.model, effort: agent.effort, readonly: agent.readonly, net: agent.net, dirs: agent.dirs, limits: agent.limits }, input)
         agent.structured = undefined
         agent.corrected = false
         await connect($, next.signal)
+        // An agent restored while the daemon was down learns the daemon's settings once it is up.
+        if (!agent.opened) {
+          const known = await request($, '/agents').then(text => JSON.parse(text).find((a: any) => a.agentId === agentId), () => undefined)
+          if (known) Object.assign(agent, { opened: true, cwd: known.cwd, effort: agent.effort ?? known.effort, model: agent.model ?? known.model })
+        }
+        const chosen = merge({ text: '', model: agent.model, effort: agent.effort, readonly: agent.readonly, net: agent.net, dirs: agent.dirs, limits: agent.limits }, input)
         // A task can name the vendor's working folder; it is fixed at the first turn.
         if (input.cwd && agent.opened && input.cwd !== agent.cwd) throw new Error(`@cwd is fixed at the first turn (${agent.cwd})`)
         if (agent.worktree && !input.cwd && !directories.get(agentId)) throw new Error('worktree isolation was requested but Claude Code reported no worktree path; refusing to run in the main tree')

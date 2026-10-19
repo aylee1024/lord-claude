@@ -100,8 +100,12 @@ def grok_profiles():
 
 TEMP_ROOTS = ('/tmp', '/private/tmp', '/var/tmp', '/private/var/tmp', '/var/folders', '/private/var/folders')
 
+def fold(path):
+    # macOS volumes are case-insensitive by default, so /Users/Name/.GROK is ~/.grok there.
+    return path.lower() if sys.platform == 'darwin' else path
+
 def inside(path, roots):
-    return any(path == root or path.startswith(root.rstrip('/') + '/') for root in roots)
+    return any(fold(path) == fold(root) or fold(path).startswith(fold(root).rstrip('/') + '/') for root in roots)
 
 async def run_quick(argv, timeout=20):
     # Helper CLI calls are bounded: a wedged one must not hold the daemon.
@@ -555,7 +559,10 @@ class Daemon:
             code, out = await run_quick([*program, 'models'])
             ids = {line.split('\t')[0].strip() for line in out.splitlines()} if code == 0 else set()
             self.agy_models.update(i.rsplit('-', 1)[0] for i in ids if i.rsplit('-', 1)[-1] in EFFORTS)
-            if code != 0: self.log(f'agy models failed: {out}')
+            if code != 0:
+                # Not cached: the next open asks agy again. Until then agy's own --effort range applies.
+                self.log(f'agy models failed: {out}')
+                return EFFORTS
             self.agy_levels[model] = [v for v in EFFORTS if f'{model}-{v}' in ids]
         if self.agy_models and model not in self.agy_models:
             raise ValueError(f'unknown gemini model {model}; agy lists {", ".join(sorted(self.agy_models))}')
@@ -570,7 +577,7 @@ class Daemon:
                 raise ValueError({'grok': "@dir is not available for grok: its sandbox confines writes to the working folder; use @cwd",
                                   'gemini': '@dir is not needed for gemini: agy has no sandbox and can write outside its folder'}[family])
             cwd = str(Path(body['cwd']).expanduser().resolve(strict=True))
-            if cwd in ('/', str(Path.home())):
+            if cwd == '/' or os.path.samefile(cwd, Path.home()):
                 raise ValueError('refusing / or the home folder as a working folder: start Claude Code in a project folder, or put "@cwd <folder>" on the first line of the task')
             a = self.agents.get(aid)
             readonly = body.get('readonly') or bool(a and a.record.get('readonly'))
@@ -948,7 +955,9 @@ class Daemon:
                 v.reason = f'stopped: the turn ran past its {wall} s wall-clock limit'
             else: continue
             self.log(f'{a.agentId}: {v.reason}')
-            # The whole tree, since tool commands may leave the vendor's process group.
+            # The vendor's process group and every descendant by pid, since tool commands may leave the group.
+            try: os.killpg(v.process.pid, signal.SIGKILL)
+            except ProcessLookupError: pass
             signal_all(pids, signal.SIGKILL)
 
     async def prune(self, days):
