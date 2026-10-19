@@ -81,8 +81,18 @@ function result(e: TurnStepInput, answer: string): TurnStepResult {
   return { turnId: e.turnId, index: e.index, answer, toolUses: [], stopReason: 'end_turn', usage: null }
 }
 
+async function defaultSocket($: EngineInterface): Promise<string> {
+  // Each plugin version has its own daemon, so an update never waits for agents an older daemon is running.
+  return `${await $.env.get('HOME')}/.claude/lord/lordd-${await version($) ?? '0'}.sock`
+}
+
 async function socket($: EngineInterface): Promise<string> {
-  return await $.env.get('LORD_DAEMON_SOCKET') || `${await $.env.get('HOME')}/.claude/lord/lordd.sock`
+  return await $.env.get('LORD_DAEMON_SOCKET') || await defaultSocket($)
+}
+
+async function daemonOf($: EngineInterface, agent: LordAgent): Promise<string> {
+  // The daemon running the agent's turn; a turn opened before 2.0.18 ran on the one socket every version shared.
+  return agent.daemon ?? (await $.env.get('LORD_DAEMON_SOCKET') || `${await $.env.get('HOME')}/.claude/lord/lordd.sock`)
 }
 
 async function keyFile($: EngineInterface): Promise<string> {
@@ -92,7 +102,7 @@ async function keyFile($: EngineInterface): Promise<string> {
 
 let pluginVersion: Promise<string | undefined> | undefined
 function version($: EngineInterface): Promise<string | undefined> {
-  // Sent with /open: a daemon older than this plugin exits once idle, and the next turn starts this version's.
+  // Names this version's daemon socket, and is sent with /open: a daemon older than a plugin on its socket exits once idle.
   pluginVersion ??= $.fs.read(`${$.plugin.root}/.claude-plugin/plugin.json`).then(text => JSON.parse(String(text)).version, () => undefined)
   return pluginVersion
 }
@@ -156,10 +166,11 @@ async function reloadIfUpdated($: EngineInterface): Promise<void> {
   }).catch(() => $.ui.toast(`Lord Claude ${reloading} is installed: run /reload-plugins --force to load it`))
 }
 
-async function request($: EngineInterface, path: string, body?: unknown): Promise<string> {
+// `at` is the socket of the daemon running an agent's turn: a reload onto a newer version mid-turn must still reach it.
+async function request($: EngineInterface, path: string, body?: unknown, at?: string): Promise<string> {
   const key = await $.fs.read(await keyFile($)).then(text => /^X-Lord-Control:\s*(\S+)/.exec(String(text))?.[1], () => undefined)
   const response = await $.http.fetch('http://lord' + path, {
-    socketPath: await socket($), method: body === undefined ? 'GET' : 'POST',
+    socketPath: at ?? await socket($), method: body === undefined ? 'GET' : 'POST',
     headers: { 'Content-Type': 'application/json', ...(key ? { 'X-Lord-Control': key } : {}) },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   })
@@ -183,11 +194,11 @@ function json(text: string): Record<string, unknown> | undefined {
   return undefined
 }
 
-async function* events($: EngineInterface, path: string, body: unknown): AsyncGenerator<any, void> {
+async function* events($: EngineInterface, path: string, body: unknown, at?: string): AsyncGenerator<any, void> {
   // The engine's HTTP API returns a complete body; curl exposes NDJSON as it arrives.
   const child = $.process.spawn({
     argv: ['/usr/bin/curl', '--disable', '--silent', '--show-error', '--no-buffer', '--fail-with-body', '--noproxy', '*',
-      '--connect-timeout', '5', '--unix-socket', await socket($), '--request', 'POST',
+      '--connect-timeout', '5', '--unix-socket', at ?? await socket($), '--request', 'POST',
       '--header', 'Content-Type: application/json', '--header', '@' + await keyFile($), '--data-binary', '@-', 'http://lord' + path],
     input: JSON.stringify(body),
   })
@@ -226,7 +237,7 @@ async function* events($: EngineInterface, path: string, body: unknown): AsyncGe
 async function connect($: EngineInterface, signal: AbortSignal): Promise<void> {
   try { await request($, '/health'); return } catch (error) {
     // Only the default socket belongs to the daemon this plugin starts; a test socket is never auto-started.
-    if (signal.aborted || await socket($) !== `${await $.env.get('HOME')}/.claude/lord/lordd.sock`) throw error
+    if (signal.aborted || await socket($) !== await defaultSocket($)) throw error
   }
   // The daemon forks and exits 0 at once. A missing interpreter, or exit 3 (older than 3.11), tries the next one;
   // any other failure (a broken ~/.claude/lord/config.json) is reported with the daemon's message.
@@ -265,7 +276,7 @@ async function steer($: EngineInterface, agentId: string, text: string): Promise
   agent.pending = merge({ text: '', ...agent.pending }, options)
   await keep($, agentId)
   try {
-    const response = JSON.parse(await request($, '/steer', { agentId, text: parsed.text }))
+    const response = JSON.parse(await request($, '/steer', { agentId, text: parsed.text }, await daemonOf($, agent)))
     return response.steered === true
   } catch { return false }
 }
@@ -295,8 +306,8 @@ async function lordAgent($: EngineInterface, agentId: string): Promise<Agent | u
   return agents.get(agentId)
 }
 
-async function* vendorTurn($: EngineInterface, path: string, body: unknown, stream: Stream): AsyncGenerator<any, Outcome> {
-  for await (const event of events($, path, body)) {
+async function* vendorTurn($: EngineInterface, path: string, body: unknown, stream: Stream, at?: string): AsyncGenerator<any, Outcome> {
+  for await (const event of events($, path, body, at)) {
     if (typeof event !== 'object' || event === null) throw new Error('invalid daemon event')
     if (event.type === 'activity' && typeof event.text === 'string') {
       stream.live = -1
@@ -415,9 +426,10 @@ export const register: Register = on => {
         Object.assign(agent, { model: chosen.model, effort: chosen.effort, readonly: chosen.readonly, net: chosen.net, nosandbox: chosen.nosandbox, dirs: chosen.dirs, limits: chosen.limits })
         agent.opened = true
         agent.cwd = cwd
+        agent.daemon = await socket($)
         outcome = yield* vendorTurn($, '/turn', { agentId, text: input.text, model: agent.model, effort: agent.effort ?? e.effort }, stream)
       } else if (agent.continuing) {
-        outcome = yield* vendorTurn($, '/continue', { agentId }, stream)
+        outcome = yield* vendorTurn($, '/continue', { agentId }, stream, await daemonOf($, agent))
       } else {
         // A later step with no lord tool behind it is the engine asking for the StructuredOutput call that a
         // Workflow schema requires. The schema itself reaches only the system prompt, which vendors never see,
@@ -438,7 +450,7 @@ export const register: Register = on => {
           agent.corrected = true
           const text = verdict ? `That JSON was rejected: ${verdict.text}\nReply with only the corrected JSON object.`
             : 'Reply with only a JSON object holding your answer, with no other text.'
-          outcome = yield* vendorTurn($, '/turn', { agentId, text, model: agent.model, effort: agent.effort ?? e.effort }, stream)
+          outcome = yield* vendorTurn($, '/turn', { agentId, text, model: agent.model, effort: agent.effort ?? e.effort }, stream, await daemonOf($, agent))
           if (!outcome.tool) {
             agent.lastAnswer = stream.answer
             value = json(stream.answer)
@@ -482,7 +494,7 @@ export const register: Register = on => {
       agent.continuing = false
       await keep($, agentId).catch(() => {})
       if (next.signal.aborted) {
-        if (!ending) try { await request($, '/interrupt', { agentId }) } catch {}
+        if (!ending) try { await request($, '/interrupt', { agentId }, await daemonOf($, agent)) } catch {}
         throw error
       }
       // The result is the error alone, so a partial answer is never mistaken for a finished one; the
@@ -496,7 +508,7 @@ export const register: Register = on => {
     // A lord agent's turn never falls back to the stand-in model; anything else passes through.
     if (!e.agentId || !agents.has(e.agentId)) return yield* next(e)
     if (next.signal.aborted) {
-      if (!ending) try { await request($, '/interrupt', { agentId: e.agentId }) } catch {}
+      if (!ending) try { await request($, '/interrupt', { agentId: e.agentId }, await daemonOf($, agents.get(e.agentId)!)) } catch {}
       throw new Error('Lord turn interrupted')
     }
     const line = 'lord: error: turn hook failed'
@@ -529,7 +541,7 @@ export const register: Register = on => {
     } else if (agent && (pending.get(e.tool_use_id) === e.agentId || agent.call === e.tool_use_id)) {
       pending.delete(e.tool_use_id)
       delete agent.call
-      try { await request($, '/tool_result', { agentId: e.agentId, callId: e.tool_use_id, text: r.text ?? r.deny ?? JSON.stringify(r.result), isError: !!(r.isError || r.deny) }) }
+      try { await request($, '/tool_result', { agentId: e.agentId, callId: e.tool_use_id, text: r.text ?? r.deny ?? JSON.stringify(r.result), isError: !!(r.isError || r.deny) }, await daemonOf($, agent)) }
       catch (error) { agent.error = errorLine(error) }
       await keep($, e.agentId!)
     }
@@ -561,7 +573,7 @@ export const register: Register = on => {
     if (agent) {
       // Aborting a dispatch also aborts its HTTP calls; completion has a fresh dispatch.
       if ((e.isAborted || agent.running) && !ending) {
-        try { await request($, '/interrupt', { agentId: e.agentId }) } catch {}
+        try { await request($, '/interrupt', { agentId: e.agentId }, await daemonOf($, agent)) } catch {}
         agent.running = false
         await keep($, e.agentId)
       }

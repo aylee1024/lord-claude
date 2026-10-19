@@ -23,17 +23,26 @@ answer becomes the agent's reply. No Claude tokens are spent on these turns.
 (`tools: Agent, SendMessage`; `effort: high`; `model: haiku` is never called, and its prompt makes any fallback reply a
 visible `lord: error` line), `lordd.py`, `config.json` (defaults; `~/.claude/lord/config.json` is merged over it per
 family), `tests/`, `README.md`, `PRIVACY.md`, `LICENSE`.
-Runtime files only in `~/.claude/lord/`: `lordd.sock` (600, folder 700), `lordd.lock`, `sessions.jsonl` (one record per
-agent save: ids, vendor session, model, effort, cwd, options, last usage, created, used; never task text),
+Runtime files only in `~/.claude/lord/`: `lordd-<version>.sock` (600, folder 700) and `lordd-<version>.lock`, one pair per
+plugin version, since each version's plugin starts and talks to its own daemon (`LORD_DAEMON_SOCKET` overrides; daemons
+before 2.0.18 used `lordd.sock` and `lordd.lock`); `journal.jsonl` (one record per agent save: ids, vendor session, model,
+effort, cwd, options, last usage, created, used; never task text), shared by every daemon from 2.0.18: appends and
+rewrites hold `journal.lock`, and a rewrite keeps the newest record of each agent, from the file or the rewriting daemon's
+own saves, less the agents that daemon pruned. An agent the daemon does not know, or knows by an older record while it
+runs nothing for it, is read from the journal at `/open`; `/agents` adds unknown ones. `sessions.jsonl`, the journal of
+daemons before 2.0.18, is read and never written (the first `journal.jsonl` starts from it). A vendor's Lord tool server
+gets the starting daemon's socket as `LORD_DAEMON_SOCKET`; one without it (started by an older daemon) uses `lordd.sock`.
 `logs/<agentId>.log` (the agent's activity: vendor commands and file actions, redacted, 4 MB cap, removed with the
 record; agy tool steps are logged once each, as the tool's name and parameters), `logs/<agentId>.answer.md` (the
-agent's latest non-empty final answer, redacted, removed with the record), `lordd.log` (1 MB, one rotation). Two global side effects: an agy MCP entry `lord` while the daemon runs (added
-before its first gemini agent, removed when it exits; agy has no per-run MCP option) and the `lord-workspace` and `lord-readonly` profiles between `# lord: begin` and `# lord: end` in
+agent's latest non-empty final answer, redacted, removed with the record), `lordd.log` (1 MB, one rotation). Two global side effects: an agy MCP entry `lord` while a daemon runs (added
+or updated at each gemini agent start, removed when a daemon exits with no daemon of another version running; agy has
+no per-run MCP option) and the `lord-workspace` and `lord-readonly` profiles between `# lord: begin` and `# lord: end` in
 `$GROK_HOME/sandbox.toml` (default `~/.grok`), rewritten only when they differ.
 
 ## Daemon HTTP API (JSON bodies)
 Every request but `GET /health` and `POST /mcp` carries `X-Lord-Control: <key>` from `~/.claude/lord/control.header`
-(0600, new at each daemon start; grok's Lord profiles deny reading it); without it the reply is 403.
+(0600, new at a daemon start when no daemon of another version is running, and otherwise kept, so both daemons' plugins
+can reach them; grok's Lord profiles deny reading it); without it the reply is 403.
 
 | Method | Path | Body | Reply |
 |---|---|---|---|

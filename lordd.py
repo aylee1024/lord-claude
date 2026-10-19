@@ -2,6 +2,7 @@
 """Lord's Unix HTTP broker and subscription CLI adapters (Python 3.11 or later)."""
 import argparse
 import asyncio
+from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 import fcntl
 import json
@@ -32,7 +33,11 @@ def newer(version, than):
 
 VERSION = plugin_version(HERE.parent)
 HOME = Path(os.environ.get('LORD_HOME', Path.home() / '.claude/lord')).expanduser()
-SOCKET = HOME / 'lordd.sock'
+# Each plugin version runs its own daemon on its own socket, so an update never waits for an older daemon's agents
+# to finish; the older daemon exits once its sessions have moved on. Daemons before 2.0.18 all used lordd.sock.
+# LORD_DAEMON_SOCKET overrides it, and is how a vendor process's Lord tools reach the daemon that started it.
+LEGACY_SOCKET = HOME / 'lordd.sock'
+SOCKET = Path(os.environ['LORD_DAEMON_SOCKET']) if os.environ.get('LORD_DAEMON_SOCKET') else HOME / f'lordd-{VERSION}.sock'
 LIMIT = 8 * 1024 * 1024
 EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max']
 RANKS = ['minimal', *EFFORTS, 'ultra']
@@ -340,7 +345,7 @@ class Vendor:
                 self.process = await asyncio.create_subprocess_exec(*command,
                     cwd=self.agent.cwd if self.agent else HOME, start_new_session=True,
                     env=subscription_env({**({} if self.agent and self.agent.record.get('tools') else GROK_NO_CLAUDE_IMPORTS),
-                                          **({'LORD_AGENT_ID': self.agent.agentId, 'LORD_HOME': str(HOME), 'LORD_MCP_TOKEN': self.agent.token} if self.agent else {})}),
+                                          **({'LORD_AGENT_ID': self.agent.agentId, 'LORD_HOME': str(HOME), 'LORD_DAEMON_SOCKET': str(SOCKET), 'LORD_MCP_TOKEN': self.agent.token} if self.agent else {})}),
                     stdin=-1, stdout=-1, stderr=-1, limit=LIMIT)
             except FileNotFoundError: raise RuntimeError(f'{command[0]} was not found; {INSTALL[self.family]}') from None
             self.generation += 1
@@ -513,13 +518,45 @@ class Daemon:
         self.stop_event, self.open_locks, self.prune_lock = asyncio.Event(), {}, asyncio.Lock()
         # agy_models keeps agy's listing order: its first model is the fallback for a default agy does not offer.
         self.agy_registered, self.agy_levels, self.agy_models = False, {}, {}
-        self.journal = HOME / 'sessions.jsonl'
-        if self.journal.exists():
-            for line in self.journal.read_text().splitlines():
+        # Daemons of every version from 2.0.18 append to journal.jsonl and merge when they rewrite it. sessions.jsonl
+        # belongs to earlier daemons, which rewrite it with only their own agents; it is read, never written.
+        self.journal, self.legacy_journal = HOME / 'journal.jsonl', HOME / 'sessions.jsonl'
+        self.touched, self.pruned = set(), set()
+        found = self.records(self.journal if self.journal.exists() else self.legacy_journal)
+        # A first journal starts with every earlier record, so the next rewrite keeps them.
+        if not self.journal.exists(): self.touched = set(found)
+        for aid, record in found.items(): self.agents[aid] = Agent(record)
+
+    def records(self, *paths):
+        # The newest record of each agent: later lines, and later files, replace earlier ones.
+        found = {}
+        for path in paths:
+            try: lines = path.read_text().splitlines()
+            except OSError: continue
+            for line in lines:
                 try:
                     record = json.loads(line)
-                    self.agents[record['agentId']] = Agent(record)
-                except (ValueError, KeyError): self.log('Invalid journal line ignored')
+                    found[record['agentId']] = record
+                except (ValueError, KeyError, TypeError): self.log('Invalid journal line ignored')
+        return found
+
+    def refresh(self, aid=None):
+        # A daemon of another version may have run an agent since this one read the journal. A record this daemon
+        # holds gives way to a newer one there only while this daemon runs nothing for it; aid None adds unknown agents.
+        found = self.records(self.legacy_journal, self.journal)
+        for key in [aid] if aid else list(found):
+            record, a = found.get(key), self.agents.get(key)
+            if record is None or key in self.pruned: continue
+            if a is None: self.agents[key] = Agent(record)
+            elif aid and record.get('used', '') > a.record.get('used', '') and a.state in ('idle', 'closed') and not a.stream_lock.locked():
+                v = self.vendors.get(key)
+                if not (v and v.process and v.process.returncode is None): self.agents[key] = Agent(record)
+
+    @contextmanager
+    def journal_lock(self):
+        with (HOME / 'journal.lock').open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield
 
     def log(self, text):
         path = HOME / 'lordd.log'
@@ -547,8 +584,8 @@ class Daemon:
 
     async def agy_mcp(self, program):
         # agy has no per-run MCP option. One user-level entry serves every agy process; the server reads its
-        # agent id from LORD_AGENT_ID and lists no tools in agy sessions the daemon did not start.
-        if self.agy_registered: return
+        # agent id from LORD_AGENT_ID and lists no tools in agy sessions the daemon did not start. It is added (or
+        # updated) at every agy start, because a daemon of another version may have removed it on exit.
         code, out = await run_quick([*program, 'mcp', 'add', 'lord', '--', sys.executable, str(HERE), '--mcp'])
         # The program that added the entry removes it when the daemon exits (close); a copy, because the caller goes
         # on to append agy's run options to its list.
@@ -561,10 +598,11 @@ class Daemon:
 
     def save(self, a):
         a.record.update({k: getattr(a, k) for k in ('vendorSession', 'model', 'effort', 'total')}, used=datetime.now(timezone.utc).isoformat())
-        with self.journal.open('a') as file: file.write(dumps(a.record) + '\n')
+        with self.journal_lock(), self.journal.open('a') as file: file.write(dumps(a.record) + '\n')
+        self.touched.add(a.agentId)
 
     def server(self, a):
-        env = {'LORD_HOME': str(HOME), 'LORD_MCP_TOKEN': a.token, **({'LORD_READONLY': '1'} if a.record.get('readonly') else {})}
+        env = {'LORD_HOME': str(HOME), 'LORD_DAEMON_SOCKET': str(SOCKET), 'LORD_MCP_TOKEN': a.token, **({'LORD_READONLY': '1'} if a.record.get('readonly') else {})}
         return {'name': 'lord', 'command': sys.executable, 'args': [str(HERE), '--mcp', a.agentId], 'env': env}
 
     async def attach(self, a):
@@ -671,6 +709,7 @@ class Daemon:
         aid, family = body['agentId'], body['family']
         if not isinstance(aid, str) or not aid or family not in ('gpt', 'grok', 'gemini'): raise ValueError('Invalid agent or family')
         async with self.open_locks.setdefault(aid, asyncio.Lock()):
+            self.refresh(aid)
             if body.get('nosandbox') and family != 'gpt':
                 raise ValueError({'grok': '@nosandbox is available for gpt only; grok keeps its sandbox',
                                   'gemini': '@nosandbox is not needed for gemini: agy has no sandbox'}[family])
@@ -705,7 +744,7 @@ class Daemon:
                 if new and self.agents.pop(aid, None) is not None:
                     vendor = self.vendors.pop(aid, None)
                     if vendor: await vendor.close()
-                    self.compact()
+                    self.compact((aid,))
                 elif saved and a.record != saved[0]:
                     # Saved, so a daemon restart does not bring the refused options back; a new process drops any
                     # sandbox or imports started for them.
@@ -884,6 +923,7 @@ class Daemon:
             while not a.events.empty(): a.events.get_nowait()
 
     def listed(self):
+        self.refresh()
         return [{**{k: getattr(a, k) for k in ('agentId', 'family', 'model', 'effort', 'state', 'activity', 'cwd')},
                  'log': str(a.log_path), 'answer': str(a.answer_path) if a.answer_path.exists() else None,
                  'usage': a.record.get('usage')} for a in self.agents.values()]
@@ -1132,22 +1172,31 @@ class Daemon:
                 a.answer_path.unlink(missing_ok=True)
                 del self.agents[aid]
                 self.open_locks.pop(aid, None)
-        self.compact()
+        self.pruned.update(removed)
+        self.compact(removed)
         return {'ok': True, 'pruned': removed}
 
-    def compact(self):
-        # The journal rewritten with one line per agent the daemon still has.
-        temporary = self.journal.with_suffix('.tmp')
-        temporary.write_text(''.join(dumps(a.record) + '\n' for a in self.agents.values()))
-        temporary.replace(self.journal)
+    def compact(self, removed=()):
+        # The journal rewritten with one line per agent: the newest record of each, from the file (which daemons of
+        # other versions append to) or from this daemon's own saves, less the agents this daemon removed.
+        with self.journal_lock():
+            found = self.records(self.journal)
+            for aid in self.touched:
+                a = self.agents.get(aid)
+                if a and a.record.get('used', '') >= found.get(aid, {}).get('used', ''): found[aid] = a.record
+            for aid in removed: found.pop(aid, None)
+            temporary = self.journal.with_suffix('.tmp')
+            temporary.write_text(''.join(dumps(record) + '\n' for record in found.values()))
+            temporary.replace(self.journal)
 
     async def close(self):
         self.stopping = True
         for a in self.agents.values(): a.emit('error', message='Daemon shutting down', retryable=True)
         await asyncio.gather(*(v.close() for v in self.vendors.values()), return_exceptions=True)
-        if self.agy_registered:
+        if self.agy_registered and not await others_answering():
             # The entry names this plugin copy's file, which an update or an uninstall later deletes; while no daemon
-            # runs, no agy session (the user's own included) is left trying to start it.
+            # runs, no agy session (the user's own included) is left trying to start it. A daemon of another version
+            # still running keeps it, and re-adds its own at its next agy start.
             code, out = await run_quick([*self.agy_registered, 'mcp', 'remove', 'lord'])
             if code != 0: self.log(f'agy mcp remove failed: {out}')
         tasks = list(self.tasks)
@@ -1156,7 +1205,7 @@ class Daemon:
         for writer in list(self.connections): writer.close()
 
     async def serve(self):
-        lock = (HOME / 'lordd.lock').open('a')
+        lock = SOCKET.with_suffix('.lock').open('a')
         # A daemon that is shutting down holds the lock for a moment after it stops answering; this one waits for it
         # and takes over, so a turn that starts during that moment still finds a daemon.
         deadline = time.monotonic() + 10
@@ -1174,11 +1223,16 @@ class Daemon:
             if await answering(): return
             # Every request but /health and /mcp (which carries a per-agent token) needs this key. Vendor sandboxes
             # cannot read the file (grok's profiles deny it; codex's sandbox cannot reach the socket without @net).
-            self.control = uuid.uuid4().hex
-            temporary = HOME / '.control.header'
-            temporary.write_text(f'X-Lord-Control: {self.control}\n')
-            temporary.chmod(0o600)
-            temporary.replace(HOME / 'control.header')
+            # Daemons of different versions share it: a new key would lock out the plugins talking to a daemon still
+            # running, and grok's profiles name this one file. It is replaced only when no other daemon runs.
+            try: self.control = re.fullmatch(r'X-Lord-Control: ([0-9a-f]{32})\n', (HOME / 'control.header').read_text())[1] if await others_answering() else None
+            except (OSError, TypeError): self.control = None
+            if not self.control:
+                self.control = uuid.uuid4().hex
+                temporary = HOME / '.control.header'
+                temporary.write_text(f'X-Lord-Control: {self.control}\n')
+                temporary.chmod(0o600)
+                temporary.replace(HOME / 'control.header')
             SOCKET.unlink(missing_ok=True)
             server = await asyncio.start_unix_server(self.http, str(SOCKET), limit=LIMIT)
             bound = True
@@ -1194,13 +1248,19 @@ class Daemon:
             if bound: SOCKET.unlink(missing_ok=True)
             lock.close()
 
-async def answering():
+async def answering(path=None):
     # Whether a daemon is serving on the socket.
-    try: _, writer = await asyncio.open_unix_connection(str(SOCKET))
+    try: _, writer = await asyncio.open_unix_connection(str(path or SOCKET))
     except (FileNotFoundError, ConnectionRefusedError): return False
     writer.close()
     await writer.wait_closed()
     return True
+
+async def others_answering():
+    # Whether a daemon of another plugin version is serving from this folder.
+    for path in HOME.glob('lordd*.sock'):
+        if path != SOCKET and await answering(path): return True
+    return False
 
 async def relay(path, body=None):
     reader, writer = await asyncio.open_unix_connection(str(SOCKET), limit=LIMIT)
@@ -1227,6 +1287,9 @@ TOOLS = [
     {'name': 'list_agents', 'description': 'Your own agent id (you) and every lord agent with its current activity.', 'inputSchema': {'type': 'object', 'properties': {}}}]
 
 async def mcp(agent_id):
+    global SOCKET
+    # A vendor started by a daemon from before 2.0.18 carries no socket path; that daemon is on the old socket.
+    if not os.environ.get('LORD_DAEMON_SOCKET'): SOCKET = LEGACY_SOCKET
     agent_id = agent_id or os.environ.get('LORD_AGENT_ID')
     token, readonly = os.environ.get('LORD_MCP_TOKEN'), os.environ.get('LORD_READONLY') == '1'
     redact = Redactor()
@@ -1282,7 +1345,7 @@ def main():
         if args.prune:
             try: result = await relay('/prune', {'days': args.days if args.days is not None else d.config['prune_days']})
             except (ConnectionRefusedError, FileNotFoundError):
-                lock = (HOME / 'lordd.lock').open('a')
+                lock = SOCKET.with_suffix('.lock').open('a')
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 try: result = await d.prune(args.days if args.days is not None else d.config['prune_days'])
                 finally:

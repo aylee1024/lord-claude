@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import socket
 import subprocess
@@ -41,7 +42,7 @@ class Client:
     def connect(self, path, body=None, key=True):
         conn = socket.socket(socket.AF_UNIX)
         conn.settimeout(float(os.environ.get('LORD_TEST_TIMEOUT', '12')))
-        conn.connect(str(self.home / 'lordd.sock'))
+        conn.connect(str(getattr(self, 'sock', None) or self.home / 'lordd.sock'))
         payload = json.dumps(body).encode() if body is not None else b''
         header = (self.home / 'control.header').read_text().strip() + '\r\n' if key and (self.home / 'control.header').exists() else ''
         conn.sendall((f'{"POST" if body is not None else "GET"} {path} HTTP/1.1\r\nHost: localhost\r\n{header}Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n').encode() + payload)
@@ -84,7 +85,7 @@ class Rig(Client):
     def __init__(self, home, idle=60):
         super().__init__(home)
         self.data = home / 'vendor'
-        self.env = dict(os.environ, LORD_HOME=str(home), GROK_HOME=str(home / 'grok'), PYTHONDONTWRITEBYTECODE='1',
+        self.env = dict(os.environ, LORD_HOME=str(home), LORD_DAEMON_SOCKET=str(home / 'lordd.sock'), GROK_HOME=str(home / 'grok'), PYTHONDONTWRITEBYTECODE='1',
                         OPENAI_API_KEY='must-not-reach-vendor', SOME_TOKEN='must-not-reach-vendor',
                         ANTHROPIC_BASE_URL='must-not-reach-vendor', CLAUDE_CODE_FLAG='must-not-reach-vendor',
                         RANDOM_SECRET='must-not-reach-vendor', CUSTOM_BEARER='Bearer must-not-reach-vendor',
@@ -161,7 +162,7 @@ def test_open_stream_done_permissions_and_usage(rig, family):
     assert events[-1]['usage']['cache_read_input_tokens'] == (0 if family == 'gpt' else 2)
     assert set(events[-1]['usage']) == {'input_tokens', 'output_tokens', 'cache_read_input_tokens'}
     assert rig.request('/agents')[0]['state'] == 'idle'
-    records = [json.loads(line) for line in (rig.home / 'sessions.jsonl').read_text().splitlines()]
+    records = [json.loads(line) for line in (rig.home / 'journal.jsonl').read_text().splitlines()]
     assert records[-1]['vendorSession'] == opened['vendorSession']
     assert all(k in records[-1] for k in ['agentId', 'family', 'cwd', 'model', 'created'])
     assert all('activity' not in rec for rec in records)
@@ -295,7 +296,7 @@ def test_prune_only_owned_sessions(rig):
     rig.open('gpt', agent='recent')
     rig.turn('PING', agent='grok')
     rig.stop()
-    path = rig.home / 'sessions.jsonl'
+    path = rig.home / 'journal.jsonl'
     records = [json.loads(line) for line in path.read_text().splitlines()]
     for row in records:
         if row['agentId'] != 'recent':
@@ -502,7 +503,7 @@ def test_second_daemon_preserves_a_live_socket_without_its_lock(rig):
     path = home / 'lordd.sock'
     listener = socket.socket(socket.AF_UNIX); listener.bind(str(path)); listener.listen()
     inode = path.stat().st_ino
-    proc = subprocess.Popen([PYTHON, str(DAEMON)], env={**rig.env, 'LORD_HOME': str(home)}, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc = subprocess.Popen([PYTHON, str(DAEMON)], env={**rig.env, 'LORD_HOME': str(home), 'LORD_DAEMON_SOCKET': str(path)}, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         proc.wait(timeout=2)
         assert proc.returncode == 0 and path.stat().st_ino == inode
@@ -609,11 +610,12 @@ def test_grok_readonly_agents_run_under_the_sandbox_profile(rig):
     assert launches.count(['--sandbox', 'test-readonly', 'agent', '--always-approve', 'stdio']) == 2
 
 
-def test_gemini_registers_the_env_keyed_lord_server_once(rig):
+def test_gemini_registers_the_env_keyed_lord_server_at_each_agy_start(rig):
+    # Re-added at every start: a daemon of another version may have removed the entry when it exited.
     rig.open('gemini', agent='g1')
     rig.open('gemini', agent='g2')
     added = [a['mcp_add'] for a in rig.audit() if 'mcp_add' in a]
-    assert len(added) == 1 and added[0][:2] == ['lord', '--'] and added[0][2] == PYTHON and added[0][3:] == [str(DAEMON), '--mcp']
+    assert added == [['lord', '--', PYTHON, str(DAEMON), '--mcp']] * 2
 
 
 def test_mcp_server_without_an_agent_lists_no_tools():
@@ -1219,7 +1221,7 @@ def test_a_refused_model_change_puts_the_agents_options_back(rig):
 
 def test_an_opened_agent_is_not_pruned_before_its_turn(rig):
     rig.open('gpt')
-    journal = rig.home / 'sessions.jsonl'
+    journal = rig.home / 'journal.jsonl'
     old = json.loads(journal.read_text().splitlines()[-1]); old['used'] = '2000-01-01T00:00:00+00:00'
     journal.write_text(json.dumps(old) + '\n')
     rig.stop(); rig.start()
@@ -1378,7 +1380,7 @@ def test_a_named_model_the_vendor_does_not_offer_is_refused_for_a_new_agent(rig,
 def test_the_agy_entry_exists_only_while_the_daemon_runs(rig):
     rig.open('gemini', agent='g1')
     rig.open('gemini', agent='g2')
-    assert [a['mcp_add'][0] for a in rig.audit() if 'mcp_add' in a] == ['lord']
+    assert [a['mcp_add'][0] for a in rig.audit() if 'mcp_add' in a] == ['lord', 'lord']
     assert not [a for a in rig.audit() if 'mcp_remove' in a]
     rig.stop()
     assert [a['mcp_remove'] for a in rig.audit() if 'mcp_remove' in a] == [['lord']]
@@ -1453,3 +1455,86 @@ def test_a_vendor_that_is_not_signed_in_says_how_to_sign_in(rig):
     assert status != 200 and 'Authentication required' in reply['error'] and 'grok is not signed in; run `grok` once' in reply['error']
     # Other failures keep their own text.
     assert load('lordd_sign_in').sign_in_hint('gpt', 'gpt process closed stdout') == 'gpt process closed stdout'
+
+
+def start_version(rig, version):
+    # A copy of the daemon whose plugin.json names another version, on that version's own socket.
+    root = rig.home / f'plugin-{version}'
+    (root / '.claude-plugin').mkdir(parents=True)
+    (root / '.claude-plugin/plugin.json').write_text(json.dumps({'version': version}))
+    shutil.copy(DAEMON, root / 'lordd.py')
+    env = {k: v for k, v in rig.env.items() if k != 'LORD_DAEMON_SOCKET'}
+    proc = subprocess.Popen([PYTHON, str(root / 'lordd.py')], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    client = Client(rig.home)
+    client.sock = rig.home / f'lordd-{version}.sock'
+    deadline = time.monotonic() + 10
+    while True:
+        assert proc.poll() is None
+        try:
+            if client.request('/health')['version'] == version: return proc, client
+        except OSError:
+            assert time.monotonic() < deadline
+            time.sleep(.025)
+
+
+def stop_version(proc):
+    proc.terminate()
+    proc.wait(timeout=10)
+
+
+def test_daemons_of_two_versions_serve_side_by_side_with_one_key(rig):
+    key = (rig.home / 'control.header').read_text()
+    rig.open('gpt', agent='old')
+    proc, new = start_version(rig, '9.9.9')
+    try:
+        # The running daemon's plugins keep their key, and neither daemon waits for the other.
+        assert (rig.home / 'control.header').read_text() == key
+        new.request('/open', {'agentId': 'fresh', 'family': 'gpt', 'cwd': str(rig.home)})
+        assert list(new.stream('/turn', {'agentId': 'fresh', 'text': 'PING'}))[-1]['text'] == 'PONG'
+        assert rig.turn('PING', agent='old')[-1]['text'] == 'PONG'
+        rig.stop()
+        assert list(new.stream('/turn', {'agentId': 'fresh', 'text': 'PING'}))[-1]['text'] == 'PONG'
+    finally: stop_version(proc)
+
+
+@pytest.mark.parametrize('family', ['gpt', 'gemini'])
+def test_a_vendor_reaches_the_daemon_that_started_it(rig, family):
+    proc, new = start_version(rig, '9.9.9')
+    try:
+        new.request('/open', {'agentId': 'a', 'family': family, 'cwd': str(rig.home)})
+        events = list(new.stream('/turn', {'agentId': 'a', 'text': 'LIST'}))
+        assert events[-1]['type'] == 'done'
+        assert json.loads(json.loads(events[-1]['text'])['content'][0]['text'])['you'] == 'a'
+    finally: stop_version(proc)
+
+
+def test_an_agent_moves_between_daemons_with_its_vendor_session(rig):
+    proc, new = start_version(rig, '9.9.9')
+    try:
+        new.request('/open', {'agentId': 'y', 'family': 'gpt', 'cwd': str(rig.home)})
+        # Started after the newer daemon read the journal.
+        sid = rig.open('gpt', agent='x')['vendorSession']
+        assert rig.turn('secret-word', agent='x')[-1]['type'] == 'done'
+        assert new.request('/open', {'agentId': 'x', 'family': 'gpt', 'cwd': str(rig.home)})['vendorSession'] == sid
+        assert list(new.stream('/turn', {'agentId': 'x', 'text': 'REMEMBER'}))[-1]['text'] == 'secret-word'
+        assert 'y' in [a['agentId'] for a in rig.request('/agents')]
+        # Each daemon's journal rewrite keeps the agents the other added.
+        new.request('/prune', {'days': 14})
+        rig.request('/prune', {'days': 14})
+        assert {json.loads(line)['agentId'] for line in (rig.home / 'journal.jsonl').read_text().splitlines()} == {'x', 'y'}
+    finally: stop_version(proc)
+
+
+def test_a_first_journal_starts_from_the_earlier_daemons_records(rig):
+    sid = rig.open('gpt', agent='x')['vendorSession']
+    rig.stop()
+    journal = rig.home / 'journal.jsonl'
+    (rig.home / 'sessions.jsonl').write_text(journal.read_text())
+    journal.unlink()
+    rig.start()
+    # The start's journal rewrite carries the earlier records over.
+    deadline = time.monotonic() + 5
+    while not journal.exists() or 'x' not in journal.read_text():
+        assert time.monotonic() < deadline
+        time.sleep(.05)
+    assert rig.open('gpt', agent='x')['vendorSession'] == sid

@@ -2,7 +2,7 @@ import { test, expect, mock } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer', model: 'fake-gpt', usage: { input_tokens: 3, output_tokens: 2, cache_read_input_tokens: 1 } }], failures = 0, socket: string | null = '/test/lord.sock', pythonExits: Record<string, number> = {}, env: Record<string, string> = {}) {
-  const requests: { path: string; body: any }[] = []
+  const requests: { path: string; body: any; socket?: string }[] = []
   const statuses: string[] = []
   const processes: string[][] = []
   const deliveries: string[] = []
@@ -20,7 +20,7 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
       if (code !== undefined) return { value: { code, signal: null } }
     } else {
       const path = e.argv[e.argv.length - 1].replace('http://lord', '')
-      requests.push({ path, body: JSON.parse(e.input ?? '{}') })
+      requests.push({ path, body: JSON.parse(e.input ?? '{}'), socket: e.argv[e.argv.indexOf('--unix-socket') + 1] })
       const raw = events.map(x => JSON.stringify(x)).join('\n') + '\n'
       for (let i = 0; i < raw.length; i += 11) yield { stream: 'stdout', text: raw.slice(i, i + 11) }
       streamFinished = true
@@ -51,7 +51,7 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
   on('tool.call', (_, e) => { toolCalls.push(e); return tools.answer })
   on('http.fetch', (_, e) => {
     const path = e.url.replace('http://lord', '')
-    requests.push({ path, body: e.init?.body ? JSON.parse(e.init.body) : undefined })
+    requests.push({ path, body: e.init?.body ? JSON.parse(e.init.body) : undefined, socket: e.init?.socketPath })
     if (socket === '/down.sock') return { deny: 'socket unavailable' }
     // The daemon compares a pinned @cwd with the folder the agent first opened in.
     if (path === '/open') {
@@ -679,6 +679,37 @@ test('a turn in flight when this code is reloaded continues from the record the 
   expect(w.requests.filter(x => x.path === '/turn' || x.path === '/continue').map(x => x.path)).toEqual(['/continue'])
   expect(item.value.answer).toBe('after the tool')
   expect(state.get('agent', 'a1')).toMatchObject({ running: false, continuing: false })
+})
+
+test('a turn caught by a reload onto a newer version keeps talking to the daemon that opened it', async ($, on) => {
+  const w = world(on, [{ type: 'done', text: 'after the tool' }])
+  const state = sessionState(on)
+  state.put('agent', 'a1', { family: 'gpt', opened: true, cwd: '/work', running: true, continuing: true, call: 'call7', daemon: '/test/.claude/lord/lordd-2.0.17.sock' })
+  await $.tool.call({ tool: 'SendMessage', tool_use_id: 'call7', agentId: 'a1', to: 'b', message: 'hi' } as any)
+  const stream = $.turn.step({ agentId: 'a1', turnId: 't1', index: 1, model: 'haiku', messageCount: 3 })
+  while (!(await stream.next()).done) {}
+  expect(w.requests.filter(x => x.path === '/tool_result' || x.path === '/continue').map(x => x.socket)).toEqual(['/test/.claude/lord/lordd-2.0.17.sock', '/test/.claude/lord/lordd-2.0.17.sock'])
+})
+
+test('a turn opened before per-version daemons continues on the socket they shared', async ($, on) => {
+  const w = world(on, [{ type: 'done', text: 'after the tool' }], 0, null)
+  on('fs.read', (_, e) => e.path.endsWith('/.claude-plugin/plugin.json') ? { value: JSON.stringify({ name: 'lord', version: '9.0.0' }) } : { deny: 'absent' })
+  const state = sessionState(on)
+  state.put('agent', 'a1', { family: 'gpt', opened: true, cwd: '/work', running: true, continuing: true, call: 'call7' })
+  await $.tool.call({ tool: 'SendMessage', tool_use_id: 'call7', agentId: 'a1', to: 'b', message: 'hi' } as any)
+  const stream = $.turn.step({ agentId: 'a1', turnId: 't1', index: 1, model: 'haiku', messageCount: 3 })
+  while (!(await stream.next()).done) {}
+  expect(w.requests.filter(x => x.path === '/tool_result' || x.path === '/continue').map(x => x.socket)).toEqual(['/test/.claude/lord/lordd.sock', '/test/.claude/lord/lordd.sock'])
+})
+
+test('each plugin version talks to its own daemon socket', async ($, on) => {
+  const w = world(on, undefined, 0, null)
+  on('fs.read', (_, e) => e.path.endsWith('/.claude-plugin/plugin.json') ? { value: JSON.stringify({ name: 'lord', version: '9.0.0' }) } : { deny: 'absent' })
+  await spawn($)
+  await step($, 'hello')
+  expect(w.requests.find(x => x.path === '/open')?.socket).toBe('/test/.claude/lord/lordd-9.0.0.sock')
+  expect(w.requests.find(x => x.path === '/turn')?.socket).toBe('/test/.claude/lord/lordd-9.0.0.sock')
+  expect(w.processes).toEqual([])
 })
 
 test('a first step after a reload of this code finds the task the earlier copy kept', async ($, on) => {

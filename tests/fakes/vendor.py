@@ -52,7 +52,8 @@ def update(sid, kind, **value):
 
 
 async def mcp(server, name, arguments):
-    env = os.environ.copy()
+    # codex starts a tool server with a fixed list of its own variables plus the server's env, nothing else.
+    env = {k: v for k, v in os.environ.items() if k in ('HOME', 'LOGNAME', 'PATH', 'SHELL', 'USER', 'LANG', 'LC_ALL', 'TERM', 'TMPDIR', 'TZ')} if FAMILY == 'gpt' else os.environ.copy()
     extra = server.get('env', {})
     env.update(extra if isinstance(extra, dict) else {v['name']: v['value'] for v in extra})
     proc = await asyncio.create_subprocess_exec(server['command'], *server['args'],
