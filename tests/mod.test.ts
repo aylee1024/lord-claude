@@ -57,7 +57,8 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
     if (path === '/open' && JSON.parse(e.init!.body!).dirs?.includes('/bad')) return { value: { ok: false, status: 400, headers: {}, text: JSON.stringify({ error: 'every @dir must be an existing directory' }) } }
     if (path === '/health' && failures-- > 0) return { deny: 'socket unavailable' }
     if (path === '/agents' && failures > 0) return { deny: 'socket unavailable' }
-    const result = path === '/agents' ? (!fresh ? [{ agentId: 'a1', family: 'gpt', state: 'running', effort: 'ultra', model: 'fake-gpt', cwd: '/pinned' }]
+    // 'elsewhere' is another session's agent on the shared daemon.
+    const result = path === '/agents' ? (!fresh ? [{ agentId: 'a1', family: 'gpt', state: 'running', effort: 'ultra', model: 'fake-gpt', cwd: '/pinned' }, { agentId: 'elsewhere', family: 'grok', state: 'running' }]
         : requests.some(x => x.path === '/open') ? [{ agentId: 'a1', family: 'gpt', state: 'running' }] : [])
       : path === '/usage' ? { chatgpt: { usedPercent: 47 } }
       : path === '/health' ? { ok: true }

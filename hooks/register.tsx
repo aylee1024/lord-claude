@@ -187,8 +187,10 @@ async function connect($: EngineInterface, signal: AbortSignal): Promise<void> {
 async function refresh($: EngineInterface): Promise<void> {
   let list: any[]
   try { list = JSON.parse(await request($, '/agents')) } catch { $.ui.status(undefined); return }
+  // The daemon serves every session; the status line counts this session's agents only.
+  const mine = new Set([...agents.keys(), ...await $.agent.list().then(roster => roster.map(agent => agent.id), () => [])])
   const counts = new Map<string, number>()
-  for (const agent of list) if (['running', 'waiting_tool'].includes(agent.state)) counts.set(agent.family, (counts.get(agent.family) ?? 0) + 1)
+  for (const agent of list) if (mine.has(agent.agentId) && ['running', 'waiting_tool'].includes(agent.state)) counts.set(agent.family, (counts.get(agent.family) ?? 0) + 1)
   const labels = ['gpt', 'grok', 'gemini'].filter(family => counts.has(family)).map(family => `${counts.get(family)} ${family}`)
   if (counts.has('gpt')) {
     try {
