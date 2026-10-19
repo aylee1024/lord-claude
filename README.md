@@ -84,6 +84,18 @@ Settings: `~/.claude/lord/config.json` is merged over the plugin's [`config.json
   - an MCP entry named `lord` in agy's user settings (agy has no per-run option for it; outside a Lord agent it lists no tools);
   - two sandbox profiles, `lord-workspace` and `lord-readonly`, between `# lord: begin` and `# lord: end` lines in `~/.grok/sandbox.toml`. Lord uses custom profiles because grok refuses to start when a custom profile cannot be applied, whereas a built-in profile that fails only prints a warning and runs unconfined. If that file is a link (to a dotfiles folder, say), Lord writes through it so the link keeps working. Your own profiles in that file are left as they are; if the file cannot take Lord's tables (for example an inline `profiles = {...}`), grok agents are refused with the reason and the file is not changed.
 
+### What the hooks module does
+
+The hooks module (`hooks/register.tsx`) sends and runs only these things:
+
+- **Requests:** HTTP to `http://lord` over the local Unix socket `~/.claude/lord/lordd.sock`, which is Lord's own daemon on this computer; nothing goes to the internet from the module. It sends a Lord agent's task text, its options, tool results and stop requests, and reads back the vendor's answer. Each request carries the key in `~/.claude/lord/control.header`, a random value the daemon writes at start; it is a local file, never sent anywhere but that socket, and not a vendor credential.
+- **Programs:** `python3 lordd.py --daemon` from the plugin folder, to start the daemon when it is not running (the first Python 3.11 or later among `LORD_PYTHON`, `/opt/homebrew/bin/python3`, `/usr/local/bin/python3`, `/usr/bin/python3`), and `/usr/bin/curl --unix-socket ~/.claude/lord/lordd.sock ... http://lord/turn` (or `/continue`) to read a turn's answer as it streams. No shell is started.
+- **Conversation:** it reads only the turns of `lord:gpt`, `lord:grok` and `lord:gemini` agents and answers them itself, so no Claude model is called for them. Other agents' turns and the main conversation pass through untouched.
+- **Hooks:** `turn.start` and `turn.step` (answer Lord agents' turns); `agent.spawn` and `classic.SubagentStart` (note a new Lord agent's type and working folder; the event and its permission mode pass on unchanged); `tool.call` on Agent, SendMessage and StructuredOutput (passes each call on unchanged, then hands a Lord agent's tool result back to its vendor); `session.send` and `session.receive` (a message to a Lord agent whose vendor is mid-turn is delivered to that vendor instead of waiting); `turn.complete` and `session.end` (stop the vendor's turn when Claude Code stops the agent); `session.start` and `command.run` (the `/lord` command and the status line). It changes no settings, permissions or tool inputs.
+- **Environment:** it reads `HOME`, `PATH` (sent to the daemon so a vendor CLI installed later is found), `LORD_DAEMON_SOCKET` and `LORD_PYTHON`.
+
+Install commands such as `curl -fsSL https://x.ai/cli/install.sh | bash` appear in this README only as instructions for installing the vendors' own CLIs; Lord never runs them.
+
 ## Coming from the v1 skills
 
 Lord v1 was a set of skills (`/codex`, `/gemini`, `/grok`, `/composer`, `/review-panel`) run under a watchdog script. They are kept at the [`v1-skills`](https://github.com/aylee1024/lord-claude/tree/v1-skills) tag. v2 replaces them with native agents and keeps their guards (memory ceiling, silence limit, time limit, one retry).
