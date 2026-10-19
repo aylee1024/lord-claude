@@ -47,6 +47,8 @@ def load_config():
     if not isinstance(user, dict): raise ValueError(f'{HOME / "config.json"} must hold a JSON object')
     for key, value in user.items():
         config[key] = {**config[key], **value} if isinstance(value, dict) and isinstance(config.get(key), dict) else value
+    for family in ('gpt', 'grok', 'gemini'):
+        if family in config and not isinstance(config[family], dict): raise ValueError(f'{family} in config.json must be an object')
     numbers = [(k, config[k]) for k in ('memory_ceiling_kb', 'idle_exit_s', 'prune_days') if k in config]
     numbers += [(f'{f}.no_progress_s', config[f]['no_progress_s']) for f in ('gpt', 'grok', 'gemini') if 'no_progress_s' in config.get(f, {})]
     for key, value in numbers:
@@ -78,7 +80,9 @@ def grok_profiles():
     # /var/run/docker.sock), and denies the sockets explicitly instead. Neither profile can read Lord's control
     # key, without which a grok agent cannot ask the daemon for a less confined agent.
     import tomllib
-    path = Path(os.path.realpath(grok_home() / 'sandbox.toml'))
+    link = grok_home() / 'sandbox.toml'
+    path = Path(os.path.realpath(link))
+    if link.is_symlink() and not path.exists(): raise RuntimeError(f'{link} is a link to {path}, which does not exist')
     key = os.path.realpath(HOME / 'control.header')
     sockets = sorted({p for s in SOCKETS for p in link_chain(s)})
     listed = lambda paths: '[' + ', '.join(json.dumps(p) for p in paths) + ']'
@@ -104,8 +108,17 @@ def fold(path):
     # macOS volumes are case-insensitive by default, so /Users/Name/.GROK is ~/.grok there.
     return path.lower() if sys.platform == 'darwin' else path
 
+def canon(path):
+    # The real path, with macOS's data-volume alias removed: /System/Volumes/Data/private/tmp is /private/tmp.
+    path = os.path.realpath(path)
+    if sys.platform == 'darwin' and fold(path + '/').startswith('/system/volumes/data/'): path = path[len('/System/Volumes/Data'):] or '/'
+    return path
+
 def inside(path, roots):
     return any(fold(path) == fold(root) or fold(path).startswith(fold(root).rstrip('/') + '/') for root in roots)
+
+# The PATH of the latest Claude Code session to open an agent: a vendor CLI installed after the daemon started is found.
+SESSION_PATH = None
 
 async def run_quick(argv, timeout=20):
     # Helper CLI calls are bounded: a wedged one must not hold the daemon.
@@ -139,7 +152,8 @@ def subscription_env(extra=None):
     return {**{k: v for k, v in os.environ.items()
                if not k.upper().startswith(('CLAUDECODE', 'CLAUDE_CODE_', 'ANTHROPIC_'))
                and not any(s in k.upper() for s in SECRET_NAMES)
-               and k.upper() not in ('OPENAI_BASE_URL', 'RUST_LOG') and not v.lower().startswith('bearer ')}, **(extra or {})}
+               and k.upper() not in ('OPENAI_BASE_URL', 'RUST_LOG') and not v.lower().startswith('bearer ')},
+            **({'PATH': SESSION_PATH} if SESSION_PATH else {}), **(extra or {})}
 
 class Redactor:
     def __init__(self):
@@ -149,9 +163,11 @@ class Redactor:
     def __call__(self, value):
         value = str(value)
         for secret in sorted(self.secrets, key=len, reverse=True): value = value.replace(secret, '[REDACTED]')
-        value = re.sub(r'(?i)\b(x-api-key|api[-_]?key|authorization|password|passwd|token)(\s*[:=]\s*)[^\s\"\x27,;]+', r'\1\2[REDACTED]', value)
-        return re.sub(r'(?i)\bBearer[ \t]+[^\s\"\x27]+|\bsk-[\w-]{16,}|\beyJ[\w-]+\.[\w-]+\.[\w-]+|\bgh[pousr]_\w{20,}|\bgithub_pat_\w{20,}'
-                      r'|\bAKIA[0-9A-Z]{16}\b|\bAIza[\w-]{30,}|\bxox[abprs]-[\w-]{10,}|\bxai-\w{20,}', '[REDACTED]', value)
+        value = re.sub(r'(?i)\bBearer[ \t]+[^\s\"\x27]+|\bsk-[\w-]{16,}|\beyJ[\w-]+\.[\w-]+\.[\w-]+|\bgh[pousr]_\w{20,}|\bgithub_pat_\w{20,}'
+                       r'|\bAKIA[0-9A-Z]{16}\b|\bAIza[\w-]{30,}|\bxox[abprs]-[\w-]{10,}|\bxai-\w{20,}', '[REDACTED]', value)
+        # key=value, key: value and "key": "value", for the usual secret names.
+        return re.sub(r'(?i)(["\x27]?\b(?:x-api-key|api[-_]?key|authorization|password|passwd|secret|token)["\x27]?\s*[:=]\s*["\x27]?)(?!\[REDACTED\])[^\s\"\x27,;}]+',
+                      r'\1[REDACTED]', value)
 
 async def process_table():
     ps = await asyncio.create_subprocess_exec('/bin/ps', '-A', '-o', 'pid=,ppid=,rss=', stdout=-1, stderr=-3)
@@ -173,18 +189,19 @@ def tree(children, root):
 def signal_all(pids, sig):
     for pid in pids:
         try: os.kill(pid, sig)
-        except ProcessLookupError: pass
+        except (ProcessLookupError, PermissionError): pass
 
 async def kill_tree(process):
     # Tool commands can leave the vendor's process group, so every descendant is signalled by pid as well.
+    # macOS answers killpg with EPERM when the group holds only zombies; the pid signals below still run.
     if process is None: return
     pids = tree((await process_table())[0], process.pid)
     try: os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError: pass
+    except (ProcessLookupError, PermissionError): pass
     signal_all(pids, signal.SIGTERM)
     await asyncio.sleep(.2)
     try: os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError: pass
+    except (ProcessLookupError, PermissionError): pass
     signal_all(pids, signal.SIGKILL)
     await process.wait()
 
@@ -576,24 +593,34 @@ class Daemon:
             if body.get('dirs') and family != 'gpt':
                 raise ValueError({'grok': "@dir is not available for grok: its sandbox confines writes to the working folder; use @cwd",
                                   'gemini': '@dir is not needed for gemini: agy has no sandbox and can write outside its folder'}[family])
+            if not Path(body['cwd']).expanduser().is_absolute(): raise ValueError('the working folder must be an absolute path')
             cwd = str(Path(body['cwd']).expanduser().resolve(strict=True))
-            if cwd == '/' or os.path.samefile(cwd, Path.home()):
-                raise ValueError('refusing / or the home folder as a working folder: start Claude Code in a project folder, or put "@cwd <folder>" on the first line of the task')
+            if inside(canon(str(Path.home())), (canon(cwd),)):
+                raise ValueError('refusing / or a folder holding your home folder as a working folder: start Claude Code in a project folder, or put "@cwd <folder>" on the first line of the task')
             a = self.agents.get(aid)
+            if a and body.get('pin_cwd') and not os.path.samefile(cwd, a.cwd): raise ValueError(f'@cwd is fixed at the first turn ({a.cwd})')
+            if isinstance(body.get('path'), str) and body['path']:
+                global SESSION_PATH
+                SESSION_PATH = body['path']
             readonly = body.get('readonly') or bool(a and a.record.get('readonly'))
             if family == 'gpt' and readonly and (body.get('net') or bool(a and a.record.get('net'))):
                 raise ValueError("@readonly with @net is not read-only for gpt: with network on, codex can reach local services, Lord's included; use lord:grok for a read-only agent with network")
             # grok's read-only base profile leaves the temp folders and grok's own folder writable.
-            if body.get('readonly') and family == 'grok' and inside(a.cwd if a else cwd, (*TEMP_ROOTS, os.path.realpath(grok_home()))):
+            if body.get('readonly') and family == 'grok' and inside(canon(a.cwd if a else cwd), (*TEMP_ROOTS, canon(str(grok_home())))):
                 raise ValueError("grok's read-only profile leaves temp folders and ~/.grok writable; pin a read-only grok outside /tmp, /var/tmp, /var/folders and ~/.grok")
             new = a is None
+            saved = None if new else (json.loads(dumps(a.record)), a.restart)
             try: return await self.open_agent(aid, family, cwd, body, a)
             except BaseException:
-                # A first /open that fails leaves no agent behind, so a corrected retry starts clean.
+                # A first /open that fails leaves no agent behind, so a corrected retry starts clean; a refused
+                # later /open puts the agent's options back and reattaches with them on the next turn.
                 if new and self.agents.pop(aid, None) is not None:
                     vendor = self.vendors.pop(aid, None)
                     if vendor: await vendor.close()
                     self.compact()
+                elif saved and a.record != saved[0]:
+                    a.record.clear(); a.record.update(saved[0])
+                    a.restart, a.generation = saved[1], 0
                 raise
 
     async def open_agent(self, aid, family, cwd, body, a):
@@ -633,10 +660,13 @@ class Daemon:
             a.record['dirs'] = sorted(set(a.record.get('dirs', [])) | set(dirs))
             a.generation = 0
         await self.attach(a)
+        if a.family == 'gemini' and body.get('model'): await self.agy_efforts(body['model'])
         # A model change applies at the next turn; refusing it here keeps the mod from adopting it.
         if body.get('model') and (models := self.known_models(a)) and body['model'] not in models:
             raise ValueError(f'unknown {a.family} model {body["model"]}; {a.family} lists {", ".join(models)}')
         if a.state == 'closed': a.state = 'idle'
+        # An opened agent counts as used, so pruning cannot take it before its turn starts.
+        self.save(a)
         return {'vendorSession': a.vendorSession, 'model': a.model, 'effort': a.effort}
 
     def known_models(self, a):
@@ -650,6 +680,11 @@ class Daemon:
 
     async def begin_locked(self, a, body):
         if a.state != 'idle' or a.undelivered(): raise ValueError('Agent has a turn awaiting completion')
+        a.cancel_requested, a.starting = False, True
+        try: await self.begin_starting(a, body)
+        finally: a.starting = False
+
+    async def begin_starting(self, a, body):
         if a.turn_task: await asyncio.gather(a.turn_task, return_exceptions=True)
         previous = (a.model, a.effort)
         a.model = body.get('model') or a.model
@@ -672,7 +707,7 @@ class Daemon:
         a.state, a.answer, a.final_text, a.items = 'running', '', '', {}
         a.base, a.tokens, a.turn_id = dict(a.total), usage({}), None
         a.finished.clear()
-        a.cancel_requested, a.dispatched = False, False
+        a.dispatched = False
         self.save(a)
         a.turn_task = self.task(self.run_turn(a, body))
 
@@ -718,6 +753,9 @@ class Daemon:
 
     async def interrupt(self, a):
         a.followup = a.earlier = None
+        # A turn still starting (begin's awaits) is interrupted once it runs, through the path below.
+        deadline = time.monotonic() + 5
+        while getattr(a, 'starting', False) and time.monotonic() < deadline: await asyncio.sleep(.02)
         if a.state in ('running', 'waiting_tool'):
             v = self.backend(a)
             a.cancel_requested = True
@@ -958,7 +996,7 @@ class Daemon:
             self.log(f'{a.agentId}: {v.reason}')
             # The vendor's process group and every descendant by pid, since tool commands may leave the group.
             try: os.killpg(v.process.pid, signal.SIGKILL)
-            except ProcessLookupError: pass
+            except (ProcessLookupError, PermissionError): pass
             signal_all(pids, signal.SIGKILL)
 
     async def prune(self, days):
@@ -969,28 +1007,32 @@ class Daemon:
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         removed = []
         for aid, a in list(self.agents.items()):
-            if a.stream_lock.locked() or a.state in ('running', 'waiting_tool') or datetime.fromisoformat(a.record.get('used', a.created)) >= cutoff: continue
-            if self.open_locks.get(aid, asyncio.Lock()).locked(): continue
-            sid = a.vendorSession
-            if not sid or not re.fullmatch(r'[A-Za-z0-9_-]+', sid): continue
-            previous, a.state = a.state, 'closed'
-            try:
-                backend = self.vendors.pop(aid, None)
-                a.generation = 0
-                if backend: await backend.close()
-                # Vendor history is kept (it is review and build evidence); codex's archive only moves it aside.
-                if a.family == 'gpt':
-                    v = self.service()
-                    try:
-                        await v.ensure()
-                        await v.rpc('thread/archive', {'threadId': sid})
-                    except Exception as error: self.log(f'codex thread {sid} not archived: {error}')
-            except BaseException:
-                a.state = previous
-                raise
-            removed.append(aid)
-            a.log_path.unlink(missing_ok=True)
-            del self.agents[aid]
+            lock = self.open_locks.setdefault(aid, asyncio.Lock())
+            if lock.locked(): continue
+            async with lock:
+                if self.agents.get(aid) is not a: continue
+                if a.stream_lock.locked() or a.state in ('running', 'waiting_tool') or datetime.fromisoformat(a.record.get('used', a.created)) >= cutoff: continue
+                sid = a.vendorSession
+                if not sid or not re.fullmatch(r'[A-Za-z0-9_-]+', sid): continue
+                previous, a.state = a.state, 'closed'
+                try:
+                    backend = self.vendors.pop(aid, None)
+                    a.generation = 0
+                    if backend: await backend.close()
+                    # Vendor history is kept (it is review and build evidence); codex's archive only moves it aside.
+                    if a.family == 'gpt':
+                        v = self.service()
+                        try:
+                            await v.ensure()
+                            await v.rpc('thread/archive', {'threadId': sid})
+                        except Exception as error: self.log(f'codex thread {sid} not archived: {error}')
+                except BaseException:
+                    a.state = previous
+                    raise
+                removed.append(aid)
+                a.log_path.unlink(missing_ok=True)
+                del self.agents[aid]
+                self.open_locks.pop(aid, None)
         self.compact()
         return {'ok': True, 'pruned': removed}
 

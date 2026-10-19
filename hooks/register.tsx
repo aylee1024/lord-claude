@@ -303,11 +303,12 @@ export const register: Register = on => {
           if (known) Object.assign(agent, { opened: true, cwd: known.cwd, effort: agent.effort ?? known.effort, model: agent.model ?? known.model })
         }
         const chosen = merge({ text: '', model: agent.model, effort: agent.effort, readonly: agent.readonly, net: agent.net, dirs: agent.dirs, limits: agent.limits }, input)
-        // A task can name the vendor's working folder; it is fixed at the first turn.
-        if (input.cwd && agent.opened && input.cwd !== agent.cwd) throw new Error(`@cwd is fixed at the first turn (${agent.cwd})`)
+        // A task can name the vendor's working folder (fixed at the first turn; the daemon compares folders, not
+        // spellings). A relative one is under the agent's start folder, not the daemon's.
+        if (input.cwd && !/^[/~]/.test(input.cwd)) input.cwd = `${directories.get(agentId) ?? agent.cwd ?? await $.session.cwd()}/${input.cwd}`
         if (agent.worktree && !input.cwd && !directories.get(agentId)) throw new Error('worktree isolation was requested but Claude Code reported no worktree path; refusing to run in the main tree')
         const cwd = input.cwd ?? (agent.opened ? agent.cwd : undefined) ?? directories.get(agentId) ?? agent.cwd ?? await $.session.cwd()
-        await request($, '/open', { agentId, family: agent.family, cwd, model: chosen.model, effort: chosen.effort ?? e.effort, readonly: chosen.readonly, net: chosen.net, dirs: chosen.dirs, ...chosen.limits })
+        await request($, '/open', { agentId, family: agent.family, cwd, pin_cwd: !!input.cwd, path: await $.env.get('PATH'), model: chosen.model, effort: chosen.effort ?? e.effort, readonly: chosen.readonly, net: chosen.net, dirs: chosen.dirs, ...chosen.limits })
         Object.assign(agent, { model: chosen.model, effort: chosen.effort, readonly: chosen.readonly, net: chosen.net, dirs: chosen.dirs, limits: chosen.limits })
         agent.opened = true
         agent.cwd = cwd
@@ -330,6 +331,8 @@ export const register: Register = on => {
         if (verdict && agent.corrected) throw new Error(`the vendor's JSON was rejected again: ${verdict.text}`)
         let value = verdict ? undefined : json(agent.lastAnswer ?? '')
         if (!value) {
+          // One correction per turn: an answer after it that still holds no JSON ends the turn.
+          if (agent.corrected) throw new Error('the vendor\'s corrected answer held no JSON object')
           if (verdict) agent.corrected = true
           const text = verdict ? `That JSON was rejected: ${verdict.text}\nReply with only the corrected JSON object.`
             : 'Reply with only a JSON object holding your answer, with no other text.'

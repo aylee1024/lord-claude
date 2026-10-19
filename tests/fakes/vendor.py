@@ -230,7 +230,7 @@ async def handle(value):
 
 async def main():
     global AGY_SESSION
-    audit(launch=True, argv=sys.argv[3:], grok_env={k: v for k, v in os.environ.items() if k.startswith('GROK_')}, env={k: v for k, v in os.environ.items() if 'must-not-reach' in v})
+    audit(launch=True, argv=sys.argv[3:], path=os.environ.get('PATH', ''), grok_env={k: v for k, v in os.environ.items() if k.startswith('GROK_')}, env={k: v for k, v in os.environ.items() if 'must-not-reach' in v})
     print('fixture Bearer fake-bearer-value', file=sys.stderr, flush=True)
     if FAMILY == 'gemini':
         args = sys.argv[3:]

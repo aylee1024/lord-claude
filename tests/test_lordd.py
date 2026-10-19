@@ -1142,3 +1142,99 @@ def test_an_interrupt_after_a_detached_turn_finished_discards_its_result(rig):
     while rig.request('/agents')[0]['state'] != 'idle' and time.monotonic() < deadline: time.sleep(.05)
     rig.request('/interrupt', {'agentId': 'a'})
     assert rig.turn('PING')[-1]['text'] == 'PONG'
+
+
+def test_a_refused_model_change_puts_the_agents_options_back(rig):
+    rig.open('gpt')
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home), 'net': True, 'model': 'no-such-model'})
+    file.close(); conn.close()
+    assert status == 400
+    rig.turn('PING')
+    params = [e['params'] for e in rig.audit() if e.get('method') == 'turn/start'][-1]
+    assert params['sandboxPolicy']['networkAccess'] is False
+
+
+def test_an_opened_agent_is_not_pruned_before_its_turn(rig):
+    rig.open('gpt')
+    journal = rig.home / 'sessions.jsonl'
+    old = json.loads(journal.read_text().splitlines()[-1]); old['used'] = '2000-01-01T00:00:00+00:00'
+    journal.write_text(json.dumps(old) + '\n')
+    rig.stop(); rig.start()
+    rig.open('gpt')
+    assert rig.request('/prune', {'days': 1})['pruned'] == []
+    assert rig.turn('PING')[-1]['text'] == 'PONG'
+
+
+def test_folder_refusals_see_through_macos_data_volume_paths(rig):
+    if sys.platform != 'darwin': pytest.skip('macOS data volume')
+    for cwd in ('/System/Volumes/Data', '/System/Volumes/Data' + str(Path.home())):
+        conn, file, status, _ = rig.connect('/open', {'agentId': 'd', 'family': 'gpt', 'cwd': cwd})
+        reply = json.loads(file.read()); file.close(); conn.close()
+        assert status == 400 and 'home folder' in reply['error']
+    temp = Path(tempfile.mkdtemp(dir='/private/var/tmp'))
+    try:
+        conn, file, status, _ = rig.connect('/open', {'agentId': 'r', 'family': 'grok', 'cwd': '/System/Volumes/Data' + str(temp), 'readonly': True})
+        reply = json.loads(file.read()); file.close(); conn.close()
+        assert status == 400 and 'read-only profile' in reply['error']
+    finally: temp.rmdir()
+
+
+def test_relative_folders_are_refused_and_a_pinned_folder_is_compared_as_a_folder(rig):
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'a', 'family': 'gpt', 'cwd': 'relative/folder'})
+    reply = json.loads(file.read()); file.close(); conn.close()
+    assert status == 400 and 'absolute' in reply['error']
+    rig.open('gpt')
+    assert rig.open('gpt', pin_cwd=True, cwd=str(rig.home) + '/./')['vendorSession']
+    other = rig.home / 'other'; other.mkdir()
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'a', 'family': 'gpt', 'cwd': str(other), 'pin_cwd': True})
+    reply = json.loads(file.read()); file.close(); conn.close()
+    assert status == 400 and 'fixed at the first turn' in reply['error']
+
+
+def test_secrets_in_headers_and_json_are_redacted():
+    m = load('lordd_redact_json')
+    text = m.Redactor()('Authorization: Bearer opaque123 {"password": "pw-value", "api_key": "k-value"} token=t-value keep')
+    assert not any(s in text for s in ('opaque123', 'pw-value', 'k-value', 't-value')) and text.endswith('keep')
+
+
+def test_a_family_section_that_is_not_an_object_is_refused(tmp_path, monkeypatch):
+    m = load('lordd_family')
+    (tmp_path / 'config.json').write_text(json.dumps({'grok': 'grok-5'}))
+    monkeypatch.setattr(m, 'HOME', tmp_path)
+    with pytest.raises(ValueError, match='grok in config.json must be an object'): m.load_config()
+
+
+def test_vendors_start_with_the_latest_session_path(rig):
+    rig.request('/open', {'agentId': 'p', 'family': 'grok', 'cwd': str(rig.home), 'path': '/session/bin:' + os.environ['PATH']})
+    launch = [e for e in rig.audit() if e.get('launch')][-1]
+    assert launch['path'].startswith('/session/bin:')
+
+
+def test_an_interrupt_while_a_turn_is_starting_stops_it_and_leaves_nothing():
+    m = load('lordd_starting')
+    from unittest.mock import AsyncMock
+    async def main():
+        a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6.1-sol', 'vendorSession': 's'})
+        d = object.__new__(m.Daemon); d.agents = {'a': a}; d.redact = str; d.save = lambda a: None
+        async def slow_attach(a): await asyncio.sleep(.1)
+        d.effort, d.attach = AsyncMock(), slow_attach
+        d.backend = lambda a: None
+        d.task = asyncio.create_task
+        begin = asyncio.create_task(d.begin_locked(a, {'text': 'x'}))
+        await asyncio.sleep(.02)
+        await d.interrupt(a)
+        await begin
+        await asyncio.sleep(.05)
+        return a.state, a.undelivered()
+    assert asyncio.run(main()) == ('idle', False)
+
+
+def test_kill_tree_survives_a_group_of_zombies(monkeypatch):
+    m = load('lordd_eperm')
+    def eperm(*args): raise PermissionError(1, 'Operation not permitted')
+    monkeypatch.setattr(m.os, 'killpg', eperm)
+    async def main():
+        process = await asyncio.create_subprocess_exec(sys.executable, '-c', 'import time; time.sleep(30)', start_new_session=True)
+        await m.kill_tree(process)
+        return process.returncode
+    assert asyncio.run(main()) is not None

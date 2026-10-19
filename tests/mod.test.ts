@@ -7,6 +7,7 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
   const processes: string[][] = []
   const deliveries: string[] = []
   let modelCalls = 0
+  let opened: string | undefined
   let streamFinished = false
   mock.env(on, { HOME: '/test', ...(socket ? { LORD_DAEMON_SOCKET: socket } : {}) })
   let spawned = 'lord:gpt'
@@ -46,6 +47,12 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
     const path = e.url.replace('http://lord', '')
     requests.push({ path, body: e.init?.body ? JSON.parse(e.init.body) : undefined })
     if (socket === '/down.sock') return { deny: 'socket unavailable' }
+    // The daemon compares a pinned @cwd with the folder the agent first opened in.
+    if (path === '/open') {
+      const body = JSON.parse(e.init!.body!)
+      if (body.pin_cwd && opened && body.cwd !== opened) return { value: { ok: false, status: 400, headers: {}, text: JSON.stringify({ error: `@cwd is fixed at the first turn (${opened})` }) } }
+      if (!body.dirs?.includes('/bad')) opened = opened ?? body.cwd
+    }
     if (path === '/open' && JSON.parse(e.init!.body!).dirs?.includes('/bad')) return { value: { ok: false, status: 400, headers: {}, text: JSON.stringify({ error: 'every @dir must be an existing directory' }) } }
     if (path === '/health' && failures-- > 0) return { deny: 'socket unavailable' }
     if (path === '/agents' && failures > 0) return { deny: 'socket unavailable' }
@@ -62,7 +69,7 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
     modelCalls++
     return { turnId: e.turnId, index: e.index, answer: 'MODEL CALLED', toolUses: [], stopReason: 'end_turn', usage: null }
   })
-  return { tools, requests, statuses, processes, deliveries, clock, modelCalls: () => modelCalls, streamFinished: () => streamFinished }
+  return { events, tools, requests, statuses, processes, deliveries, clock, modelCalls: () => modelCalls, streamFinished: () => streamFinished }
 }
 
 async function spawn($: any, type = 'lord:gpt') {
@@ -118,7 +125,7 @@ test('Workflow wrappers and leading directives are removed and worktree cwd wins
   await spawn($, 'lord:grok')
   await $.classic.SubagentStart({ agent_id: 'a1', agent_type: 'lord:grok', cwd: '/repo/.claude/worktrees/agent-a1' })
   await step($, '[Workflow harness — computed task]\nextra header\nThe computed task text follows:\n\n  @model grok-model\n  @readonly\n  @net\n  do work\n    keep indent')
-  expect(w.requests.find(x => x.path === '/open')?.body).toEqual({ agentId: 'a1', family: 'grok', cwd: '/repo/.claude/worktrees/agent-a1', model: 'grok-model', readonly: true, net: true, effort: 'xhigh' })
+  expect(w.requests.find(x => x.path === '/open')?.body).toEqual({ agentId: 'a1', family: 'grok', cwd: '/repo/.claude/worktrees/agent-a1', pin_cwd: false, model: 'grok-model', readonly: true, net: true, effort: 'xhigh' })
   expect(w.requests.find(x => x.path === '/turn')?.body.text).toBe('do work\n  keep indent')
 })
 
@@ -346,7 +353,7 @@ test('a different @cwd after the first turn is refused', async ($, on) => {
   const w = world(on)
   await spawn($)
   await step($, '@cwd /pins/r1\nfirst')
-  expect((await step($, '@cwd /pins/r2\nsecond')).result.answer).toMatch(/^lord: error: @cwd is fixed at the first turn/)
+  expect((await step($, '@cwd /pins/r2\nsecond')).result.answer).toMatch(/^lord: error: open: @cwd is fixed at the first turn/)
   expect(w.requests.filter(x => x.path === '/turn').length).toBe(1)
 })
 
@@ -453,4 +460,32 @@ test('an agent restored while the daemon was down gets its settings once the dae
   expect((await response).result.answer).toBe('connected')
   const open = w.requests.find(x => x.path === '/open')!.body
   expect([open.effort, open.cwd]).toEqual(['ultra', '/pinned'])
+})
+
+test('a relative @cwd is under the agent\'s start folder and the session PATH reaches the daemon', async ($, on) => {
+  const w = world(on)
+  await spawn($)
+  await $.classic.SubagentStart({ agent_id: 'a1', agent_type: 'lord:gpt', cwd: '/repo' } as any)
+  await step($, '@cwd sub/dir\nwork')
+  const open = w.requests.find(x => x.path === '/open')!.body
+  expect([open.cwd, open.pin_cwd]).toEqual(['/repo/sub/dir', true])
+})
+
+test('after a JSON correction that used a lord tool, an answer with no JSON ends the turn instead of asking again', async ($, on) => {
+  const w = world(on, [{ type: 'done', text: '{"bad":true}' }])
+  await spawn($)
+  await step($, 'task')
+  await step($, '', 1)
+  w.tools.answer = { result: {}, isError: true, text: 'word is required', ref: 9 }
+  await $.tool.call({ tool: 'StructuredOutput', tool_use_id: 'lord_structured_t1_1', agentId: 'a1', bad: true } as any)
+  w.events.splice(0, w.events.length, { type: 'tool', callId: 'c9', name: 'SendMessage', input: { to: 'x', message: 'hi', summary: 'hi' } })
+  expect((await step($, '', 2)).result.stopReason).toBe('tool_use')
+  w.tools.answer = { result: {}, text: 'sent', ref: 9 }
+  await $.tool.call({ tool: 'SendMessage', tool_use_id: 'c9', agentId: 'a1', to: 'x', message: 'hi', summary: 'hi' } as any)
+  w.events.splice(0, w.events.length, { type: 'done', text: 'prose only' })
+  await step($, '', 3)
+  const before = w.requests.filter(x => x.path === '/turn').length
+  const { result } = await step($, '', 4)
+  expect(result.answer).toBe("lord: error: the vendor's corrected answer held no JSON object")
+  expect(w.requests.filter(x => x.path === '/turn').length).toBe(before)
 })
