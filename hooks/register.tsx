@@ -536,7 +536,7 @@ export const register: Register = on => {
       return { text: list.map((agent: any) => {
         const next = agents.get(agent.agentId)?.model
         const tokens = agent.usage ? ` ${agent.usage.input_tokens}+${agent.usage.cache_read_input_tokens} in ${agent.usage.output_tokens} out` : ''
-        return `${agent.agentId} ${agent.family} ${agent.model}${next && next !== agent.model ? ` (next: ${next})` : ''} ${agent.effort ?? ''} ${agent.state}${tokens} ${agent.cwd ?? ''}${agent.activity ? ' — ' + agent.activity : ''}\n  log: ${agent.log}`
+        return `${agent.agentId} ${agent.family} ${agent.model}${next && next !== agent.model ? ` (next: ${next})` : ''} ${agent.effort ?? ''} ${agent.state}${tokens} ${agent.cwd ?? ''}${agent.activity ? ' — ' + agent.activity : ''}\n  log: ${agent.log}${agent.answer ? `\n  answer: ${agent.answer}` : ''}`
       }).join('\n') || 'lord: no agents' }
     } catch (error) { return { text: errorLine(error) } }
   })

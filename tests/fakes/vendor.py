@@ -89,7 +89,10 @@ async def turn(sid, text, request_id=None):
     elif FAMILY == 'grok':
         update(sid, 'tool_call', toolCallId='native', title='fake work', status='in_progress')
     else:
-        send({'event': 'step_update', 'step_update': {'step_type': 'run_command', 'command': 'fake work'}})
+        # agy reports each tool step twice: when it starts and when it ends.
+        for state in ('ACTIVE', 'DONE'):
+            send({'event': 'step_update', 'step_update': {'step_index': 2, 'state': state, 'step_type': 'tool', 'tool_name': 'run_command',
+                  'tool_info': {'name': 'run_command', 'parameters': {'CommandLine': 'fake work'}}}})
     if '--signed-out' in sys.argv and FAMILY == 'gpt':
         send({'method': 'error', 'params': {'threadId': sid, 'turnId': tid, 'willRetry': False,
               'error': {'message': 'unexpected status 401 Unauthorized: Missing bearer or basic authentication in header'}}})

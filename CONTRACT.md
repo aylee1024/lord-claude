@@ -26,7 +26,8 @@ family), `tests/`, `README.md`, `PRIVACY.md`, `LICENSE`.
 Runtime files only in `~/.claude/lord/`: `lordd.sock` (600, folder 700), `lordd.lock`, `sessions.jsonl` (one record per
 agent save: ids, vendor session, model, effort, cwd, options, last usage, created, used; never task text),
 `logs/<agentId>.log` (the agent's activity: vendor commands and file actions, redacted, 4 MB cap, removed with the
-record), `lordd.log` (1 MB, one rotation). Two global side effects: an agy MCP entry `lord` while the daemon runs (added
+record; agy tool steps are logged once each, as the tool's name and parameters), `logs/<agentId>.answer.md` (the
+agent's latest final answer, redacted, rewritten each turn, removed with the record), `lordd.log` (1 MB, one rotation). Two global side effects: an agy MCP entry `lord` while the daemon runs (added
 before its first gemini agent, removed when it exits; agy has no per-run MCP option) and the `lord-workspace` and `lord-readonly` profiles between `# lord: begin` and `# lord: end` in
 `$GROK_HOME/sandbox.toml` (default `~/.grok`), rewritten only when they differ.
 
@@ -45,7 +46,7 @@ Every request but `GET /health` and `POST /mcp` carries `X-Lord-Control: <key>` 
 | POST | /interrupt, /close | `{agentId}` | `{ok}` (codex `turn/interrupt`, grok `session/cancel`, agy process kill; close also stops the process) |
 | POST | /mcp | `{agentId, name, arguments, token}` | the lord tool call of a vendor's MCP server; the per-agent token is required |
 | POST | /prune | `{days}` | `{ok, pruned}`; also at daemon start and hourly: journal records unused for `prune_days`; codex threads archived, vendor history otherwise kept |
-| GET | /agents | - | `[{agentId, family, model, effort, state, activity, cwd, log, usage}]` (`usage`: the vendor's last turn; codex input excludes its cached tokens) |
+| GET | /agents | - | `[{agentId, family, model, effort, state, activity, cwd, log, answer, usage}]` (`answer`: the answer file's path, null before a first answer) (`usage`: the vendor's last turn; codex input excludes its cached tokens) |
 
 NDJSON events: `text` (vendor text as it streams), `activity` (one line of vendor work), `tool` (`{callId, name: Agent|
 SendMessage, input}`; the stream ends, the vendor waits), `done` (`{text, usage, model}`; `text` is the final answer
@@ -87,7 +88,7 @@ the family's `no_progress_s` while running (grok and gemini 2400 s, gpt off), is
 `hang_s`), or a turn past its `wall_s`; progress is vendor stdout since the turn's dispatch (stderr is logging); the turn ends with an error naming
 the reason. Every stop kills the vendor's whole process tree by pid as well as its group. A failed vendor start is
 retried once; a crash, or a codex turn that ends failed, restarts the vendor on the next turn, never in a loop. Each turn's activity log starts with a `turn: <family> <model> effort <effort>` line. A process idle for `process_idle_s`
-(default `idle_exit_s`) is closed, the codex process that archives pruned threads included, and its session resumed on the next turn.
+(default 60 s) is closed, the codex process that archives pruned threads included, and its session resumed on the next turn.
 
 ## Lord tools given to every vendor session (MCP, `lordd.py --mcp [agentId]`)
 `spawn_agent(type, prompt, description, background?, effort?, model?)` becomes an engine Agent call (a non-Claude model

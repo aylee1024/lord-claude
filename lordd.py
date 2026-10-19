@@ -71,7 +71,7 @@ def load_config():
         config[key] = {**config[key], **value} if isinstance(value, dict) and isinstance(config.get(key), dict) else value
     for family in ('gpt', 'grok', 'gemini'):
         if family in config and not isinstance(config[family], dict): raise ValueError(f'{family} in config.json must be an object')
-    numbers = [(k, config[k]) for k in ('memory_ceiling_kb', 'idle_exit_s', 'prune_days') if k in config]
+    numbers = [(k, config[k]) for k in ('memory_ceiling_kb', 'idle_exit_s', 'process_idle_s', 'prune_days') if k in config]
     numbers += [(f'{f}.no_progress_s', config[f]['no_progress_s']) for f in ('gpt', 'grok', 'gemini') if 'no_progress_s' in config.get(f, {})]
     for key, value in numbers:
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0: raise ValueError(f'{key} must be a number of 0 or more')
@@ -163,6 +163,13 @@ def codex_activity(item):
     if kind == 'webSearch': return 'search ' + str(item.get('query'))
     if kind in ('userMessage', 'agentMessage', 'reasoning', None): return None
     return str(kind)
+
+def agy_activity(step):
+    # A tool step as agy names it, with its parameters: the file, folder, search or command it used.
+    info = step.get('tool_info') or {}
+    name = info.get('name') or step.get('tool_name')
+    if not name: return str(step.get('command') or step.get('step_type', 'Working'))
+    return f"{name} {dumps(info['parameters'])[:300]}" if info.get('parameters') else str(name)
 
 def dumps(value):
     return json.dumps(value, separators=(',', ':'), ensure_ascii=True)
@@ -259,8 +266,9 @@ class Agent:
         self.cancel_requested, self.turn_task = False, None
         self.followup, self.earlier, self.carry, self.call_data, self.ended_turns = None, None, [], {}, set()
         self.final_text, self.restart, self.token = '', False, uuid.uuid4().hex
-        self.default_model = False
+        self.default_model, self.agy_step = False, None
         self.log_path = HOME / 'logs' / f"{record['agentId']}.log"
+        self.answer_path = self.log_path.with_suffix('.answer.md')
 
     def note(self, text):
         # The agent's activity log: what the vendor ran and read, for review provenance.
@@ -284,6 +292,11 @@ class Agent:
             for future in self.calls.values():
                 if not future.done(): future.set_result({'content': [{'type': 'text', 'text': 'Turn ended'}], 'isError': True})
         self.events.put_nowait({'type': kind, **value})
+        if kind == 'done':
+            # The latest turn's final answer, kept beside the activity log, so a read-only agent's findings
+            # still land in a file.
+            self.answer_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            self.answer_path.write_text(REDACT(value['text']))
 
 class Vendor:
     def __init__(self, daemon, family, agent=None):
@@ -423,7 +436,10 @@ class Vendor:
                 elif payload.get('step_type') != 'agent_response':
                     # Text before a tool step is narration; the answer is what agy says after its last one.
                     a.answer = ''
-                    a.emit('activity', text=str(payload.get('command') or payload.get('step_type', 'Working')))
+                    # agy reports a tool step when it starts and again when it ends; the step is noted once.
+                    if payload.get('step_index') is None or payload.get('step_index') != a.agy_step:
+                        a.agy_step = payload.get('step_index')
+                        a.emit('activity', text=agy_activity(payload))
             elif event == 'result' and a.state in ('running', 'waiting_tool'):
                 if payload.get('status') != 'SUCCESS' or payload.get('error'):
                     a.emit('error', message=self.d.redact(payload.get('error') or payload.get('status')), retryable=True)
@@ -788,7 +804,7 @@ class Daemon:
         a.state, a.answer, a.final_text, a.items = 'running', '', '', {}
         a.base, a.tokens, a.turn_id = dict(a.total), usage({}), None
         a.finished.clear()
-        a.dispatched = False
+        a.dispatched, a.agy_step = False, None
         a.note(f'turn: {a.family} {a.model} effort {a.effort}')
         self.save(a)
         a.turn_task = self.task(self.run_turn(a, body))
@@ -869,7 +885,8 @@ class Daemon:
 
     def listed(self):
         return [{**{k: getattr(a, k) for k in ('agentId', 'family', 'model', 'effort', 'state', 'activity', 'cwd')},
-                 'log': str(a.log_path), 'usage': a.record.get('usage')} for a in self.agents.values()]
+                 'log': str(a.log_path), 'answer': str(a.answer_path) if a.answer_path.exists() else None,
+                 'usage': a.record.get('usage')} for a in self.agents.values()]
 
     async def mcp_call(self, a, name, args, token):
         if token != a.token: raise ValueError('lord tool call from an unknown process')
@@ -1112,6 +1129,7 @@ class Daemon:
                     raise
                 removed.append(aid)
                 a.log_path.unlink(missing_ok=True)
+                a.answer_path.unlink(missing_ok=True)
                 del self.agents[aid]
                 self.open_locks.pop(aid, None)
         self.compact()

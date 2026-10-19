@@ -805,6 +805,23 @@ def test_activity_is_logged_per_agent_and_listed(rig):
     assert f"turn: gpt {entry['model']} effort {entry['effort']}" in Path(entry['log']).read_text()
 
 
+def test_agy_tool_steps_are_logged_once_with_their_parameters(rig):
+    rig.open('gemini')
+    rig.turn('PING')
+    log = Path(rig.request('/agents')[0]['log']).read_text()
+    assert log.count('run_command {"CommandLine":"fake work"}') == 1
+
+
+def test_each_turn_saves_its_final_answer_to_a_file(rig):
+    rig.open('gpt', readonly=True)
+    assert rig.request('/agents')[0]['answer'] is None
+    rig.turn('PING')
+    path = Path(rig.request('/agents')[0]['answer'])
+    assert path.read_text() == 'PONG'
+    rig.turn('second answer')
+    assert path.read_text() == 'second answer'
+
+
 def test_a_later_readonly_reattaches_with_the_read_only_sandbox(rig):
     rig.open('gpt')
     rig.turn('PING')
