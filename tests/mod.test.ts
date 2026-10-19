@@ -50,6 +50,7 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
     // The daemon compares a pinned @cwd with the folder the agent first opened in.
     if (path === '/open') {
       const body = JSON.parse(e.init!.body!)
+      if (body.model === '/bad-model') return { value: { ok: false, status: 400, headers: {}, text: JSON.stringify({ error: 'unknown gpt model /bad-model' }) } }
       if (body.pin_cwd && opened && body.cwd !== opened) return { value: { ok: false, status: 400, headers: {}, text: JSON.stringify({ error: `@cwd is fixed at the first turn (${opened})` }) } }
       if (!body.dirs?.includes('/bad')) opened = opened ?? body.cwd
     }
@@ -506,4 +507,24 @@ test('a no-JSON correction that used a lord tool is not asked again', async ($, 
   const before = asks()
   await step($, '', 3)
   expect(asks()).toBe(before)
+})
+
+test('a relative @cwd does not replace a requested worktree that never arrived', async ($, on) => {
+  const w = world(on)
+  await $.tool.call({ tool: 'Agent', tool_use_id: 'spawn1', subagent_type: 'lord:gpt', isolation: 'worktree', prompt: 'task', description: 'test' } as any)
+  await spawn($)
+  const { result } = await step($, '@cwd sub\nwork')
+  expect(result.answer).toMatch(/worktree isolation was requested/)
+  expect(w.requests.some(x => x.path === '/open')).toBe(false)
+})
+
+test('/lord model with a model the daemon refuses is not kept for later turns', async ($, on) => {
+  const w = world(on)
+  await spawn($)
+  await step($, 'first')
+  await $.command.run({ command: 'lord', args: 'model a1 /bad-model' })
+  expect((await step($, 'second')).result.answer).toMatch(/unknown gpt model \/bad-model/)
+  w.requests.length = 0
+  expect((await step($, 'third')).result.answer).toBe('fake answer')
+  expect(w.requests.find(x => x.path === '/turn')!.body.model).toBeUndefined()
 })

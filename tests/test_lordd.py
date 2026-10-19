@@ -1265,3 +1265,24 @@ def test_a_crashed_vendors_descendants_in_another_group_are_stopped():
         os.kill(child, signal.SIGKILL)
         return False
     assert asyncio.run(main())
+
+
+def test_grok_effort_is_clamped_before_grok_reports_its_levels():
+    m = load('lordd_grok_levels')
+    async def main():
+        a = m.Agent({'agentId': 'k', 'family': 'grok', 'cwd': '.', 'model': 'grok-4.7'})
+        d = object.__new__(m.Daemon); d.vendors = {}
+        await d.effort(a, 'ultra')
+        return a.effort
+    assert asyncio.run(main()) == 'xhigh'
+
+
+def test_an_aws_secret_key_assignment_is_redacted():
+    r = load('lordd_redact_aws').Redactor()
+    assert 'abc123' not in r('aws_secret_access_key=abc123def456 AWS_SECRET_ACCESS_KEY: abc123xyz')
+
+
+def test_an_extra_folder_holding_the_home_folder_is_refused(rig):
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home), 'dirs': ['/']})
+    reply = json.loads(file.read()); file.close(); conn.close()
+    assert status == 400 and 'holding your home folder' in reply['error']

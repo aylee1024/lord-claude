@@ -61,7 +61,7 @@ What each vendor enforces:
 
 An agent's reply is the vendor's final answer only; its narration and tool activity show live in the agent's view but are not recorded. In a Workflow with `schema`, describe the fields in the prompt: Claude Code shows the schema only to its own model, so Lord turns the vendor's JSON into the structured result and passes any validation error back once for a corrected object.
 
-Agents can start their own agents and message others through three Lord tools (`spawn_agent`, `send_message`, `list_agents`); Claude Code runs and shows every child. `list_agents` shows each agent's id, vendor, model and state, not its commands or folder. A read-only agent gets only `list_agents`, so it cannot hand writes to another agent.
+Agents can start their own agents and message others through three Lord tools (`spawn_agent`, `send_message`, `list_agents`); Claude Code runs and shows every child. `list_agents` shows each agent's id, vendor, model and state, not its commands or folder. A sandbox confines one agent, not the agents it starts: a writable agent can start a less confined one (gemini has no sandbox; a child's prompt can carry `@net` or `@dir`), and gpt with `@net` can reach Lord's daemon. For a hard boundary use `@readonly`, which removes `spawn_agent` and `send_message`. A read-only agent gets only `list_agents`, so it cannot hand writes to another agent.
 
 `/lord` lists agents with the model that ran, effort, state, the vendor's token counts and the agent's activity log (`~/.claude/lord/logs/<agentId>.log`: every command and file action the vendor reported). `/lord model <agentId> <model>` selects an agent's next model. The status line shows working agents and, while gpt agents work, your ChatGPT usage.
 

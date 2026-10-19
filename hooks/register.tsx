@@ -303,13 +303,14 @@ export const register: Register = on => {
           if (known) Object.assign(agent, { opened: true, cwd: known.cwd, effort: agent.effort ?? known.effort, model: agent.model ?? known.model })
         }
         const chosen = merge({ text: '', model: agent.model, effort: agent.effort, readonly: agent.readonly, net: agent.net, dirs: agent.dirs, limits: agent.limits }, input)
+        // Only an absolute @cwd replaces the worktree; a relative one would be under the main tree.
+        if (agent.worktree && !(input.cwd && /^[/~]/.test(input.cwd)) && !directories.get(agentId)) throw new Error('worktree isolation was requested but Claude Code reported no worktree path; refusing to run in the main tree')
         // A task can name the vendor's working folder (fixed at the first turn; the daemon compares folders, not
         // spellings). A relative one is under the agent's start folder, not the daemon's.
         const base = input.cwd && /^[/~]/.test(input.cwd) ? input.cwd : `${directories.get(agentId) ?? agent.cwd ?? await $.session.cwd()}${input.cwd ? '/' + input.cwd : ''}`
         if (input.cwd) input.cwd = base
         // A relative @dir is under the agent's working folder too.
         if (input.dirs) input.dirs = input.dirs.map(dir => /^[/~]/.test(dir) ? dir : `${input.cwd ?? (agent.opened ? agent.cwd : undefined) ?? base}/${dir}`)
-        if (agent.worktree && !input.cwd && !directories.get(agentId)) throw new Error('worktree isolation was requested but Claude Code reported no worktree path; refusing to run in the main tree')
         const cwd = input.cwd ?? (agent.opened ? agent.cwd : undefined) ?? directories.get(agentId) ?? agent.cwd ?? await $.session.cwd()
         await request($, '/open', { agentId, family: agent.family, cwd, pin_cwd: !!input.cwd, path: await $.env.get('PATH'), model: chosen.model, effort: chosen.effort ?? e.effort, readonly: chosen.readonly, net: chosen.net, dirs: chosen.dirs, ...chosen.limits })
         Object.assign(agent, { model: chosen.model, effort: chosen.effort, readonly: chosen.readonly, net: chosen.net, dirs: chosen.dirs, limits: chosen.limits })
@@ -461,7 +462,8 @@ export const register: Register = on => {
         const known = list.find((agent: any) => agent.agentId === args[1])
         if (!known) return { text: `lord: unknown agent ${args[1]}` }
         const agent = agents.get(args[1]) ?? { family: known.family, cwd: known.cwd }
-        agent.model = args[2]
+        // Staged like an @model line: it applies only once /open accepts it.
+        agent.pending = merge({ text: '', ...agent.pending }, { model: args[2] })
         agents.set(args[1], agent)
         return { text: `lord: ${args[1]} will use ${args[2]} next turn.` }
       }

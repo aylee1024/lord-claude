@@ -8,7 +8,7 @@ Lord collects no data and has no server. It runs on your computer and makes no n
 - xAI: https://x.ai/legal/privacy-policy
 - Google: https://policies.google.com/privacy
 
-The vendor program can read and act on files in the agent's working folder with its own tools, as it would if you ran it yourself. Lord removes secret-like environment variables (names containing KEY, TOKEN, SECRET, PASSWORD or CREDENTIAL, and bearer values) before it starts a vendor program, and never reads vendor login files.
+The vendor program reads and acts on files with its own tools, as it would if you ran it yourself, within its sandbox: gpt writes its working folder, `@dir` folders and temp folders; grok its working folder, temp folders and `~/.grok`; gemini (agy) has no sandbox and can write anywhere. Lord removes secret-like environment variables (names containing KEY, TOKEN, SECRET, PASSWORD or CREDENTIAL, and bearer values) before it starts a vendor program, and never reads vendor login files.
 
 **What stays on your computer**, under `~/.claude/lord/`:
 

@@ -168,7 +168,7 @@ class Redactor:
         # key=value, key: value and "key": "value", for the usual secret names.
         # Names may carry a prefix (GITHUB_TOKEN, client_secret, "access_token"); a scheme word (Basic, Token) goes with
         # its value.
-        return re.sub(r'(?i)(["\x27]?(?<![A-Za-z0-9])[\w-]*(?:api[-_]?key|authorization|password|passwd|secret|token)["\x27]?\s*[:=]\s*["\x27]?)'
+        return re.sub(r'(?i)(["\x27]?(?<![A-Za-z0-9])[\w-]*(?:api[-_]?key|authorization|password|passwd|secret|token)[\w-]*["\x27]?\s*[:=]\s*["\x27]?)'
                       r'(?!\[REDACTED\])(?:(?:basic|token|digest|bearer)\s+)?[^\s\"\x27,;}]+', r'\1[REDACTED]', value)
 
 async def process_table():
@@ -569,7 +569,8 @@ class Daemon:
             model = next((m for m in models if m['id'] == a.model), None)
             if models and model is None: raise ValueError(f'unknown gpt model {a.model}; codex lists {", ".join(m["id"] for m in models)}')
             allowed = [v['reasoningEffort'] for v in (model or {}).get('supportedReasoningEfforts', [])]
-        elif a.family == 'grok': allowed = self.backend(a).efforts
+        # Before grok reports its levels (a resumed session may not), its documented range applies.
+        elif a.family == 'grok': allowed = self.backend(a).efforts or ['low', 'medium', 'high', 'xhigh']
         else: allowed = await self.agy_efforts(a.model)
         if allowed and value not in allowed:
             value = min((v for v in allowed if v in RANKS), key=lambda v: abs(RANKS.index(v) - RANKS.index(value)), default=value)
@@ -651,6 +652,8 @@ class Daemon:
                 raise ValueError(f'invalid {key}')
         if any(not Path(x).expanduser().is_absolute() for x in body.get('dirs') or []): raise ValueError('every @dir must be an absolute path')
         dirs = [str(Path(x).expanduser().resolve()) for x in body.get('dirs') or []]
+        if any(inside(canon(str(Path.home())), (canon(x),)) or (sys.platform == 'darwin' and inside('/System/Volumes/Data', (x,))) for x in dirs):
+            raise ValueError('refusing / or a folder holding your home folder as an @dir')
         if any(not Path(x).is_dir() for x in dirs): raise ValueError('every @dir must be an existing directory')
         for key in ('readonly', 'net'):
             if body.get(key) and not a.record.get(key):
