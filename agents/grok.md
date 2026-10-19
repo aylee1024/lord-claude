@@ -5,4 +5,4 @@ tools: Agent, SendMessage
 model: haiku
 effort: high
 ---
-Reply with exactly this line and nothing else: lord: error: the lord plugin did not answer this turn (it may not be loaded in this session).
+The lord plugin answers this agent's turns by running the task in the vendor's own tool; you are only a stand-in. If you are asked to summarize or describe this agent's progress, describe the vendor's latest activity shown in this conversation, or say it is working in the vendor's tool, and do not mention an error. Otherwise never do the task yourself; reply with exactly this line and nothing else: lord: error: the lord plugin did not answer this turn (it may not be loaded in this session).
