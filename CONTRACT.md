@@ -96,6 +96,15 @@ goes as an `@model` first line); `send_message(to, text)` becomes SendMessage; `
 `list_agents`, and the daemon refuses spawn and send for it.
 
 ## Mod behaviour
+- A new Lord agent's `agent.spawn` description becomes `<model>, <effort> · <description>` and its `model` the vendor model:
+  `@model`, else `~/.claude/lord/config.json`, else the bundled `config.json`. Short names: the model's word capitalized, with
+  its version when that has a minor number (gpt-6-astra Astra, gpt-6.1-sol Sol 6.1); an id with no word is the family plus
+  version (grok-4.7 Grok 4.7). Effort: `@effort`, else the Agent call's, else high, capped at xhigh for grok and high for
+  gemini; the Agent call's `effort` is set to that level when Claude Code accepts it (ultra is not). The vendor model also
+  makes Claude Code's progress-summary requests fail (404), so summaries never replace the label.
+- At `session.start` and each main-loop `turn.complete`, a Lord newer than the loaded one in Claude Code's
+  `installed_plugins.json` (same install folder) runs `/reload-plugins --force` once per version, a second later, when no
+  Lord turn of the session is running; a refused reload says to run it by hand.
 - Each agent file's own prompt, used only when no Lord hook answers a turn, makes Claude reply with a two-line
   `lord: error:` message. Claude Code's progress summaries run that prompt too and drop a multi-line reply, so an
   agent's row never shows the error while the vendor works.

@@ -30,7 +30,11 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
   // Like the real daemon, an agent spawned in this session is listed only after its /open; without a spawn the
   // test stands for a module reload and the daemon already holds the agent's settings.
   let fresh = false
-  on('agent.spawn', (_, e) => { spawned = e.subagentType; fresh = true; return { agentId: 'a1', model: 'haiku' } })
+  const spawnInputs: any[] = []
+  on('agent.spawn', (_, e) => { spawned = e.subagentType; spawnInputs.push(e); fresh = true; return { agentId: 'a1', model: 'haiku' } })
+  const commands: any[] = [], toasts: string[] = []
+  on('command.run', (_, e) => { commands.push(e); return { text: '' } })
+  on('ui.toast', (_, e) => { toasts.push(e.text); return { value: {} } })
   on('classic.SubagentStart', () => ({}))
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', (_, e) => ({ text: e.answer }))
@@ -42,7 +46,8 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
   on('session.receive', (_, e) => ({ text: e.text }))
   on('agent.list', () => ({ value: [{ id: 'a1', type: spawned }] as any }))
   const tools = { answer: { result: {}, text: 'child result', ref: 9 } as any }
-  on('tool.call', () => tools.answer)
+  const toolCalls: any[] = []
+  on('tool.call', (_, e) => { toolCalls.push(e); return tools.answer })
   on('http.fetch', (_, e) => {
     const path = e.url.replace('http://lord', '')
     requests.push({ path, body: e.init?.body ? JSON.parse(e.init.body) : undefined })
@@ -69,7 +74,7 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
     modelCalls++
     return { turnId: e.turnId, index: e.index, answer: 'MODEL CALLED', toolUses: [], stopReason: 'end_turn', usage: null }
   })
-  return { events, tools, requests, statuses, processes, deliveries, clock, modelCalls: () => modelCalls, streamFinished: () => streamFinished }
+  return { events, tools, requests, statuses, processes, deliveries, clock, spawnInputs, toolCalls, commands, toasts, modelCalls: () => modelCalls, streamFinished: () => streamFinished }
 }
 
 async function spawn($: any, type = 'lord:gpt') {
@@ -450,6 +455,79 @@ test('@nosandbox reaches the daemon and stays on for later turns', async ($, on)
   await step($, 'next')
   expect(w.requests.filter(x => x.path === '/open').map(x => x.body.nosandbox)).toEqual([true, true])
   expect(w.requests.find(x => x.path === '/turn')?.body.text).toBe('build it')
+})
+
+const CONFIGS = (path: string) => path === '/test/.claude/lord/config.json' ? { value: JSON.stringify({ grok: { model: 'grok-5' } }) }
+  : path.endsWith('/config.json') ? { value: JSON.stringify({ gpt: { model: 'gpt-6.1-sol' }, grok: { model: 'grok-4.7' }, gemini: { model: 'gemini-4-argon' } }) }
+  : { deny: 'no such file' }
+
+test('each Lord agent is labelled with the vendor model and effort it will run, and runs as that model', async ($, on) => {
+  const w = world(on)
+  on('fs.read', (_, e) => CONFIGS(e.path))
+  const launch = async (type: string, prompt: string, effort?: string) => {
+    await $.tool.call({ tool: 'Agent', tool_use_id: 'L', subagent_type: type, prompt, description: 'Fix it', ...(effort ? { effort } : {}) } as any)
+    await $.agent.spawn({ tool_use_id: 'L', prompt, description: 'Fix it', subagentType: type, provider: { plugin: 'lord', tier: 'user' }, parentModel: 'haiku', background: true, fork: false } as any)
+    const input = w.spawnInputs.at(-1)
+    return { description: input.description, model: input.model }
+  }
+  expect(await launch('lord:gpt', '@model gpt-6-astra\n@effort xhigh\nwork')).toEqual({ description: 'Astra, xhigh · Fix it', model: 'gpt-6-astra' })
+  expect(await launch('lord:gpt', '@model gpt-6-sol\nwork')).toEqual({ description: 'Sol, high · Fix it', model: 'gpt-6-sol' })
+  // The bundled default, with the Agent call's effort.
+  expect(await launch('lord:gpt', 'work', 'max')).toEqual({ description: 'Sol 6.1, max · Fix it', model: 'gpt-6.1-sol' })
+  // The user's config.json wins over the bundled one; grok runs a max request as xhigh, gemini as high.
+  expect(await launch('lord:grok', 'work', 'max')).toEqual({ description: 'Grok 5, xhigh · Fix it', model: 'grok-5' })
+  expect(await launch('lord:gemini', '@effort max\nwork')).toEqual({ description: 'Argon, high · Fix it', model: 'gemini-4-argon' })
+  // The Agent call carries the level the vendor runs, so Claude Code shows it beside the model; ultra stays an @effort line.
+  const calls = w.toolCalls
+  await launch('lord:gpt', '@effort xhigh\nwork', 'high')
+  expect(calls.at(-1).effort).toBe('xhigh')
+  await launch('lord:grok', 'work', 'max')
+  expect(calls.at(-1).effort).toBe('xhigh')
+  expect(await launch('lord:gpt', '@effort ultra\nwork', 'max')).toEqual({ description: 'Sol 6.1, ultra · Fix it', model: 'gpt-6.1-sol' })
+  expect(calls.at(-1).effort).toBe('max')
+  // Claude's own agents are left alone.
+  expect(await launch('general-purpose', 'work', 'max')).toEqual({ description: 'Fix it', model: undefined })
+  expect(calls.at(-1).effort).toBe('max')
+})
+
+test('a newer installed Lord reloads plugins once no Lord turn is running, once per version', async ($, on) => {
+  const w = world(on, [{ type: 'activity', text: 'working' }, { type: 'done', text: 'final answer' }])
+  let installed = '9.0.1', root = ''
+  on('fs.read', (_, e) => {
+    if (e.path.endsWith('/.claude-plugin/plugin.json')) { root = e.path.replace('/.claude-plugin/plugin.json', ''); return { value: JSON.stringify({ name: 'lord', version: '9.0.0' }) } }
+    if (e.path.endsWith('/installed_plugins.json')) return { value: JSON.stringify({ version: 2, plugins: { 'lord@x': [{ installPath: root.replace(/\/[^/]+$/, '') + '/' + installed, version: installed }] } }) }
+    return { deny: 'no such file' }
+  })
+  await spawn($)
+  await $.turn.start({ agentId: 'a1', turnId: 't1', text: 'hello' })
+  const stream = $.turn.step({ agentId: 'a1', turnId: 't1', index: 0, model: 'haiku', messageCount: 1 })
+  await stream.next()
+  // The Lord turn is mid-stream: no reload.
+  await $.turn.complete({ turnId: 'm1', answer: '', isAborted: false } as any)
+  await w.clock.advance(1000)
+  expect(w.commands).toEqual([])
+  while (!(await stream.next()).done) {}
+  await $.turn.complete({ turnId: 'm2', answer: '', isAborted: false } as any)
+  await w.clock.advance(1000)
+  expect(w.commands.map(c => [c.command, c.args])).toEqual([['reload-plugins', '--force']])
+  expect(w.toasts).toContain('Lord Claude 9.0.1 installed; reloading plugins')
+  // Once per version; an equal version never reloads.
+  await $.turn.complete({ turnId: 'm3', answer: '', isAborted: false } as any)
+  await w.clock.advance(1000)
+  expect(w.commands.length).toBe(1)
+})
+
+test('an installed version equal to the loaded one does not reload', async ($, on) => {
+  const w = world(on)
+  let root = ''
+  on('fs.read', (_, e) => {
+    if (e.path.endsWith('/.claude-plugin/plugin.json')) { root = e.path.replace('/.claude-plugin/plugin.json', ''); return { value: JSON.stringify({ name: 'lord', version: '9.0.0' }) } }
+    if (e.path.endsWith('/installed_plugins.json')) return { value: JSON.stringify({ plugins: { 'lord@x': [{ installPath: root.replace(/\/[^/]+$/, '') + '/9.0.0', version: '9.0.0' }] } }) }
+    return { deny: 'no such file' }
+  })
+  await $.session.start({ cwd: '/repo' })
+  await w.clock.advance(1000)
+  expect(w.commands).toEqual([])
 })
 
 test('a named lord launch is refused, since it would start a Claude teammate instead of the vendor', async ($, on) => {

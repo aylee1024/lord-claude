@@ -13,6 +13,7 @@ const directories = new Map<string, string>()
 const pending = new Map<string, string>()
 const others = new Set<string>()
 const isolated = new Set<string>()
+const callEfforts = new Map<string, string>()
 // Quitting aborts the session's agent turns; the daemon keeps those turns running for the next session.
 let ending = false
 
@@ -83,6 +84,55 @@ function version($: EngineInterface): Promise<string | undefined> {
   // Sent with /open: a daemon older than this plugin exits once idle, and the next turn starts this version's.
   pluginVersion ??= $.fs.read(`${$.plugin.root}/.claude-plugin/plugin.json`).then(text => JSON.parse(String(text)).version, () => undefined)
   return pluginVersion
+}
+
+function newer(version: string, than: string): boolean {
+  // Dotted numbers only; anything else is never newer.
+  const a = version.split('.').map(Number), b = than.split('.').map(Number)
+  if ([...a, ...b].some(Number.isNaN)) return false
+  for (let i = 0; i < Math.max(a.length, b.length); i++) if ((a[i] ?? 0) !== (b[i] ?? 0)) return (a[i] ?? 0) > (b[i] ?? 0)
+  return false
+}
+
+const RANKS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']
+// The highest level each vendor runs, as the agent descriptions state; a higher request runs at this one.
+const CEILINGS: Record<string, string> = { gpt: 'ultra', grok: 'xhigh', gemini: 'high' }
+
+function capped(family: string, effort: string): string {
+  const level = RANKS.indexOf(effort), ceiling = RANKS.indexOf(CEILINGS[family] ?? 'ultra')
+  return level < 0 ? effort : RANKS[Math.min(level, ceiling)]!
+}
+
+function shortName(model: string): string {
+  // gpt-6-astra -> Astra, gpt-6.1-sol -> Sol 6.1, gemini-4-argon -> Argon, grok-4.7 -> Grok 4.7.
+  const capital = (word: string) => word[0]!.toUpperCase() + word.slice(1)
+  const named = /^[a-z]+-(\d+(?:\.\d+)*)-([a-z][a-z0-9]*)$/i.exec(model)
+  if (named) return capital(named[2]!) + (named[1]!.includes('.') ? ` ${named[1]}` : '')
+  const bare = /^([a-z]+)-(\d+(?:\.\d+)*)$/i.exec(model)
+  return bare ? `${capital(bare[1]!)} ${bare[2]}` : model
+}
+
+async function defaultModel($: EngineInterface, family: string): Promise<string | undefined> {
+  // The daemon's own rule: the bundled config.json, with ~/.claude/lord/config.json over it one family at a time.
+  const read = (path: string) => $.fs.read(path).then(text => JSON.parse(String(text))?.[family]?.model, () => undefined)
+  return await read(`${await $.env.get('HOME')}/.claude/lord/config.json`) ?? await read(`${$.plugin.root}/config.json`)
+}
+
+let reloading: string | undefined
+async function reloadIfUpdated($: EngineInterface): Promise<void> {
+  // Claude Code keeps the plugin version a session started with; a newer installed copy loads through /reload-plugins.
+  const loaded = await version($)
+  const base = $.plugin.root.replace(/\/[^/]+$/, '')
+  const installed = await $.fs.read(`${await $.env.get('HOME')}/.claude/plugins/installed_plugins.json`).then(text =>
+    Object.values(JSON.parse(String(text)).plugins ?? {}).flat().find((entry: any) => String(entry?.installPath ?? '').replace(/\/[^/]+$/, '') === base) as any, () => undefined)
+  if (!installed?.version || !loaded || !newer(String(installed.version), loaded) || reloading === installed.version) return
+  // A reload mid-turn would cut a vendor's stream; the next check runs once no Lord agent is working.
+  if ([...agents.values()].some(agent => agent.running)) return
+  reloading = String(installed.version)
+  $.ui.toast(`Lord Claude ${reloading} installed; reloading plugins`)
+  // The command queues until the session is idle; run from inside a hook the turn waits on, it would be refused.
+  void $.clock.sleep(1000).then(() => $.command.run({ command: 'reload-plugins', args: '--force' }))
+    .catch(() => $.ui.toast(`Lord Claude ${reloading} is installed: run /reload-plugins --force to load it`))
 }
 
 async function request($: EngineInterface, path: string, body?: unknown): Promise<string> {
@@ -245,11 +295,24 @@ export const register: Register = on => {
     ending = false
     const r = await next(e)
     await $.command.register({ name: 'lord', description: 'List Lord agents or select their next model.', argumentHint: '[model <agentId> <model>]', immediate: true })
+    void reloadIfUpdated($).catch(() => {})
     return r
   })
 
   on('agent.spawn', async ($, e, next) => {
-    const r = await next(e)
+    let input = e
+    // A resumed run's content is fixed by Claude Code, so only a new agent is labelled.
+    if (e.subagentType.startsWith('lord:') && !e.resume) {
+      // The agent list shows the description, so it leads with the vendor model and effort Lord will request; the
+      // agent's model becomes the vendor's, so Claude Code's views name it rather than the stand-in's Claude model.
+      const family = e.subagentType.slice(5), options = task(e.prompt)
+      const model = options.model ?? await defaultModel($, family)
+      const effort = callEfforts.get(e.tool_use_id) ?? capped(family, options.effort ?? 'high')
+      const label = model ? `${shortName(model)}, ${effort}` : effort
+      input = { ...e, description: e.description ? `${label} · ${e.description}` : label, ...(model ? { model } : {}) }
+    }
+    callEfforts.delete(e.tool_use_id)
+    const r = await next(input)
     if (e.subagentType.startsWith('lord:') && r.agentId) {
       const previous = agents.get(r.agentId)
       // A resumed run arrives with the session's folder; an agent that already opened keeps its own.
@@ -398,7 +461,16 @@ export const register: Register = on => {
     if (e.tool === 'Agent' && String((e as any).subagent_type ?? '').startsWith('lord:') && (e as any).name)
       return { deny: `lord agents cannot be named: a named Agent call starts a separate Claude process instead of ${String((e as any).subagent_type).slice(5)}. Launch it without name and message it by the agent id the launch returns.` }
     if (e.tool === 'Agent' && String((e as any).subagent_type ?? '').startsWith('lord:') && (e as any).isolation === 'worktree') isolated.add(e.tool_use_id)
-    const r = await next(e)
+    let call = e
+    if (e.tool === 'Agent' && String((e as any).subagent_type ?? '').startsWith('lord:')) {
+      // The level the vendor will run: an @effort line, else the Agent call's, else the agent files' high, capped per
+      // vendor. Claude Code shows the call's effort beside the agent's model, so the call carries that level when it
+      // is one Claude Code accepts (ultra is codex-only and stays an @effort line).
+      const input = e as any, effort = capped(String(input.subagent_type).slice(5), task(String(input.prompt ?? '')).effort ?? input.effort ?? 'high')
+      callEfforts.set(e.tool_use_id, effort)
+      if (effort !== input.effort && ['low', 'medium', 'high', 'xhigh', 'max'].includes(effort)) call = { ...e, effort } as typeof e
+    }
+    const r = await next(call)
     const agent = e.agentId ? agents.get(e.agentId) : undefined
     if (e.tool === 'StructuredOutput') {
       if (agent?.structured === 'sent') agent.structured = { isError: !!(r.isError || r.deny), text: String(r.text ?? r.deny ?? '') }
@@ -426,6 +498,7 @@ export const register: Register = on => {
 
   on('turn.complete', async ($, e, next) => {
     starts.delete(e.turnId)
+    if (!e.agentId) void reloadIfUpdated($).catch(() => {})
     if (e.agentId && agents.has(e.agentId)) {
       const agent = agents.get(e.agentId)!
       // Aborting a dispatch also aborts its HTTP calls; completion has a fresh dispatch.
