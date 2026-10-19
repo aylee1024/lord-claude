@@ -96,6 +96,9 @@ goes as an `@model` first line); `send_message(to, text)` becomes SendMessage; `
 `list_agents`, and the daemon refuses spawn and send for it.
 
 ## Mod behaviour
+- Each agent file's own prompt, used only when no Lord hook answers a turn, makes Claude reply with a two-line
+  `lord: error:` message. Claude Code's progress summaries run that prompt too and drop a multi-line reply, so an
+  agent's row never shows the error while the vendor works.
 - Agent ids map to families from `agent.spawn`, or after a module reload from `$.agent.list()`, else the daemon's
   `/agents`; cwd from `classic.SubagentStart` (worktrees included). An Agent call with `isolation: "worktree"` whose
   worktree path never arrives ends with an error instead of running in the main tree. A resumed run (`agent.spawn`

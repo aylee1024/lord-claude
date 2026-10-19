@@ -193,10 +193,10 @@ async function show($: EngineInterface, text: string | null): Promise<void> {
   try { await update($, band, () => text) } catch {}
 }
 
-async function refresh($: EngineInterface, stopping?: string): Promise<void> {
+async function refresh($: EngineInterface): Promise<void> {
   const roster = await $.agent.list().catch(() => [])
-  // Claude's own agents, teammates included; one whose stop is being reported still reads as running.
-  const claude = roster.filter(agent => !agent.type.startsWith('lord:') && agent.id !== stopping && ['pending', 'running', 'waiting'].includes(agent.status)).length
+  // Claude's own agents, teammates included.
+  const claude = roster.filter(agent => !agent.type.startsWith('lord:') && ['pending', 'running', 'waiting'].includes(agent.status)).length
   let list: any[] = []
   try { list = JSON.parse(await request($, '/agents')) } catch {}
   // The daemon serves every session; the row counts this session's agents only.
@@ -294,7 +294,9 @@ export const register: Register = on => {
   })
 
   on('classic.SubagentStop', ($, e, next) => {
-    void refresh($, e.agent_id)
+    // An agent that stops still reads as running while its stop is reported, and the engine's progress-summary
+    // forks report a stop too, so the row recounts from the roster a moment later.
+    void $.clock.sleep(1000).then(() => refresh($), () => {})
     return next(e)
   })
 

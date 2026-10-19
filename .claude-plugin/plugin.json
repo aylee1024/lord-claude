@@ -1,7 +1,7 @@
 {
   "name": "lord",
   "displayName": "Lord Claude",
-  "version": "2.0.11",
+  "version": "2.0.12",
   "description": "Run OpenAI GPT, xAI Grok and Google Gemini as native Claude Code agents, each in its own CLI on your own subscription.",
   "author": {
     "name": "aylee1024",

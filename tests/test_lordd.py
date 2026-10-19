@@ -788,6 +788,14 @@ def test_unsupported_options_are_refused_with_the_reason(rig, family, body, word
     finally: file.close(); conn.close()
 
 
+def test_each_stand_in_reply_is_two_lines_so_a_progress_summary_copying_it_is_dropped():
+    # Claude Code's progress summaries run the agent's own system prompt and drop a multi-line reply.
+    for family in ('gpt', 'grok', 'gemini'):
+        body = (ROOT / f'agents/{family}.md').read_text().split('\n---\n', 1)[1]
+        lines = [line for line in body.splitlines()[1:] if line.strip()]
+        assert lines[0].startswith('lord: error: ') and len(lines) == 2, family
+
+
 def test_activity_is_logged_per_agent_and_listed(rig):
     rig.open('gpt')
     rig.turn('PING')
