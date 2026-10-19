@@ -781,6 +781,9 @@ def test_read_only_agents_get_only_list_agents_and_calls_need_the_token(rig):
     ('gpt', {'cwd': str(Path.home())}, 'home folder'),
     ('gpt', {'model': 'no-such-model'}, 'unknown gpt model'),
     ('gemini', {'model': 'no-such-model'}, 'unknown gemini model'),
+    ('grok', {'nosandbox': True}, '@nosandbox is available for gpt only'),
+    ('gemini', {'nosandbox': True}, '@nosandbox is not needed for gemini'),
+    ('gpt', {'nosandbox': True, 'readonly': True}, 'contradict'),
 ])
 def test_unsupported_options_are_refused_with_the_reason(rig, family, body, word):
     conn, file, status, _ = rig.connect('/open', {'agentId': 'a', 'family': family, 'cwd': str(rig.home), **body})
@@ -803,6 +806,26 @@ def test_a_later_readonly_reattaches_with_the_read_only_sandbox(rig):
     rig.open('gpt', readonly=True)
     rig.turn('PING')
     assert [e['params'] for e in rig.audit() if e.get('method') == 'turn/start'][-1]['sandboxPolicy']['type'] == 'readOnly'
+
+
+def test_nosandbox_runs_codex_unconfined_and_a_later_readonly_is_refused(rig):
+    rig.open('gpt', nosandbox=True)
+    rig.turn('PING')
+    assert [e['params'] for e in rig.audit() if e.get('method') == 'thread/start'][-1]['sandbox'] == 'danger-full-access'
+    assert [e['params'] for e in rig.audit() if e.get('method') == 'turn/start'][-1]['sandboxPolicy'] == {'type': 'dangerFullAccess'}
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home), 'readonly': True})
+    try: assert status == 400 and 'contradict' in json.loads(file.read())['error']
+    finally: file.close(); conn.close()
+
+
+def test_a_later_nosandbox_reattaches_unconfined(rig):
+    rig.open('gpt')
+    rig.turn('PING')
+    assert [e['params'] for e in rig.audit() if e.get('method') == 'turn/start'][-1]['sandboxPolicy']['type'] == 'workspaceWrite'
+    rig.open('gpt', nosandbox=True)
+    rig.turn('PING')
+    assert [e['params'] for e in rig.audit() if e.get('method') == 'thread/resume'][-1]['sandbox'] == 'danger-full-access'
+    assert [e['params'] for e in rig.audit() if e.get('method') == 'turn/start'][-1]['sandboxPolicy'] == {'type': 'dangerFullAccess'}
 
 
 def test_grok_answer_is_the_text_after_its_last_tool_call(rig):

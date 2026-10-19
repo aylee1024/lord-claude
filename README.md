@@ -37,12 +37,13 @@ You can also put options on their own lines at the start of a task or message:
 | `@effort <level>` | Reasoning effort, `low` to `ultra`. The nearest level the model supports is used |
 | `@readonly` | Cannot change your files: gpt writes nothing, grok writes only temp folders and `~/.grok` (gpt and grok only) |
 | `@net` | Turn on network for gpt; grok and gemini always have it |
+| `@nosandbox` | Run gpt with no sandbox: it can run any command and write anywhere, as Claude Code's own agents can when its sandbox is off. For builds whose tests need `ps`, `sysctl` or `nice`. Not with `@readonly` |
 | `@cwd <folder>` | The folder the agent works in |
 | `@dir <folder>` | An extra folder gpt may write to |
 | `@memory <GB>`, `@hang <s>`, `@wall <s>` | Stop the agent if it uses too much memory, goes silent, or runs too long |
 | `@tools` | Load your own codex or grok plugins and tool servers, which Lord leaves out by default |
 
-Where each agent can write: gpt in its folder, `@dir` folders and temp folders; grok in its folder, temp folders and `~/.grok`; gemini anywhere, because agy has no sandbox. A sandbox limits one agent, not the agents it starts, so use `@readonly` when an agent must not change anything. A read-only agent cannot start or message other agents.
+Where each agent can write: gpt in its folder, `@dir` folders and temp folders (anywhere with `@nosandbox`); grok in its folder, temp folders and `~/.grok`; gemini anywhere, because agy has no sandbox. A sandbox limits one agent, not the agents it starts, so use `@readonly` when an agent must not change anything. A read-only agent cannot start or message other agents.
 
 Launch Lord agents without a `name`: a named launch would start a separate Claude process instead of the vendor, so Lord refuses it. Message an agent by the id its launch returns; it keeps its working folder across messages.
 

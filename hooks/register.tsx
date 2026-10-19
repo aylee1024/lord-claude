@@ -1,12 +1,12 @@
 import type { EngineInterface, Register, TurnStepInput, TurnStepResult } from 'claude-code'
 
 type Verdict = 'sent' | { isError: boolean; text: string }
-type Agent = { family: string; cwd?: string; running?: boolean; model?: string; effort?: string; readonly?: boolean; net?: boolean; dirs?: string[]; limits?: Limits; opened?: boolean; error?: string
+type Agent = { family: string; cwd?: string; running?: boolean; model?: string; effort?: string; readonly?: boolean; net?: boolean; nosandbox?: boolean; dirs?: string[]; limits?: Limits; opened?: boolean; error?: string
   continuing?: boolean; lastAnswer?: string; structured?: Verdict; corrected?: boolean; worktree?: boolean; pending?: Task }
 type Stream = { next: number; live: number; answer: string }
 type Outcome = { tool?: { callId: string; name: string; input: Record<string, unknown> } }
 type Limits = { memory_gb?: number; hang_s?: number; wall_s?: number; tools?: boolean }
-type Task = { text: string; error?: string; model?: string; effort?: string; readonly?: boolean; net?: boolean; dirs?: string[]; cwd?: string; limits?: Limits }
+type Task = { text: string; error?: string; model?: string; effort?: string; readonly?: boolean; net?: boolean; nosandbox?: boolean; dirs?: string[]; cwd?: string; limits?: Limits }
 const agents = new Map<string, Agent>()
 const starts = new Map<string, Task>()
 const directories = new Map<string, string>()
@@ -38,6 +38,7 @@ function task(text: string): Task {
     else if (/^@effort\s+(minimal|low|medium|high|xhigh|max|ultra)\s*$/.test(line)) result.effort = line.split(/\s+/)[1]
     else if (line === '@readonly') result.readonly = true
     else if (line === '@net') result.net = true
+    else if (line === '@nosandbox') result.nosandbox = true
     else if (/^@memory\s+\d+(\.\d+)?\s*$/.test(line)) result.limits = { ...result.limits, memory_gb: Number(line.split(/\s+/)[1]) }
     else if (/^@hang\s+\d+\s*$/.test(line)) result.limits = { ...result.limits, hang_s: Number(line.split(/\s+/)[1]) }
     else if (/^@wall\s+\d+\s*$/.test(line)) result.limits = { ...result.limits, wall_s: Number(line.split(/\s+/)[1]) }
@@ -45,7 +46,7 @@ function task(text: string): Task {
     else if (/^@cwd\s+\S/.test(line)) result.cwd = line.replace(/^@cwd\s+/, '')
     else if (/^@dir\s+\S/.test(line)) result.dirs = [...(result.dirs ?? []), line.replace(/^@dir\s+/, '')]
     // A known option written wrongly would end the options here and leave the rest (an @readonly, say) as task text.
-    else if (/^@(model|effort|readonly|net|memory|hang|wall|tools|cwd|dir)\b/.test(line)) { result.error = `option line not understood: ${line}`; break }
+    else if (/^@(model|effort|readonly|net|nosandbox|memory|hang|wall|tools|cwd|dir)\b/.test(line)) { result.error = `option line not understood: ${line}`; break }
     else break
     lines.shift()
   }
@@ -312,7 +313,7 @@ export const register: Register = on => {
           const known = await request($, '/agents').then(text => JSON.parse(text).find((a: any) => a.agentId === agentId), () => undefined)
           if (known) Object.assign(agent, { opened: true, cwd: known.cwd, effort: agent.effort ?? known.effort, model: agent.model ?? known.model })
         }
-        const chosen = merge({ text: '', model: agent.model, effort: agent.effort, readonly: agent.readonly, net: agent.net, dirs: agent.dirs, limits: agent.limits }, input)
+        const chosen = merge({ text: '', model: agent.model, effort: agent.effort, readonly: agent.readonly, net: agent.net, nosandbox: agent.nosandbox, dirs: agent.dirs, limits: agent.limits }, input)
         // Only an absolute @cwd replaces the worktree; a relative one would be under the main tree.
         if (agent.worktree && !(input.cwd && /^[/~]/.test(input.cwd)) && !directories.get(agentId)) throw new Error('worktree isolation was requested but Claude Code reported no worktree path; refusing to run in the main tree')
         // A task can name the vendor's working folder (fixed at the first turn; the daemon compares folders, not
@@ -322,8 +323,8 @@ export const register: Register = on => {
         // A relative @dir is under the agent's working folder too.
         if (input.dirs) input.dirs = input.dirs.map(dir => /^[/~]/.test(dir) ? dir : `${input.cwd ?? (agent.opened ? agent.cwd : undefined) ?? base}/${dir}`)
         const cwd = input.cwd ?? (agent.opened ? agent.cwd : undefined) ?? directories.get(agentId) ?? agent.cwd ?? await $.session.cwd()
-        await request($, '/open', { agentId, family: agent.family, cwd, pin_cwd: !!input.cwd, path: await $.env.get('PATH'), version: await version($), model: chosen.model, effort: chosen.effort ?? e.effort, readonly: chosen.readonly, net: chosen.net, dirs: chosen.dirs, ...chosen.limits })
-        Object.assign(agent, { model: chosen.model, effort: chosen.effort, readonly: chosen.readonly, net: chosen.net, dirs: chosen.dirs, limits: chosen.limits })
+        await request($, '/open', { agentId, family: agent.family, cwd, pin_cwd: !!input.cwd, path: await $.env.get('PATH'), version: await version($), model: chosen.model, effort: chosen.effort ?? e.effort, readonly: chosen.readonly, net: chosen.net, nosandbox: chosen.nosandbox, dirs: chosen.dirs, ...chosen.limits })
+        Object.assign(agent, { model: chosen.model, effort: chosen.effort, readonly: chosen.readonly, net: chosen.net, nosandbox: chosen.nosandbox, dirs: chosen.dirs, limits: chosen.limits })
         agent.opened = true
         agent.cwd = cwd
         void refresh($)

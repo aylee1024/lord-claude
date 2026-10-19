@@ -199,7 +199,7 @@ async def handle(value):
             return
         sid = str(uuid.uuid4())
         if FAMILY == 'gpt':
-            assert p['approvalPolicy'] == 'never' and p['sandbox'] in ('workspace-write', 'read-only')
+            assert p['approvalPolicy'] == 'never' and p['sandbox'] in ('workspace-write', 'read-only', 'danger-full-access')
             server = p['config']['mcp_servers']['lord']
         else:
             server = p['mcpServers'][0]

@@ -443,6 +443,15 @@ test('the first turn\'s @cwd stays the folder for later turns', async ($, on) =>
   expect(w.requests.filter(x => x.path === '/open').map(x => x.body.cwd)).toEqual(['/pins/r1', '/pins/r1', '/pins/r1'])
 })
 
+test('@nosandbox reaches the daemon and stays on for later turns', async ($, on) => {
+  const w = world(on)
+  await spawn($)
+  await step($, '@nosandbox\nbuild it')
+  await step($, 'next')
+  expect(w.requests.filter(x => x.path === '/open').map(x => x.body.nosandbox)).toEqual([true, true])
+  expect(w.requests.find(x => x.path === '/turn')?.body.text).toBe('build it')
+})
+
 test('a named lord launch is refused, since it would start a Claude teammate instead of the vendor', async ($, on) => {
   const w = world(on)
   const named = await $.tool.call({ tool: 'Agent', tool_use_id: 'n1', subagent_type: 'lord:gpt', name: 'builder', prompt: 'task', description: 'test' } as any)

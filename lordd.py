@@ -572,7 +572,8 @@ class Daemon:
                         'plugins': {name: {'enabled': False} for name in user.get('plugins', {})}}
                 if user.get('notify'): lean['notify'] = []
                 params = {'cwd': a.cwd, 'model': a.model, 'approvalPolicy': 'never',
-                          'sandbox': 'read-only' if a.record.get('readonly') else 'workspace-write',
+                          # @nosandbox: codex runs commands unconfined, as Claude Code's own agents do without its sandbox.
+                          'sandbox': 'read-only' if a.record.get('readonly') else 'danger-full-access' if a.record.get('nosandbox') else 'workspace-write',
                           'config': {**lean, 'mcp_servers': {**lean['mcp_servers'], 'lord': server},
                                      'sandbox_workspace_write': {'network_access': bool(a.record.get('net')), 'writable_roots': a.record.get('dirs', [])}}}
                 if a.vendorSession: params['threadId'] = a.vendorSession
@@ -654,6 +655,9 @@ class Daemon:
         aid, family = body['agentId'], body['family']
         if not isinstance(aid, str) or not aid or family not in ('gpt', 'grok', 'gemini'): raise ValueError('Invalid agent or family')
         async with self.open_locks.setdefault(aid, asyncio.Lock()):
+            if body.get('nosandbox') and family != 'gpt':
+                raise ValueError({'grok': '@nosandbox is available for gpt only; grok keeps its sandbox',
+                                  'gemini': '@nosandbox is not needed for gemini: agy has no sandbox'}[family])
             if body.get('readonly') and family == 'gemini': raise ValueError('readonly is not enforceable for agy; use lord:gpt or lord:grok')
             if body.get('dirs') and family != 'gpt':
                 raise ValueError({'grok': "@dir is not available for grok: its sandbox confines writes to the working folder; use @cwd",
@@ -669,6 +673,8 @@ class Daemon:
                 global SESSION_PATH
                 SESSION_PATH = body['path']
             readonly = body.get('readonly') or bool(a and a.record.get('readonly'))
+            if readonly and (body.get('nosandbox') or bool(a and a.record.get('nosandbox'))):
+                raise ValueError('@readonly and @nosandbox contradict each other; an agent is one or the other')
             if family == 'gpt' and readonly and (body.get('net') or bool(a and a.record.get('net'))):
                 raise ValueError("@readonly with @net is not read-only for gpt: with network on, codex can reach local services, Lord's included; use lord:grok for a read-only agent with network")
             # grok's read-only base profile leaves the temp folders and grok's own folder writable.
@@ -696,7 +702,7 @@ class Daemon:
         if a is None:
             if not Path(cwd).is_dir(): raise ValueError('cwd must be a directory')
             config = self.config[family]
-            a = Agent({**{k: body[k] for k in ('readonly', 'net') if k in body}, 'agentId': aid,
+            a = Agent({**{k: body[k] for k in ('readonly', 'net', 'nosandbox') if k in body}, 'agentId': aid,
                 'family': family, 'cwd': cwd, 'model': body.get('model') or config['model'],
                 'effort': body.get('effort') or config['effort'], 'created': datetime.now(timezone.utc).isoformat()})
             # Until this first /open succeeds, a model nobody named may give way to the vendor's own default.
@@ -713,7 +719,7 @@ class Daemon:
         if any(inside(canon(str(Path.home())), (canon(x),)) or (sys.platform == 'darwin' and inside('/System/Volumes/Data', (x,))) for x in dirs):
             raise ValueError('refusing / or a folder holding your home folder as an @dir')
         if any(not Path(x).is_dir() for x in dirs): raise ValueError('every @dir must be an existing directory')
-        for key in ('readonly', 'net'):
+        for key in ('readonly', 'net', 'nosandbox'):
             if body.get(key) and not a.record.get(key):
                 # A sandbox change needs a new process (grok) or a reattached thread (codex).
                 a.record[key] = True
@@ -802,6 +808,7 @@ class Daemon:
                 params = {'threadId': a.vendorSession, 'input': [{'type': 'text', 'text': body['text']}],
                           'model': a.model, 'effort': a.effort,
                           'sandboxPolicy': {'type': 'readOnly', 'networkAccess': bool(a.record.get('net'))} if a.record.get('readonly')
+                                           else {'type': 'dangerFullAccess'} if a.record.get('nosandbox')
                                            else {'type': 'workspaceWrite', 'networkAccess': bool(a.record.get('net')), 'writableRoots': a.record.get('dirs', [])}}
                 if body.get('schema'): params['outputSchema'] = body['schema']
                 result = await v.rpc('turn/start', params)

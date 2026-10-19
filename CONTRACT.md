@@ -37,7 +37,7 @@ Every request but `GET /health` and `POST /mcp` carries `X-Lord-Control: <key>` 
 | Method | Path | Body | Reply |
 |---|---|---|---|
 | GET | /health | - | `{ok, pid, version}` (`version` from the daemon's own plugin.json) |
-| POST | /open | `{agentId, family, cwd, version?, model?, effort?, readonly?, net?, dirs?, memory_gb?, hang_s?, wall_s?, tools?}` | `{vendorSession, model, effort}`; idempotent; resumes after a daemon restart from the journal. A new agent whose configured default model the vendor does not list gets the vendor's own default (codex `isDefault`, grok's current `model` option, agy's first listed model), logged. A later `readonly`, `net`, `tools` or new `dirs` restarts the vendor session before the next turn. Refused with the reason: a named model the vendor does not list (the vendor's list), `dirs` for grok/gemini, `readonly` for gemini, for gpt with `net`, or for grok under a temp folder or `~/.grok` (an existing agent is judged by its own folder), `/` or the home folder as cwd |
+| POST | /open | `{agentId, family, cwd, version?, model?, effort?, readonly?, net?, nosandbox?, dirs?, memory_gb?, hang_s?, wall_s?, tools?}` | `{vendorSession, model, effort}`; idempotent; resumes after a daemon restart from the journal. A new agent whose configured default model the vendor does not list gets the vendor's own default (codex `isDefault`, grok's current `model` option, agy's first listed model), logged. A later `readonly`, `net`, `nosandbox`, `tools` or new `dirs` restarts the vendor session before the next turn. Refused with the reason: a named model the vendor does not list (the vendor's list), `dirs` for grok/gemini, `nosandbox` for grok/gemini or with `readonly`, `readonly` for gemini, for gpt with `net`, or for grok under a temp folder or `~/.grok` (an existing agent is judged by its own folder), `/` or the home folder as cwd |
 | POST | /turn | `{agentId, text, model?, effort?}` | NDJSON stream; if the agent has a running or undelivered turn (its client went away), that turn streams first (a pending lord tool call is offered again) and this text starts when it ends, its done text prefixed with the earlier result. An interrupted turn leaves nothing to deliver |
 | POST | /continue | `{agentId}` | NDJSON stream of the same turn after a tool result |
 | POST | /tool_result | `{agentId, callId, text, isError}` | `{ok}` |
@@ -57,7 +57,7 @@ waits undelivered, for up to `keep_undelivered_s` (a day).
 
 ## Vendor setup
 - codex: `codex app-server` per agent; `thread/start|resume` with cwd, `approvalPolicy: never`, sandbox
-  `workspace-write` (writable roots = cwd + `dirs`) or `read-only`, network per `net`, the lord MCP server, and the
+  `workspace-write` (writable roots = cwd + `dirs`), `read-only`, or `danger-full-access` with `nosandbox`, network per `net`, the lord MCP server, and the
   user's codex MCP servers, codex plugins and notifier disabled unless `tools`.
 - grok: `grok --sandbox <write_sandbox|readonly_sandbox> agent --always-approve stdio` per agent, defaults
   `lord-workspace` (extends `workspace`: writes to cwd and temp folders) and `lord-readonly` (extends `read-only` with
