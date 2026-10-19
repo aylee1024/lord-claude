@@ -489,3 +489,21 @@ test('after a JSON correction that used a lord tool, an answer with no JSON ends
   expect(result.answer).toBe("lord: error: the vendor's corrected answer held no JSON object")
   expect(w.requests.filter(x => x.path === '/turn').length).toBe(before)
 })
+
+// the one-correction rule only counts a correction of REJECTED JSON; the "no JSON" correction never sets
+// `corrected`, so each time the vendor answers it through a lord tool the engine's next StructuredOutput step asks again.
+test('a no-JSON correction that used a lord tool is not asked again', async ($, on) => {
+  const w = world(on, [{ type: 'done', text: 'just prose' }])
+  await spawn($)
+  await step($, 'task')
+  w.events.splice(0, w.events.length, { type: 'tool', callId: 'c9', name: 'SendMessage', input: { to: 'x', message: 'hi', summary: 'hi' } })
+  expect((await step($, '', 1)).result.stopReason).toBe('tool_use')
+  w.tools.answer = { result: {}, text: 'sent', ref: 9 }
+  await $.tool.call({ tool: 'SendMessage', tool_use_id: 'c9', agentId: 'a1', to: 'x', message: 'hi', summary: 'hi' } as any)
+  w.events.splice(0, w.events.length, { type: 'done', text: 'still prose' })
+  await step($, '', 2)
+  const asks = () => w.requests.filter(x => x.path === '/turn' && x.body.text.startsWith('Reply with only a JSON object')).length
+  const before = asks()
+  await step($, '', 3)
+  expect(asks()).toBe(before)
+})

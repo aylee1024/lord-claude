@@ -166,8 +166,10 @@ class Redactor:
         value = re.sub(r'(?i)\bBearer[ \t]+[^\s\"\x27]+|\bsk-[\w-]{16,}|\beyJ[\w-]+\.[\w-]+\.[\w-]+|\bgh[pousr]_\w{20,}|\bgithub_pat_\w{20,}'
                        r'|\bAKIA[0-9A-Z]{16}\b|\bAIza[\w-]{30,}|\bxox[abprs]-[\w-]{10,}|\bxai-\w{20,}', '[REDACTED]', value)
         # key=value, key: value and "key": "value", for the usual secret names.
-        return re.sub(r'(?i)(["\x27]?\b(?:x-api-key|api[-_]?key|authorization|password|passwd|secret|token)["\x27]?\s*[:=]\s*["\x27]?)(?!\[REDACTED\])[^\s\"\x27,;}]+',
-                      r'\1[REDACTED]', value)
+        # Names may carry a prefix (GITHUB_TOKEN, client_secret, "access_token"); a scheme word (Basic, Token) goes with
+        # its value.
+        return re.sub(r'(?i)(["\x27]?(?<![A-Za-z0-9])[\w-]*(?:api[-_]?key|authorization|password|passwd|secret|token)["\x27]?\s*[:=]\s*["\x27]?)'
+                      r'(?!\[REDACTED\])(?:(?:basic|token|digest|bearer)\s+)?[^\s\"\x27,;}]+', r'\1[REDACTED]', value)
 
 async def process_table():
     ps = await asyncio.create_subprocess_exec('/bin/ps', '-A', '-o', 'pid=,ppid=,rss=', stdout=-1, stderr=-3)
@@ -191,11 +193,17 @@ def signal_all(pids, sig):
         try: os.kill(pid, sig)
         except (ProcessLookupError, PermissionError): pass
 
-async def kill_tree(process):
+async def kill_tree(process, known=()):
     # Tool commands can leave the vendor's process group, so every descendant is signalled by pid as well.
     # macOS answers killpg with EPERM when the group holds only zombies; the pid signals below still run.
+    # A vendor that already exited leaves its descendants with launchd as parent: those recorded by the guard
+    # (`known`) are signalled when they are still orphans, and never a pid that has since gone to another parent.
     if process is None: return
-    pids = tree((await process_table())[0], process.pid)
+    children = (await process_table())[0]
+    parent = {child: ppid for ppid, kids in children.items() for child in kids}
+    pids = tree(children, process.pid)
+    orphans = {pid for pid in known if parent.get(pid) == 1 or parent.get(pid) in known}
+    pids = [*pids, *(orphans - set(pids))]
     try: os.killpg(process.pid, signal.SIGTERM)
     except (ProcessLookupError, PermissionError): pass
     signal_all(pids, signal.SIGTERM)
@@ -254,7 +262,7 @@ class Vendor:
     def __init__(self, daemon, family, agent=None):
         self.d, self.family, self.agent = daemon, family, agent
         self.process, self.serial, self.generation = None, 0, 0
-        self.last, self.reason, self.efforts = time.monotonic(), None, []
+        self.last, self.reason, self.efforts, self.descendants = time.monotonic(), None, [], set()
         self.pending, self.models = {}, []
         self.lock, self.write_lock = asyncio.Lock(), asyncio.Lock()
         self.stopping, self.ready = False, False
@@ -355,7 +363,7 @@ class Vendor:
                     a.generation = 0
                     a.emit('error', message=self.d.redact(reason or error), retryable=not reason)
             self.d.log(error)
-            try: await kill_tree(process)
+            try: await kill_tree(process, self.descendants)
             finally: self.reaped.set()
 
     async def request(self, value):
@@ -441,7 +449,7 @@ class Vendor:
         for future in [*self.pending.values(), getattr(self, 'initialized', None)]:
             if future and not future.done(): future.set_exception(RuntimeError('Vendor closed'))
         process = self.process
-        await kill_tree(process)
+        await kill_tree(process, self.descendants)
         if self.process is process: self.process = None
 
 class Daemon:
@@ -595,7 +603,8 @@ class Daemon:
                                   'gemini': '@dir is not needed for gemini: agy has no sandbox and can write outside its folder'}[family])
             if not Path(body['cwd']).expanduser().is_absolute(): raise ValueError('the working folder must be an absolute path')
             cwd = str(Path(body['cwd']).expanduser().resolve(strict=True))
-            if inside(canon(str(Path.home())), (canon(cwd),)):
+            # A folder that holds the home folder, by its usual path or through macOS's data volume (/System/Volumes).
+            if inside(canon(str(Path.home())), (canon(cwd),)) or (sys.platform == 'darwin' and inside('/System/Volumes/Data', (cwd,))):
                 raise ValueError('refusing / or a folder holding your home folder as a working folder: start Claude Code in a project folder, or put "@cwd <folder>" on the first line of the task')
             a = self.agents.get(aid)
             if a and body.get('pin_cwd') and not os.path.samefile(cwd, a.cwd): raise ValueError(f'@cwd is fixed at the first turn ({a.cwd})')
@@ -619,8 +628,11 @@ class Daemon:
                     if vendor: await vendor.close()
                     self.compact()
                 elif saved and a.record != saved[0]:
+                    # Saved, so a daemon restart does not bring the refused options back; a new process drops any
+                    # sandbox or imports started for them.
                     a.record.clear(); a.record.update(saved[0])
-                    a.restart, a.generation = saved[1], 0
+                    a.restart, a.generation = True, 0
+                    self.save(a)
                 raise
 
     async def open_agent(self, aid, family, cwd, body, a):
@@ -637,6 +649,7 @@ class Daemon:
         for key in ('memory_gb', 'hang_s', 'wall_s'):
             if body.get(key) is not None and (not isinstance(body[key], (int, float)) or body[key] < 0 or (key == 'memory_gb' and body[key] == 0)):
                 raise ValueError(f'invalid {key}')
+        if any(not Path(x).expanduser().is_absolute() for x in body.get('dirs') or []): raise ValueError('every @dir must be an absolute path')
         dirs = [str(Path(x).expanduser().resolve()) for x in body.get('dirs') or []]
         if any(not Path(x).is_dir() for x in dirs): raise ValueError('every @dir must be an existing directory')
         for key in ('readonly', 'net'):
@@ -716,6 +729,9 @@ class Daemon:
         try:
             if a.cancel_requested:
                 a.emit('error', message='interrupted', retryable=False)
+                # With no client attached, an interrupted turn leaves nothing to deliver.
+                if not a.stream_lock.locked():
+                    while not a.events.empty(): a.events.get_nowait()
                 return
             a.dispatched, v.last = True, time.monotonic()
             a.started = v.last
@@ -753,7 +769,9 @@ class Daemon:
 
     async def interrupt(self, a):
         a.followup = a.earlier = None
-        # A turn still starting (begin's awaits) is interrupted once it runs, through the path below.
+        # A turn still starting (begin's awaits) is interrupted once it runs, through the path below; a start-up
+        # longer than the wait ends as interrupted when it finishes.
+        if getattr(a, 'starting', False): a.cancel_requested = True
         deadline = time.monotonic() + 5
         while getattr(a, 'starting', False) and time.monotonic() < deadline: await asyncio.sleep(.02)
         if a.state in ('running', 'waiting_tool'):
@@ -985,6 +1003,7 @@ class Daemon:
         children, rss = await process_table()
         for v in live:
             a, pids = v.agent, tree(children, v.process.pid)
+            v.descendants = set(pids) - {v.process.pid}
             ceiling = a.record['memory_gb'] * 1048576 if a.record.get('memory_gb') else self.config.get('memory_ceiling_kb', 12 * 1024 * 1024)
             used = sum(rss.get(pid, 0) for pid in pids)
             silent = a.record['hang_s'] if a.record.get('hang_s') is not None else self.config[a.family].get('no_progress_s', 0)

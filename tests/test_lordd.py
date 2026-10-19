@@ -1238,3 +1238,30 @@ def test_kill_tree_survives_a_group_of_zombies(monkeypatch):
         await m.kill_tree(process)
         return process.returncode
     assert asyncio.run(main()) is not None
+
+
+def test_prefixed_secret_names_and_basic_credentials_are_redacted():
+    r = load('lordd_redact_names').Redactor()
+    for text in ('export GITHUB_TOKEN=val1abcdefgh', 'curl -d client_secret=val2abcdefgh', '{"access_token": "val3abcdefgh"}',
+                 'DB_PASSWORD=val4abcdefgh psql', 'Authorization: Basic dmFsNWFiY2RlZmdo'):
+        assert 'val' not in r(text) and 'dmFs' not in r(text), r(text)
+    assert r('tokens used 9,032') == 'tokens used 9,032'
+
+
+def test_a_crashed_vendors_descendants_in_another_group_are_stopped():
+    m = load('lordd_orphans')
+    async def main():
+        code = ('import os, subprocess, sys, time\n'
+                'c = subprocess.Popen([sys.executable, "-c", "import os, time; os.setsid(); time.sleep(60)"])\n'
+                'print(c.pid, flush=True)\n')
+        parent = await asyncio.create_subprocess_exec(sys.executable, '-c', code, stdout=-1, start_new_session=True)
+        child = int((await parent.stdout.readline()).decode())
+        await parent.wait()
+        await asyncio.sleep(.3)
+        await m.kill_tree(parent, {child})
+        await asyncio.sleep(.3)
+        try: os.kill(child, 0)
+        except ProcessLookupError: return True
+        os.kill(child, signal.SIGKILL)
+        return False
+    assert asyncio.run(main())
