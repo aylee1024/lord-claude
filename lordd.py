@@ -496,7 +496,7 @@ class Daemon:
         # One lock per agent: a slow vendor start delays only its own agent's /open.
         self.stop_event, self.open_locks, self.prune_lock = asyncio.Event(), {}, asyncio.Lock()
         # agy_models keeps agy's listing order: its first model is the fallback for a default agy does not offer.
-        self.usage_cache, self.agy_registered, self.agy_levels, self.agy_models = (0, {}), False, {}, {}
+        self.agy_registered, self.agy_levels, self.agy_models = False, {}, {}
         self.journal = HOME / 'sessions.jsonl'
         if self.journal.exists():
             for line in self.journal.read_text().splitlines():
@@ -526,7 +526,7 @@ class Daemon:
         return self.vendors[a.agentId]
 
     def service(self):
-        # A codex process owned by no agent, for account usage and archiving pruned threads.
+        # A codex process owned by no agent, for archiving pruned threads.
         return self.vendors.setdefault(None, Vendor(self, 'gpt'))
 
     async def agy_mcp(self, program):
@@ -906,15 +906,6 @@ class Daemon:
         if method == 'GET':
             if path == '/health': return {'ok': True, 'pid': os.getpid(), 'version': VERSION}
             if path == '/agents': return self.listed()
-            if path == '/usage':
-                if time.monotonic() - self.usage_cache[0] >= 60:
-                    v = self.service()
-                    await v.ensure()
-                    r = (await v.rpc('account/rateLimits/read', {}))['rateLimits']
-                    window = r.get('primary') or r.get('secondary') or {}
-                    self.usage_cache = time.monotonic(), {'chatgpt': {'usedPercent': window.get('usedPercent', 0),
-                        'resetsAt': window.get('resetsAt'), 'credits': r.get('credits')}}
-                return self.usage_cache[1]
         elif method == 'POST':
             if path == '/open': return await self.open(body)
             if path == '/prune': return await self.prune(body.get('days', self.config['prune_days']))

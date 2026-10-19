@@ -32,6 +32,7 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
   let fresh = false
   on('agent.spawn', (_, e) => { spawned = e.subagentType; fresh = true; return { agentId: 'a1', model: 'haiku' } })
   on('classic.SubagentStart', () => ({}))
+  on('classic.SubagentStop', () => ({}))
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', (_, e) => ({ text: e.answer }))
   on('session.cwd', () => ({ value: '/repo' }))
@@ -40,7 +41,7 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.send', (_, e) => { deliveries.push(e.text); return { isDelivered: true } })
   on('session.receive', (_, e) => ({ text: e.text }))
-  on('agent.list', () => ({ value: [{ id: 'a1', type: spawned }] as any }))
+  on('agent.list', () => ({ value: [{ id: 'a1', type: spawned, status: 'running' }, { id: 'c1', type: 'general-purpose', status: 'running' }, { id: 'c2', type: 'Explore', status: 'completed' }] as any }))
   const tools = { answer: { result: {}, text: 'child result', ref: 9 } as any }
   on('tool.call', () => tools.answer)
   on('http.fetch', (_, e) => {
@@ -60,7 +61,6 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
     // 'elsewhere' is another session's agent on the shared daemon.
     const result = path === '/agents' ? (!fresh ? [{ agentId: 'a1', family: 'gpt', state: 'running', effort: 'ultra', model: 'fake-gpt', cwd: '/pinned' }, { agentId: 'elsewhere', family: 'grok', state: 'running' }]
         : requests.some(x => x.path === '/open') ? [{ agentId: 'a1', family: 'gpt', state: 'running' }] : [])
-      : path === '/usage' ? { chatgpt: { usedPercent: 47 } }
       : path === '/health' ? { ok: true }
       : path === '/open' ? { vendorSession: 'v1', model: 'fake-gpt', effort: 'high' }
       : path === '/steer' ? { ok: true, steered: true }
@@ -209,7 +209,16 @@ test('ordinary agents retain their own model step', async ($, on) => {
 test('status refresh and slash model override apply without polling', async ($, on) => {
   const w = world(on)
   await $.session.start({ cwd: '/repo' })
-  expect(w.statuses).toContain('1 gpt · ChatGPT 47%')
+  // The row above the prompt names the product and counts this session's agents; no status line, no usage figure.
+  const ui = await $.ui.mount({ plugin: 'lord', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false, isWorking: false, maxRows: 10 } } as any)
+  expect((await ui.find({ type: 'Text', text: /Lord Claude/ }))?.text).toBe('Lord Claude: 1 claude · 1 gpt')
+  await ui.unmount()
+  // A Claude agent whose stop is being reported no longer counts.
+  await $.classic.SubagentStop({ agent_id: 'c1', agent_type: 'general-purpose' } as any)
+  const after = await $.ui.mount({ plugin: 'lord', surface: 'terminal', component: 'AbovePrompt', props: { hasSurvey: false, isWorking: false, maxRows: 10 } } as any)
+  expect((await after.find({ type: 'Text', text: /Lord Claude/ }))?.text).toBe('Lord Claude: 1 gpt')
+  await after.unmount()
+  expect(w.statuses).toEqual([])
   await spawn($)
   await step($, 'hello')
   const changed = await $.command.run({ command: 'lord', args: 'model a1 chosen-model' })

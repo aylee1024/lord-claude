@@ -237,8 +237,6 @@ async def handle(value):
         assert live['id'] == p['expectedTurnId']
         live['steer'] = p['input'][0]['text']
         live['wake'].set()
-    elif method == 'account/rateLimits/read':
-        result = {'rateLimits': {'primary': {'usedPercent': 47, 'resetsAt': 1234567890}, 'credits': {'balance': '1'}}}
     elif method == 'thread/archive':
         audit(archived=p['threadId'])
     else:

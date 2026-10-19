@@ -1,4 +1,8 @@
+import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, TurnStepInput, TurnStepResult } from 'claude-code'
+
+// The row above the prompt naming this session's working Lord agents; null hides it.
+const band = atom({ plugin: 'lord', key: 'band' } as const, null)
 
 type Verdict = 'sent' | { isError: boolean; text: string }
 type Agent = { family: string; cwd?: string; running?: boolean; model?: string; effort?: string; readonly?: boolean; net?: boolean; nosandbox?: boolean; dirs?: string[]; limits?: Limits; opened?: boolean; error?: string
@@ -184,21 +188,24 @@ async function connect($: EngineInterface, signal: AbortSignal): Promise<void> {
   }
 }
 
-async function refresh($: EngineInterface): Promise<void> {
-  let list: any[]
-  try { list = JSON.parse(await request($, '/agents')) } catch { $.ui.status(undefined); return }
-  // The daemon serves every session; the status line counts this session's agents only.
-  const mine = new Set([...agents.keys(), ...await $.agent.list().then(roster => roster.map(agent => agent.id), () => [])])
+async function show($: EngineInterface, text: string | null): Promise<void> {
+  // Refreshes run unawaited and may finish after the session has ended, when state writes are refused.
+  try { await update($, band, () => text) } catch {}
+}
+
+async function refresh($: EngineInterface, stopping?: string): Promise<void> {
+  const roster = await $.agent.list().catch(() => [])
+  // Claude's own agents, teammates included; one whose stop is being reported still reads as running.
+  const claude = roster.filter(agent => !agent.type.startsWith('lord:') && agent.id !== stopping && ['pending', 'running', 'waiting'].includes(agent.status)).length
+  let list: any[] = []
+  try { list = JSON.parse(await request($, '/agents')) } catch {}
+  // The daemon serves every session; the row counts this session's agents only.
+  const mine = new Set([...agents.keys(), ...roster.map(agent => agent.id)])
   const counts = new Map<string, number>()
   for (const agent of list) if (mine.has(agent.agentId) && ['running', 'waiting_tool'].includes(agent.state)) counts.set(agent.family, (counts.get(agent.family) ?? 0) + 1)
-  const labels = ['gpt', 'grok', 'gemini'].filter(family => counts.has(family)).map(family => `${counts.get(family)} ${family}`)
-  if (counts.has('gpt')) {
-    try {
-      const usage = JSON.parse(await request($, '/usage'))
-      if (typeof usage.chatgpt?.usedPercent === 'number') labels.push(`ChatGPT ${usage.chatgpt.usedPercent}%`)
-    } catch {}
-  }
-  $.ui.status(labels.length ? labels.join(' · ') : undefined)
+  const labels = [...(claude ? [`${claude} claude`] : []), ...['gpt', 'grok', 'gemini'].filter(family => counts.has(family)).map(family => `${counts.get(family)} ${family}`)]
+  // A plugin's status line carries the plugin's short name; this row says the product's name.
+  await show($, labels.length ? `Lord Claude: ${labels.join(' · ')}` : null)
 }
 
 async function steer($: EngineInterface, agentId: string, text: string): Promise<boolean> {
@@ -266,6 +273,13 @@ export const register: Register = on => {
     return r
   })
 
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    const text = await read($, band)
+    if (!text || e.props.hasSurvey) return next(e)
+    const { Box, Text } = $.ui.resolve(e)
+    return <Box><Text dimColor>{text}</Text></Box>
+  })
+
   on('agent.spawn', async ($, e, next) => {
     const r = await next(e)
     if (e.subagentType.startsWith('lord:') && r.agentId) {
@@ -275,7 +289,13 @@ export const register: Register = on => {
         worktree: previous?.worktree || isolated.has(e.tool_use_id) })
       isolated.delete(e.tool_use_id)
     }
+    void refresh($)
     return r
+  })
+
+  on('classic.SubagentStop', ($, e, next) => {
+    void refresh($, e.agent_id)
+    return next(e)
   })
 
   on('classic.SubagentStart', async ($, e, next) => {

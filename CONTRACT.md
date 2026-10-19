@@ -45,7 +45,6 @@ Every request but `GET /health` and `POST /mcp` carries `X-Lord-Control: <key>` 
 | POST | /interrupt, /close | `{agentId}` | `{ok}` (codex `turn/interrupt`, grok `session/cancel`, agy process kill; close also stops the process) |
 | POST | /mcp | `{agentId, name, arguments, token}` | the lord tool call of a vendor's MCP server; the per-agent token is required |
 | POST | /prune | `{days}` | `{ok, pruned}`; also at daemon start and hourly: journal records unused for `prune_days`; codex threads archived, vendor history otherwise kept |
-| GET | /usage | - | `{chatgpt: {usedPercent, resetsAt, credits}}` (cached 60 s) |
 | GET | /agents | - | `[{agentId, family, model, effort, state, activity, cwd, log, usage}]` (`usage`: the vendor's last turn; codex input excludes its cached tokens) |
 
 NDJSON events: `text` (vendor text as it streams), `activity` (one line of vendor work), `tool` (`{callId, name: Agent|
@@ -88,7 +87,7 @@ the family's `no_progress_s` while running (grok and gemini 2400 s, gpt off), is
 `hang_s`), or a turn past its `wall_s`; progress is vendor stdout since the turn's dispatch (stderr is logging); the turn ends with an error naming
 the reason. Every stop kills the vendor's whole process tree by pid as well as its group. A failed vendor start is
 retried once; a crash, or a codex turn that ends failed, restarts the vendor on the next turn, never in a loop. Each turn's activity log starts with a `turn: <family> <model> effort <effort>` line. A process idle for `process_idle_s`
-(default `idle_exit_s`) is closed, the account-usage codex process included, and its session resumed on the next turn.
+(default `idle_exit_s`) is closed, the codex process that archives pruned threads included, and its session resumed on the next turn.
 
 ## Lord tools given to every vendor session (MCP, `lordd.py --mcp [agentId]`)
 `spawn_agent(type, prompt, description, background?, effort?, model?)` becomes an engine Agent call (a non-Claude model
@@ -117,5 +116,5 @@ goes as an `@model` first line); `send_message(to, text)` becomes SendMessage; `
 - Task notifications from children are unwrapped with their result verbatim.
 - TaskStop or Esc sends /interrupt; once `session.end` fires for a quit (not `/clear` or a resume), aborted turns are
   left running in the daemon.
-- `$.ui.status` shows this session's working agents (the daemon serves every session) and, while gpt agents work, ChatGPT usage; nothing when the daemon is down.
+- A row above the prompt (`ui.render` for `AbovePrompt`) reads `Lord Claude: <n> gpt · <n> grok · <n> gemini` for this session's working agents (the daemon serves every session); nothing when none work or the daemon is down.
   `/lord` lists agents with the model that ran, tokens and log; `/lord model <id> <model>`.

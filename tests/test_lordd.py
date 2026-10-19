@@ -266,11 +266,8 @@ def test_daemon_restart_resumes_idempotent_session(rig, family):
     assert rig.turn('REMEMBER')[-1]['text'] == 'before-daemon-restart'
 
 
-def test_usage_cached_env_scrub_and_close(rig):
+def test_env_scrub_and_close(rig):
     rig.open('gpt')
-    expected = {'chatgpt': {'usedPercent': 47, 'resetsAt': 1234567890, 'credits': {'balance': '1'}}}
-    assert rig.request('/usage') == expected == rig.request('/usage')
-    assert len([e for e in rig.audit() if e.get('method') == 'account/rateLimits/read']) == 1
     assert all(e['env'] == {} for e in rig.audit() if e.get('launch'))
     assert rig.request('/close', {'agentId': 'a'}) == {'ok': True}
     assert rig.request('/agents')[0]['state'] == 'closed'
