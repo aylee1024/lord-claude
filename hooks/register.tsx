@@ -77,6 +77,13 @@ async function keyFile($: EngineInterface): Promise<string> {
   return (await socket($)).replace(/[^/]*$/, 'control.header')
 }
 
+let pluginVersion: Promise<string | undefined> | undefined
+function version($: EngineInterface): Promise<string | undefined> {
+  // Sent with /open: a daemon older than this plugin exits once idle, and the next turn starts this version's.
+  pluginVersion ??= $.fs.read(`${$.plugin.root}/.claude-plugin/plugin.json`).then(text => JSON.parse(String(text)).version, () => undefined)
+  return pluginVersion
+}
+
 async function request($: EngineInterface, path: string, body?: unknown): Promise<string> {
   const key = await $.fs.read(await keyFile($)).then(text => /^X-Lord-Control:\s*(\S+)/.exec(String(text))?.[1], () => undefined)
   const response = await $.http.fetch('http://lord' + path, {
@@ -151,9 +158,11 @@ async function connect($: EngineInterface, signal: AbortSignal): Promise<void> {
   }
   // The daemon forks and exits 0 at once. A missing interpreter, or exit 3 (older than 3.11), tries the next one;
   // any other failure (a broken ~/.claude/lord/config.json) is reported with the daemon's message.
-  const pythons = [await $.env.get('LORD_PYTHON'), '/opt/homebrew/bin/python3', '/usr/local/bin/python3', '/usr/bin/python3']
+  // Homebrew's and python.org's, then each python3 on the session PATH (pyenv, conda, uv), then the system's.
+  const path = String(await $.env.get('PATH') ?? '').split(':').filter(dir => dir.startsWith('/')).map(dir => dir.replace(/\/+$/, '') + '/python3')
+  const pythons = [...new Set([await $.env.get('LORD_PYTHON'), '/opt/homebrew/bin/python3', '/usr/local/bin/python3', ...path, '/usr/bin/python3'].filter(Boolean) as string[])]
   let started = false
-  for (const python of pythons.filter(Boolean) as string[]) {
+  for (const python of pythons) {
     let code: number | null = null, stderr = ''
     try {
       const child = $.process.spawn({ argv: [python, `${$.plugin.root}/lordd.py`, '--daemon'] })
@@ -312,7 +321,7 @@ export const register: Register = on => {
         // A relative @dir is under the agent's working folder too.
         if (input.dirs) input.dirs = input.dirs.map(dir => /^[/~]/.test(dir) ? dir : `${input.cwd ?? (agent.opened ? agent.cwd : undefined) ?? base}/${dir}`)
         const cwd = input.cwd ?? (agent.opened ? agent.cwd : undefined) ?? directories.get(agentId) ?? agent.cwd ?? await $.session.cwd()
-        await request($, '/open', { agentId, family: agent.family, cwd, pin_cwd: !!input.cwd, path: await $.env.get('PATH'), model: chosen.model, effort: chosen.effort ?? e.effort, readonly: chosen.readonly, net: chosen.net, dirs: chosen.dirs, ...chosen.limits })
+        await request($, '/open', { agentId, family: agent.family, cwd, pin_cwd: !!input.cwd, path: await $.env.get('PATH'), version: await version($), model: chosen.model, effort: chosen.effort ?? e.effort, readonly: chosen.readonly, net: chosen.net, dirs: chosen.dirs, ...chosen.limits })
         Object.assign(agent, { model: chosen.model, effort: chosen.effort, readonly: chosen.readonly, net: chosen.net, dirs: chosen.dirs, limits: chosen.limits })
         agent.opened = true
         agent.cwd = cwd

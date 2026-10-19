@@ -28,6 +28,10 @@ if sys.argv[3:5] == ['mcp', 'add']:
     audit(mcp_add=sys.argv[5:])
     sys.exit(0)
 
+if sys.argv[3:5] == ['mcp', 'remove']:
+    audit(mcp_remove=sys.argv[5:])
+    sys.exit(0)
+
 
 def send(value):
     print(json.dumps(value), flush=True)
@@ -86,6 +90,11 @@ async def turn(sid, text, request_id=None):
         update(sid, 'tool_call', toolCallId='native', title='fake work', status='in_progress')
     else:
         send({'event': 'step_update', 'step_update': {'step_type': 'run_command', 'command': 'fake work'}})
+    if '--signed-out' in sys.argv and FAMILY == 'gpt':
+        send({'method': 'error', 'params': {'threadId': sid, 'turnId': tid, 'willRetry': False,
+              'error': {'message': 'unexpected status 401 Unauthorized: Missing bearer or basic authentication in header'}}})
+        send({'method': 'turn/completed', 'params': {'threadId': sid, 'turn': {'id': tid, 'status': 'failed'}}})
+        return
     if text == 'NARRATE' and FAMILY == 'grok':
         update(sid, 'agent_message_chunk', content={'type': 'text', 'text': 'Let me look first. '})
         update(sid, 'tool_call', toolCallId='native2', title='read notes', status='in_progress')
@@ -176,10 +185,13 @@ async def handle(value):
         if not SESSIONS.get('initialized'):
             send({'id': rid, 'error': {'code': -32000, 'message': 'initialize required'}})
             return
-        result = {'data': [{'id': model, 'supportedReasoningEfforts': [{'reasoningEffort': effort} for effort in efforts]}
+        result = {'data': [{'id': model, 'isDefault': model == 'gpt-6-luna', 'supportedReasoningEfforts': [{'reasoningEffort': effort} for effort in efforts]}
                     for model, efforts in [('gpt-6.1-sol', ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']), ('gpt-6-luna', ['low', 'medium', 'high'])]]}
     elif method in ('thread/start', 'session/new'):
         assert 'dynamicTools' not in p and '_meta' not in p
+        if '--signed-out' in sys.argv and FAMILY == 'grok':
+            send({'jsonrpc': '2.0', 'id': rid, 'error': {'code': -32000, 'message': 'Authentication required', 'data': 'no auth method id provided'}})
+            return
         sid = str(uuid.uuid4())
         if FAMILY == 'gpt':
             assert p['approvalPolicy'] == 'never' and p['sandbox'] in ('workspace-write', 'read-only')
@@ -192,6 +204,8 @@ async def handle(value):
         if FAMILY == 'grok':
             result['configOptions'] = [{'id': 'reasoning_effort', 'currentValue': 'xhigh',
                                         'options': [{'value': v} for v in ('xhigh', 'high', 'medium', 'low')]}]
+            if '--list-models' in sys.argv:
+                result['configOptions'].append({'id': 'model', 'currentValue': 'grok-4.7', 'options': [{'value': v} for v in ('grok-4.5', 'grok-4.7')]})
     elif method in ('thread/resume', 'session/load'):
         sid = p.get('threadId') or p['sessionId']
         load(sid)

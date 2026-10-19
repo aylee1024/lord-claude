@@ -1,5 +1,6 @@
 """HTTP and MCP contract tests against strict subprocess protocol peers."""
 import asyncio
+import fcntl
 import importlib.util
 import json
 import os
@@ -1286,3 +1287,107 @@ def test_an_extra_folder_holding_the_home_folder_is_refused(rig):
     conn, file, status, _ = rig.connect('/open', {'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home), 'dirs': ['/']})
     reply = json.loads(file.read()); file.close(); conn.close()
     assert status == 400 and 'holding your home folder' in reply['error']
+
+
+def test_a_default_model_the_vendor_does_not_offer_gives_way_to_the_vendors_default(rig):
+    grok = [PYTHON, str(ROOT / 'tests/fakes/vendor.py'), 'grok', str(rig.data), '--list-models']
+    restart_with(rig, **{'gpt.model': 'gpt-retired', 'grok.model': 'grok-retired', 'grok.program': grok, 'gemini.model': 'gemini-retired'})
+    # codex marks its default, grok names its current model, and agy's first listed model stands for its default.
+    models = {family: rig.open(family, agent=family)['model'] for family in ('gpt', 'grok', 'gemini')}
+    assert models == {'gpt': 'gpt-6-luna', 'grok': 'grok-4.7', 'gemini': 'gemini-4-argon'}
+    assert [rig.turn('PING', agent=family)[-1]['text'] for family in models] == ['PONG'] * 3
+    audit = rig.audit()
+    assert [e['params']['model'] for e in audit if e.get('method') == 'turn/start'] == ['gpt-6-luna']
+    assert {'configId': 'model', 'value': 'grok-4.7'} in [{k: e['params'].get(k) for k in ('configId', 'value')} for e in audit if e.get('method') == 'session/set_config_option']
+    assert any(e['argv'][e['argv'].index('--model') + 1] == 'gemini-4-argon' for e in audit if e.get('launch') and '--model' in e['argv'])
+    assert {a['agentId']: a['model'] for a in rig.request('/agents')} == models
+    assert 'codex does not offer gpt-retired; using gpt-6-luna' in (rig.home / 'lordd.log').read_text()
+
+
+@pytest.mark.parametrize('family', ['gpt', 'grok', 'gemini'])
+def test_a_named_model_the_vendor_does_not_offer_is_refused_for_a_new_agent(rig, family):
+    restart_with(rig, **{'grok.program': [PYTHON, str(ROOT / 'tests/fakes/vendor.py'), 'grok', str(rig.data), '--list-models']})
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'n', 'family': family, 'cwd': str(rig.home), 'model': 'no-such-model'})
+    reply = json.loads(file.read()); file.close(); conn.close()
+    assert status == 400 and f'unknown {family} model no-such-model' in reply['error']
+    assert rig.request('/agents') == []
+
+
+def test_the_agy_entry_exists_only_while_the_daemon_runs(rig):
+    rig.open('gemini', agent='g1')
+    rig.open('gemini', agent='g2')
+    assert [a['mcp_add'][0] for a in rig.audit() if 'mcp_add' in a] == ['lord']
+    assert not [a for a in rig.audit() if 'mcp_remove' in a]
+    rig.stop()
+    assert [a['mcp_remove'] for a in rig.audit() if 'mcp_remove' in a] == [['lord']]
+    # A daemon that never started a gemini agent leaves agy's settings alone.
+    rig.start()
+    rig.open('gpt')
+    rig.stop()
+    assert len([a for a in rig.audit() if 'mcp_remove' in a]) == 1
+
+
+def test_a_missing_grok_writes_no_sandbox_profiles(rig):
+    restart_with(rig, **{'grok.program': [str(rig.home / 'no-such-grok')]})
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'g', 'family': 'grok', 'cwd': str(rig.home)})
+    reply = json.loads(file.read()); file.close(); conn.close()
+    assert status != 200 and 'was not found' in reply['error'] and 'x.ai/cli/install.sh' in reply['error']
+    assert not (rig.home / 'grok' / 'sandbox.toml').exists()
+
+
+def test_health_reports_the_plugin_version(rig):
+    assert rig.request('/health')['version'] == json.loads((ROOT / '.claude-plugin/plugin.json').read_text())['version']
+
+
+def test_a_newer_plugin_retires_the_daemon_once_its_work_is_done(rig):
+    restart_with(rig, retire_idle_s=.3)
+    rig.open('gpt', version='999.0.0')
+    stream = rig.stream('/turn', {'agentId': 'a', 'text': 'SLOW'})
+    assert next(stream)['type'] == 'activity'
+    time.sleep(.8)
+    assert rig.proc.poll() is None
+    rig.request('/interrupt', {'agentId': 'a'})
+    list(stream)
+    rig.proc.wait(timeout=5)
+    assert rig.proc.returncode == 0 and not (rig.home / 'lordd.sock').exists()
+
+
+@pytest.mark.parametrize('version', [None, '0.1.0', 'same', 'not-a-version'])
+def test_an_older_or_equal_plugin_does_not_retire_the_daemon(rig, version):
+    restart_with(rig, retire_idle_s=.3)
+    if version == 'same':
+        version = rig.request('/health')['version']
+    rig.open('gpt', **({} if version is None else {'version': version}))
+    # Longer than one heartbeat after the grace period, in which a retiring daemon would have exited.
+    time.sleep(1.6)
+    assert rig.proc.poll() is None
+
+
+def test_a_new_daemon_takes_over_from_one_that_is_shutting_down(rig):
+    rig.stop()
+    with (rig.home / 'lordd.lock').open('a') as held:
+        # Stands for a daemon that has stopped answering and not yet released its lock.
+        fcntl.flock(held, fcntl.LOCK_EX)
+        rig.proc = subprocess.Popen([PYTHON, str(DAEMON)], env=rig.env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(.5)
+        assert rig.proc.poll() is None
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            assert rig.request('/health')['pid'] == rig.proc.pid
+            break
+        except OSError:
+            assert time.monotonic() < deadline and rig.proc.poll() is None
+            time.sleep(.05)
+
+
+def test_a_vendor_that_is_not_signed_in_says_how_to_sign_in(rig):
+    for family in ('gpt', 'grok'):
+        restart_with(rig, **{f'{family}.program': [PYTHON, str(ROOT / 'tests/fakes/vendor.py'), family, str(rig.data), '--signed-out']})
+    rig.open('gpt', agent='g')
+    assert 'codex is not signed in; run `codex login`' in rig.turn('PING', agent='g')[-1]['message']
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'k', 'family': 'grok', 'cwd': str(rig.home)})
+    reply = json.loads(file.read()); file.close(); conn.close()
+    assert status != 200 and 'Authentication required' in reply['error'] and 'grok is not signed in; run `grok` once' in reply['error']
+    # Other failures keep their own text.
+    assert load('lordd_sign_in').sign_in_hint('gpt', 'gpt process closed stdout') == 'gpt process closed stdout'

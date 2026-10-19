@@ -1,7 +1,7 @@
 import { test, expect, mock } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
-function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer', model: 'fake-gpt', usage: { input_tokens: 3, output_tokens: 2, cache_read_input_tokens: 1 } }], failures = 0, socket: string | null = '/test/lord.sock', pythonExits: Record<string, number> = {}) {
+function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer', model: 'fake-gpt', usage: { input_tokens: 3, output_tokens: 2, cache_read_input_tokens: 1 } }], failures = 0, socket: string | null = '/test/lord.sock', pythonExits: Record<string, number> = {}, env: Record<string, string> = {}) {
   const requests: { path: string; body: any }[] = []
   const statuses: string[] = []
   const processes: string[][] = []
@@ -9,7 +9,7 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
   let modelCalls = 0
   let opened: string | undefined
   let streamFinished = false
-  mock.env(on, { HOME: '/test', ...(socket ? { LORD_DAEMON_SOCKET: socket } : {}) })
+  mock.env(on, { HOME: '/test', ...(socket ? { LORD_DAEMON_SOCKET: socket } : {}), ...env })
   let spawned = 'lord:gpt'
   const clock = mock.clock(on)
   on('process.spawn', async function* (_, e) {
@@ -373,6 +373,24 @@ test('a Python that is missing or too old is skipped for the next one', async ($
   await w.clock.advance(1000)
   expect((await response).result.answer).toBe('connected')
   expect(w.processes.map(p => p[0])).toEqual(['/opt/homebrew/bin/python3', '/usr/local/bin/python3'])
+})
+
+test('python3 on the session PATH is tried after Homebrew and python.org, once each', async ($, on) => {
+  const exits = { '/opt/homebrew/bin/python3': 3, '/usr/local/bin/python3': 3 }
+  const w = world(on, [{ type: 'done', text: 'connected' }], 2, null, exits, { PATH: '/home/u/.pyenv/shims:relative/bin:/opt/homebrew/bin/:/usr/bin' })
+  await spawn($)
+  const response = step($, 'hello')
+  await w.clock.advance(1000)
+  expect((await response).result.answer).toBe('connected')
+  expect(w.processes.map(p => p[0])).toEqual(['/opt/homebrew/bin/python3', '/usr/local/bin/python3', '/home/u/.pyenv/shims/python3'])
+})
+
+test('/open carries the plugin version, so an older daemon hands over to this one', async ($, on) => {
+  const w = world(on)
+  on('fs.read', (_, e) => e.path.endsWith('/.claude-plugin/plugin.json') ? { value: JSON.stringify({ name: 'lord', version: '9.8.7' }) } : { deny: 'no such file' })
+  await spawn($)
+  expect((await step($, 'hello')).result.answer).toBe('fake answer')
+  expect(w.requests.find(x => x.path === '/open')?.body.version).toBe('9.8.7')
 })
 
 test('@effort sets a vendor level beyond the Agent field and persists', async ($, on) => {

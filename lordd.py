@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import sys
 import time
@@ -18,8 +19,18 @@ if sys.version_info < (3, 11):
 from urllib.parse import quote
 import uuid
 
-VERSION = '1.0'
 HERE = Path(__file__).resolve()
+
+def plugin_version(root):
+    try: return str(json.loads((root / '.claude-plugin/plugin.json').read_text())['version'])
+    except (OSError, ValueError, KeyError, TypeError): return '0'
+
+def newer(version, than):
+    # Dotted numbers only; a version that is missing or not numeric is never newer.
+    try: return tuple(map(int, str(version).split('.'))) > tuple(map(int, str(than).split('.')))
+    except ValueError: return False
+
+VERSION = plugin_version(HERE.parent)
 HOME = Path(os.environ.get('LORD_HOME', Path.home() / '.claude/lord')).expanduser()
 SOCKET = HOME / 'lordd.sock'
 LIMIT = 8 * 1024 * 1024
@@ -27,7 +38,15 @@ EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max']
 RANKS = ['minimal', *EFFORTS, 'ultra']
 INSTALL = {'gpt': "install OpenAI's codex CLI (brew install --cask codex, or npm install -g @openai/codex) and sign in with `codex login`",
            'grok': "install xAI's grok CLI (curl -fsSL https://x.ai/cli/install.sh | bash) and sign in by running `grok` once",
-           'gemini': "install Google Antigravity's agy CLI (https://antigravity.google) and sign in by running `agy` once"}
+           'gemini': "install Google Antigravity's agy CLI (curl -fsSL https://antigravity.google/cli/install.sh | bash) and sign in by running `agy` once"}
+SIGN_IN = {'gpt': 'codex is not signed in; run `codex login`', 'grok': 'grok is not signed in; run `grok` once',
+           'gemini': 'agy is not signed in; run `agy` once'}
+
+def sign_in_hint(family, text):
+    # Without a login codex answers a turn with "401 Unauthorized" and grok a new session with "Authentication required";
+    # neither says how to sign in.
+    text = str(text)
+    return f'{text} ({SIGN_IN[family]})' if re.search(r'\b401\b|Unauthorized|Authentication required', text) else text
 
 # grok imports Claude Code's tool servers, hooks and skills by default; a lord agent keeps grok's own setup only.
 GROK_NO_CLAUDE_IMPORTS = {f'GROK_{vendor}_{cell}_ENABLED': 'false' for vendor in ('CLAUDE', 'CURSOR') for cell in ('MCPS', 'HOOKS', 'SKILLS')}
@@ -237,6 +256,7 @@ class Agent:
         self.cancel_requested, self.turn_task = False, None
         self.followup, self.earlier, self.carry, self.call_data, self.ended_turns = None, None, [], {}, set()
         self.final_text, self.restart, self.token = '', False, uuid.uuid4().hex
+        self.default_model = False
         self.log_path = HOME / 'logs' / f"{record['agentId']}.log"
 
     def undelivered(self):
@@ -251,6 +271,7 @@ class Agent:
             self.log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             if not self.log_path.exists() or self.log_path.stat().st_size < 4 * 1024 * 1024:
                 with self.log_path.open('a') as file: file.write(f'{datetime.now(timezone.utc).isoformat()} {REDACT(value["text"])[:2000]}\n')
+        if kind == 'error': value['message'] = sign_in_hint(self.family, value['message'])
         if kind in ('done', 'error'):
             self.state, self.activity = 'idle', ''
             self.finished.set()
@@ -279,6 +300,9 @@ class Vendor:
             config = self.d.config[self.family]
             command = config.get('program', {'gpt': 'codex', 'grok': 'grok', 'gemini': 'agy'}[self.family])
             command = list(command) if isinstance(command, list) else [command]
+            # A missing program leaves nothing behind: no grok profiles, no agy entry.
+            if not shutil.which(command[0], path=subscription_env().get('PATH')):
+                raise RuntimeError(f'{command[0]} was not found; {INSTALL[self.family]}')
             if self.family == 'gpt': command += ['app-server']
             elif self.family == 'grok':
                 # Seatbelt applies to the whole grok process, so read-only sessions get their own process.
@@ -344,7 +368,7 @@ class Vendor:
                 if 'id' in value and 'method' not in value:
                     future = self.pending.get(value['id'])
                     if future and not future.done():
-                        if 'error' in value: future.set_exception(RuntimeError(self.d.redact(dumps(value['error']))))
+                        if 'error' in value: future.set_exception(RuntimeError(sign_in_hint(self.family, self.d.redact(dumps(value['error'])))))
                         else: future.set_result(value.get('result', {}))
                 elif 'id' in value: self.d.task(self.request(value))
                 else: self.notification(value)
@@ -459,10 +483,11 @@ class Daemon:
         self.config = load_config()
         self.agents, self.vendors, self.tasks, self.connections = {}, {}, set(), set()
         self.redact, self.stopping, self.last_request = Redactor(), False, time.monotonic()
-        self.requests, self.control = 0, None
+        self.requests, self.control, self.retire = 0, None, False
         # One lock per agent: a slow vendor start delays only its own agent's /open.
         self.stop_event, self.open_locks, self.prune_lock = asyncio.Event(), {}, asyncio.Lock()
-        self.usage_cache, self.agy_registered, self.agy_levels, self.agy_models = (0, {}), False, {}, set()
+        # agy_models keeps agy's listing order: its first model is the fallback for a default agy does not offer.
+        self.usage_cache, self.agy_registered, self.agy_levels, self.agy_models = (0, {}), False, {}, {}
         self.journal = HOME / 'sessions.jsonl'
         if self.journal.exists():
             for line in self.journal.read_text().splitlines():
@@ -500,7 +525,9 @@ class Daemon:
         # agent id from LORD_AGENT_ID and lists no tools in agy sessions the daemon did not start.
         if self.agy_registered: return
         code, out = await run_quick([*program, 'mcp', 'add', 'lord', '--', sys.executable, str(HERE), '--mcp'])
-        if code == 0: self.agy_registered = True
+        # The program that added the entry removes it when the daemon exits (close); a copy, because the caller goes
+        # on to append agy's run options to its list.
+        if code == 0: self.agy_registered = list(program)
         else: self.log(f'agy mcp add failed; gemini agents lack lord tools until it succeeds: {out}')
 
     def record_usage(self, a, tokens):
@@ -553,7 +580,8 @@ class Daemon:
                 if options.get('reasoning_effort'): vendor.efforts = options['reasoning_effort']
                 if options.get('model'): vendor.grok_models = options['model']
                 if options.get('model') and a.model not in options['model']:
-                    raise ValueError(f'unknown grok model {a.model}; grok lists {", ".join(options["model"])}')
+                    current = next((o.get('currentValue') for o in result.get('configOptions', []) if o.get('id') == 'model'), None)
+                    self.unlisted(a, 'grok', options['model'], current if current in options['model'] else options['model'][0])
                 await self.effort(a)
                 for key, value in [('model', a.model), ('reasoning_effort', a.effort)]:
                     await vendor.rpc('session/set_config_option', {'sessionId': a.vendorSession, 'configId': key, 'value': value})
@@ -567,14 +595,28 @@ class Daemon:
         if a.family == 'gpt':
             models = self.backend(a).models
             model = next((m for m in models if m['id'] == a.model), None)
-            if models and model is None: raise ValueError(f'unknown gpt model {a.model}; codex lists {", ".join(m["id"] for m in models)}')
+            if models and model is None:
+                model = next((m for m in models if m.get('isDefault')), models[0])
+                self.unlisted(a, 'codex', [m['id'] for m in models], model['id'])
             allowed = [v['reasoningEffort'] for v in (model or {}).get('supportedReasoningEfforts', [])]
         # Before grok reports its levels (a resumed session may not), its documented range applies.
         elif a.family == 'grok': allowed = self.backend(a).efforts or ['low', 'medium', 'high', 'xhigh']
-        else: allowed = await self.agy_efforts(a.model)
+        else:
+            try: allowed = await self.agy_efforts(a.model)
+            except ValueError:
+                # agy listed its models, and this one is not among them.
+                self.unlisted(a, 'agy', sorted(self.agy_models), next(iter(self.agy_models)))
+                allowed = await self.agy_efforts(a.model)
         if allowed and value not in allowed:
             value = min((v for v in allowed if v in RANKS), key=lambda v: abs(RANKS.index(v) - RANKS.index(value)), default=value)
         a.effort = value
+
+    def unlisted(self, a, tool, listed, fallback):
+        # A model someone named is refused. A new agent's configured default gives way to the vendor's own default, so
+        # an account that lacks the default, or a vendor that retired it, still gets an agent; /lord shows the model.
+        if not a.default_model: raise ValueError(f'unknown {a.family} model {a.model}; {tool} lists {", ".join(listed)}')
+        self.log(f'{a.agentId}: {tool} does not offer {a.model}; using {fallback}')
+        a.model = fallback
 
     async def agy_efforts(self, model):
         # agy lists each model once per effort level, as <model>-<level>.
@@ -583,8 +625,9 @@ class Daemon:
             program = config.get('program', 'agy')
             program = list(program) if isinstance(program, list) else [program]
             code, out = await run_quick([*program, 'models'])
-            ids = {line.split('\t')[0].strip() for line in out.splitlines()} if code == 0 else set()
-            self.agy_models.update(i.rsplit('-', 1)[0] for i in ids if i.rsplit('-', 1)[-1] in EFFORTS)
+            listed = [line.split('\t')[0].strip() for line in out.splitlines()] if code == 0 else []
+            ids = set(listed)
+            self.agy_models.update(dict.fromkeys(i.rsplit('-', 1)[0] for i in listed if i.rsplit('-', 1)[-1] in EFFORTS))
             if code != 0:
                 # Not cached: the next open asks agy again. Until then agy's own --effort range applies.
                 self.log(f'agy models failed: {out}')
@@ -595,6 +638,10 @@ class Daemon:
         return self.agy_levels[model]
 
     async def open(self, body):
+        if not self.retire and newer(body.get('version'), VERSION):
+            # A newer plugin's own daemon takes over once this one has finished its work (heartbeat).
+            self.retire = True
+            self.log(f'plugin {body["version"]} is newer than this daemon ({VERSION}); exiting once idle')
         aid, family = body['agentId'], body['family']
         if not isinstance(aid, str) or not aid or family not in ('gpt', 'grok', 'gemini'): raise ValueError('Invalid agent or family')
         async with self.open_locks.setdefault(aid, asyncio.Lock()):
@@ -643,6 +690,8 @@ class Daemon:
             a = Agent({**{k: body[k] for k in ('readonly', 'net') if k in body}, 'agentId': aid,
                 'family': family, 'cwd': cwd, 'model': body.get('model') or config['model'],
                 'effort': body.get('effort') or config['effort'], 'created': datetime.now(timezone.utc).isoformat()})
+            # Until this first /open succeeds, a model nobody named may give way to the vendor's own default.
+            a.default_model = not body.get('model')
             await self.effort(a)
             self.agents[aid] = a
         elif a.family != family: raise ValueError('agentId already belongs to another family')
@@ -681,6 +730,7 @@ class Daemon:
         if body.get('model') and (models := self.known_models(a)) and body['model'] not in models:
             raise ValueError(f'unknown {a.family} model {body["model"]}; {a.family} lists {", ".join(models)}')
         if a.state == 'closed': a.state = 'idle'
+        a.default_model = False
         # An opened agent counts as used, so pruning cannot take it before its turn starts.
         self.save(a)
         return {'vendorSession': a.vendorSession, 'model': a.model, 'effort': a.effort}
@@ -987,7 +1037,8 @@ class Daemon:
                 self.task(self.prune(self.config['prune_days']))
             busy = any(a.state in ('running', 'waiting_tool') or (a.undelivered() and now - self.last_request < self.config.get('keep_undelivered_s', 86400))
                        for a in self.agents.values())
-            if not self.requests and now - self.last_request >= self.config['idle_exit_s'] and not busy:
+            idle_s = min(self.config['idle_exit_s'], self.config.get('retire_idle_s', 30)) if self.retire else self.config['idle_exit_s']
+            if not self.requests and now - self.last_request >= idle_s and not busy:
                 self.stop_event.set()
                 return
 
@@ -1068,6 +1119,11 @@ class Daemon:
         self.stopping = True
         for a in self.agents.values(): a.emit('error', message='Daemon shutting down', retryable=True)
         await asyncio.gather(*(v.close() for v in self.vendors.values()), return_exceptions=True)
+        if self.agy_registered:
+            # The entry names this plugin copy's file, which an update or an uninstall later deletes; while no daemon
+            # runs, no agy session (the user's own included) is left trying to start it.
+            code, out = await run_quick([*self.agy_registered, 'mcp', 'remove', 'lord'])
+            if code != 0: self.log(f'agy mcp remove failed: {out}')
         tasks = list(self.tasks)
         for task in tasks: task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
@@ -1075,18 +1131,21 @@ class Daemon:
 
     async def serve(self):
         lock = (HOME / 'lordd.lock').open('a')
-        try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            lock.close()
-            return
+        # A daemon that is shutting down holds the lock for a moment after it stops answering; this one waits for it
+        # and takes over, so a turn that starts during that moment still finds a daemon.
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline or await answering():
+                    lock.close()
+                    return
+                await asyncio.sleep(.1)
         server, bound = None, False
         try:
-            try: _, writer = await asyncio.open_unix_connection(str(SOCKET))
-            except (FileNotFoundError, ConnectionRefusedError): pass
-            else:
-                writer.close()
-                await writer.wait_closed()
-                return
+            if await answering(): return
             # Every request but /health and /mcp (which carries a per-agent token) needs this key. Vendor sandboxes
             # cannot read the file (grok's profiles deny it; codex's sandbox cannot reach the socket without @net).
             self.control = uuid.uuid4().hex
@@ -1108,6 +1167,14 @@ class Daemon:
             if server: await server.wait_closed()
             if bound: SOCKET.unlink(missing_ok=True)
             lock.close()
+
+async def answering():
+    # Whether a daemon is serving on the socket.
+    try: _, writer = await asyncio.open_unix_connection(str(SOCKET))
+    except (FileNotFoundError, ConnectionRefusedError): return False
+    writer.close()
+    await writer.wait_closed()
+    return True
 
 async def relay(path, body=None):
     reader, writer = await asyncio.open_unix_connection(str(SOCKET), limit=LIMIT)

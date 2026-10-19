@@ -12,9 +12,11 @@ answer becomes the agent's reply. No Claude tokens are spent on these turns.
 - **Mod** (`hooks/register.tsx`, runs inside Claude Code). Control requests use `$.http.fetch` over the Unix socket;
   turn streams use `/usr/bin/curl --unix-socket` through `$.process.spawn`, because `$.http.fetch` buffers bodies.
 - **Daemon** (`lordd.py`, one standard-library file, Python 3.11 or later). Owns one vendor process per agent. Outlives
-  Claude Code sessions; exits after `idle_exit_s` with no request and no running turn. The mod starts it with the first
-  of `LORD_PYTHON`, `/opt/homebrew/bin/python3`, `/usr/local/bin/python3`, `/usr/bin/python3` that runs it (lordd exits
-  non-zero on an older Python).
+  Claude Code sessions; exits after `idle_exit_s` with no request and no running turn, or after `retire_idle_s` (30 s)
+  once an `/open` came from a newer plugin version (so the next turn starts that version's daemon). The mod starts it
+  with the first of `LORD_PYTHON`, `/opt/homebrew/bin/python3`, `/usr/local/bin/python3`, `python3` in each folder of the
+  session PATH, `/usr/bin/python3` that runs it (lordd exits non-zero on an older Python). A daemon started while another
+  is shutting down waits up to 10 s for its lock instead of exiting.
 
 ## Files
 `.claude-plugin/{plugin,marketplace}.json`, `hooks/{hooks.json,register.tsx}`, `agents/{gpt,grok,gemini}.md`
@@ -24,8 +26,8 @@ family), `tests/`, `README.md`, `PRIVACY.md`, `LICENSE`.
 Runtime files only in `~/.claude/lord/`: `lordd.sock` (600, folder 700), `lordd.lock`, `sessions.jsonl` (one record per
 agent save: ids, vendor session, model, effort, cwd, options, last usage, created, used; never task text),
 `logs/<agentId>.log` (the agent's activity: vendor commands and file actions, redacted, 4 MB cap, removed with the
-record), `lordd.log` (1 MB, one rotation). Two global side effects: an agy MCP entry `lord` (agy has no per-run MCP
-option) and the `lord-workspace` and `lord-readonly` profiles between `# lord: begin` and `# lord: end` in
+record), `lordd.log` (1 MB, one rotation). Two global side effects: an agy MCP entry `lord` while the daemon runs (added
+before its first gemini agent, removed when it exits; agy has no per-run MCP option) and the `lord-workspace` and `lord-readonly` profiles between `# lord: begin` and `# lord: end` in
 `$GROK_HOME/sandbox.toml` (default `~/.grok`), rewritten only when they differ.
 
 ## Daemon HTTP API (JSON bodies)
@@ -34,8 +36,8 @@ Every request but `GET /health` and `POST /mcp` carries `X-Lord-Control: <key>` 
 
 | Method | Path | Body | Reply |
 |---|---|---|---|
-| GET | /health | - | `{ok, pid, version}` |
-| POST | /open | `{agentId, family, cwd, model?, effort?, readonly?, net?, dirs?, memory_gb?, hang_s?, wall_s?, tools?}` | `{vendorSession, model, effort}`; idempotent; resumes after a daemon restart from the journal. A later `readonly`, `net`, `tools` or new `dirs` restarts the vendor session before the next turn. Refused with the reason: unknown model (the vendor's list), `dirs` for grok/gemini, `readonly` for gemini, for gpt with `net`, or for grok under a temp folder or `~/.grok` (an existing agent is judged by its own folder), `/` or the home folder as cwd |
+| GET | /health | - | `{ok, pid, version}` (`version` from the daemon's own plugin.json) |
+| POST | /open | `{agentId, family, cwd, version?, model?, effort?, readonly?, net?, dirs?, memory_gb?, hang_s?, wall_s?, tools?}` | `{vendorSession, model, effort}`; idempotent; resumes after a daemon restart from the journal. A new agent whose configured default model the vendor does not list gets the vendor's own default (codex `isDefault`, grok's current `model` option, agy's first listed model), logged. A later `readonly`, `net`, `tools` or new `dirs` restarts the vendor session before the next turn. Refused with the reason: a named model the vendor does not list (the vendor's list), `dirs` for grok/gemini, `readonly` for gemini, for gpt with `net`, or for grok under a temp folder or `~/.grok` (an existing agent is judged by its own folder), `/` or the home folder as cwd |
 | POST | /turn | `{agentId, text, model?, effort?}` | NDJSON stream; if the agent has a running or undelivered turn (its client went away), that turn streams first (a pending lord tool call is offered again) and this text starts when it ends, its done text prefixed with the earlier result. An interrupted turn leaves nothing to deliver |
 | POST | /continue | `{agentId}` | NDJSON stream of the same turn after a tool result |
 | POST | /tool_result | `{agentId, callId, text, isError}` | `{ok}` |
@@ -70,7 +72,10 @@ waits undelivered, for up to `keep_undelivered_s` (a day).
   `LORD_AGENT_ID` and `LORD_MCP_TOKEN`; levels and models from `agy models` (20 s limit). `readonly` is refused.
 - Effort: the request (`minimal` to `ultra`), else the nearest level the vendor lists for the model (codex model/list,
   grok configOptions, agy models).
-- A vendor program that is not found ends the request with an error naming how to install and sign in.
+- A vendor program that is not found on the session PATH ends the request with an error naming how to install and sign
+  in, before Lord writes anything for it (grok profiles, the agy entry).
+- A vendor that is not signed in (codex answers a turn with 401 Unauthorized, grok a new session with "Authentication
+  required") gets the sign-in step added to its error.
 - Environment scrub for every vendor: no inherited `*KEY*`, `*TOKEN*`, `*SECRET*`, `*PASSWORD*`, `*CREDENTIAL*`,
   `ANTHROPIC_*`, `CLAUDE_CODE_*`, bearer values, whatever their prefix; the daemon's own settings (agent id, MCP token,
   grok import switches) are added after the scrub. Subscription logins only; auth files are
