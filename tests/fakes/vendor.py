@@ -95,6 +95,11 @@ async def turn(sid, text, request_id=None):
               'error': {'message': 'unexpected status 401 Unauthorized: Missing bearer or basic authentication in header'}}})
         send({'method': 'turn/completed', 'params': {'threadId': sid, 'turn': {'id': tid, 'status': 'failed'}}})
         return
+    if text == 'FAIL' and FAMILY == 'gpt':
+        # codex fails every later turn of a process whose settings reload failed.
+        send({'method': 'turn/completed', 'params': {'threadId': sid, 'turn': {'id': tid, 'status': 'failed',
+              'error': {'message': 'failed to load workspace requirements', 'codexErrorInfo': 'other'}}}})
+        return
     if text == 'NARRATE' and FAMILY == 'grok':
         update(sid, 'agent_message_chunk', content={'type': 'text', 'text': 'Let me look first. '})
         update(sid, 'tool_call', toolCallId='native2', title='read notes', status='in_progress')

@@ -244,6 +244,17 @@ def test_vendor_crash_restart_resume(rig, family):
         assert '--conversation' in launches[-1]['argv']
 
 
+def test_a_failed_gpt_turn_gives_the_next_turn_a_new_codex_on_the_same_thread(rig):
+    session = rig.open('gpt')['vendorSession']
+    rig.turn('persistent-word')
+    failed = rig.turn('FAIL')[-1]
+    assert failed['type'] == 'error' and 'failed to load workspace requirements' in failed['message']
+    assert rig.turn('REMEMBER')[-1]['text'] == 'persistent-word'
+    assert rig.open('gpt')['vendorSession'] == session
+    assert len([e for e in rig.audit() if e.get('launch')]) == 2
+    assert any(e.get('method') == 'thread/resume' for e in rig.audit())
+
+
 @pytest.mark.parametrize('family', ['gpt', 'grok', 'gemini'])
 def test_daemon_restart_resumes_idempotent_session(rig, family):
     opened = rig.open(family)

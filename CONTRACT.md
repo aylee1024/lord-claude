@@ -86,7 +86,7 @@ Every `guard_interval_s` (5 s): an agent's whole process tree over `memory_ceili
 the family's `no_progress_s` while running (grok and gemini 2400 s, gpt off), is killed (per agent: `memory_gb`,
 `hang_s`), or a turn past its `wall_s`; progress is vendor stdout since the turn's dispatch (stderr is logging); the turn ends with an error naming
 the reason. Every stop kills the vendor's whole process tree by pid as well as its group. A failed vendor start is
-retried once; a crash restarts the vendor on the next turn, never in a loop. A process idle for `process_idle_s`
+retried once; a crash, or a codex turn that ends failed, restarts the vendor on the next turn, never in a loop. A process idle for `process_idle_s`
 (default `idle_exit_s`) is closed, the account-usage codex process included, and its session resumed on the next turn.
 
 ## Lord tools given to every vendor session (MCP, `lordd.py --mcp [agentId]`)

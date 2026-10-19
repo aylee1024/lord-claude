@@ -464,6 +464,9 @@ class Vendor:
                 self.d.record_usage(a, tokens)
                 a.emit('done', text=a.final_text, usage=tokens, model=a.model)
             else:
+                # A codex process can fail every later turn (a settings reload that failed), so the next turn
+                # gets a new process that resumes the thread.
+                if not a.cancel_requested and turn['status'] != 'interrupted': a.restart = True
                 a.emit('error', message=self.d.redact('interrupted' if a.cancel_requested else turn.get('error') or turn['status']), retryable=not a.cancel_requested and turn['status'] != 'interrupted')
         elif method == 'error' and not p.get('willRetry', False): a.emit('error', message=self.d.redact(p.get('error', p)), retryable=True)
         elif method == 'model/rerouted': a.model = p['toModel']
