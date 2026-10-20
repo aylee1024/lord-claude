@@ -1076,6 +1076,29 @@ def test_a_reconnect_offers_a_queued_tool_call_once():
     assert asyncio.run(main()) == (1, True, [])
 
 
+
+def test_a_new_turn_does_not_replay_carried_steps_or_narration_of_the_earlier_one():
+    m = load('lordd_carry')
+    async def main():
+        a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6.1-sol'})
+        # Held over from a client that went away: a step and narration, then the earlier turn's result.
+        a.carry = [{'type': 'row', 'rowId': 'r', 'shell': True, 'title': 'old step', 'text': 'old step'}, {'type': 'text', 'text': 'old narration'},
+                   {'type': 'done', 'text': 'earlier answer', 'usage': {}, 'model': 'm'}]
+        d = object.__new__(m.Daemon); d.agents = {'a': a}; d.connections = set(); d.requests = 0; d.redact = str; d.control = 'k'
+        class Writer:
+            data = b''
+            def write(self, data): self.data += data
+            async def drain(self): pass
+            def close(self): pass
+            async def wait_closed(self): pass
+        reader, writer = asyncio.StreamReader(), Writer()
+        payload = json.dumps({'agentId': 'a', 'text': 'next', 'rows': True}).encode()
+        reader.feed_data(b'POST /turn HTTP/1.1\r\nX-Lord-Control: k\r\nContent-Length: ' + str(len(payload)).encode() + b'\r\n\r\n' + payload)
+        await d.http(reader, writer)
+        return writer.data
+    data = asyncio.run(main())
+    assert b'old step' not in data and b'old narration' not in data and b'earlier answer' in data
+
 def test_waiting_for_a_lord_tool_does_not_count_as_vendor_silence():
     m = load('lordd_silence')
     async def main():
@@ -1555,3 +1578,67 @@ def test_a_first_journal_starts_from_the_earlier_daemons_records(rig):
         assert time.monotonic() < deadline
         time.sleep(.05)
     assert rig.open('gpt', agent='x')['vendorSession'] == sid
+
+
+def row_turn(rig, text, agent='a'):
+    # Reads a turn as the plugin does: each step's row is answered from /row before the stream continues.
+    rows, seen, path, body = [], [], '/turn', {'agentId': agent, 'text': text, 'rows': True}
+    while True:
+        events = list(rig.stream(path, body))
+        seen += events
+        if events[-1]['type'] != 'row': return rows, seen
+        rows.append((events[-1], rig.request('/row', {'agentId': agent, 'rowId': events[-1]['rowId']})))
+        path, body = '/continue', {'agentId': agent, 'rows': True}
+
+
+@pytest.mark.parametrize('family', ['gpt', 'grok', 'gemini'])
+def test_each_vendor_step_is_a_row_with_its_redacted_capped_output(rig, family):
+    rig.open(family)
+    rows, events = row_turn(rig, 'STEPS')
+    assert events[-1]['type'] == 'done' and events[-1]['text'] == 'STEPS'
+    command = next(result for row, result in rows if row['shell'] and row['title'] == 'printf hi')
+    assert 'sk-abcdefghijklmnopqrstuv' not in command['output'] and '[REDACTED]' in command['output']
+    assert command['output'].startswith('[') and 'earlier characters not shown' in command['output'].splitlines()[0]
+    assert len(command['output'].split('\n', 1)[1]) <= 2000 and command['output'].endswith('(exit code 2)')
+    edit = next(result for row, result in rows if not row['shell'] and 'a.txt' in row['title'])
+    assert not any('{' in row['title'] for row, _ in rows)
+    assert 'done' in edit['output'] and command['stopped'] is False
+    # The activity log keeps one line per step.
+    assert sum('printf hi' in line for line in (rig.home / 'logs' / 'a.log').read_text().splitlines()) == 1
+
+
+def test_a_client_without_rows_gets_each_step_as_one_activity_line(rig):
+    rig.open('gpt')
+    events = rig.turn('STEPS')
+    assert [e['text'] for e in events if e['type'] == 'activity'] == ['$ fake work', '$ /bin/zsh -lc "printf hi"', 'edit a.txt']
+    assert events[-1]['text'] == 'STEPS' and not any(e['type'] == 'row' for e in events)
+
+
+def test_a_stop_answers_a_step_still_waiting(rig):
+    rig.open('gpt')
+    events = list(rig.stream('/turn', {'agentId': 'a', 'text': 'SLOW', 'rows': True}))
+    assert events[-1]['type'] == 'row'
+    answer = {}
+    waiter = threading.Thread(target=lambda: answer.update(rig.request('/row', {'agentId': 'a', 'rowId': events[-1]['rowId']})))
+    waiter.start()
+    time.sleep(.3)
+    assert waiter.is_alive()
+    assert rig.request('/interrupt', {'agentId': 'a'}) == {'ok': True}
+    waiter.join(5)
+    assert answer == {'output': '', 'stopped': True}
+
+
+def test_a_turn_finished_while_disconnected_replays_no_steps_or_narration(rig):
+    rig.open('gpt')
+    stream = rig.stream('/turn', {'agentId': 'a', 'text': 'PING', 'rows': True})
+    assert next(stream)['type'] == 'row'
+    stream.close()
+    deadline = time.monotonic() + 5
+    while rig.request('/agents')[0]['state'] != 'idle':
+        assert time.monotonic() < deadline
+        time.sleep(.05)
+    rows, events = row_turn(rig, 'PONG-AGAIN')
+    assert [row['title'] for row, _ in rows] == ['fake work']
+    # Only the new turn's narration is shown: the earlier answer's pieces ('PO', 'NG') are not replayed.
+    assert [e['text'] for e in events if e['type'] == 'text'] == ['PO', 'NG-AGAIN']
+    assert events[-1]['text'].startswith('Result of the earlier task') and events[-1]['text'].endswith('PONG-AGAIN')

@@ -1,8 +1,14 @@
 import type { EngineInterface, Register, TurnStepInput, TurnStepResult } from 'claude-code'
 import type { LordAgent as Agent, LordTask as Task } from '../types'
 
-type Stream = { next: number; live: number; answer: string }
-type Outcome = { tool?: { callId: string; name: string; input: Record<string, unknown> } }
+// shown: the text of the latest text block, which the engine takes as the agent's result unless another follows.
+type Stream = { next: number; live: number; answer: string; shown: string }
+type Outcome = { tool?: { callId: string; name: string; input: Record<string, unknown> }; row?: { rowId: string; shell: boolean; title: string } }
+// A vendor's tool steps are drawn as rows: a shell command as a Bash row, any other step under the plugin's own tool for
+// that vendor, which Claude Code labels "lord - <family>". Neither runs anything; the plugin answers each with the
+// step's output as the vendor reported it.
+const stepTool = (family: string) => `mcp__lord__${family}`
+const stepTools = ['gpt', 'grok', 'gemini'].map(stepTool)
 const agents = new Map<string, Agent>()
 const starts = new Map<string, Task>()
 const directories = new Map<string, string>()
@@ -313,11 +319,15 @@ async function* vendorTurn($: EngineInterface, path: string, body: unknown, stre
       stream.live = -1
       yield { kind: 'thinking', index: stream.next++, text: event.text }
     } else if (event.type === 'text' && typeof event.text === 'string') {
-      // The engine keeps an agent's last text block as its result, so streamed vendor text is shown as
-      // thinking (not recorded) and the final answer is recorded once, whole, at done.
-      if (stream.live < 0) stream.live = stream.next++
+      // Recorded as the vendor writes it. The engine keeps an agent's last text block as its result, so a final answer
+      // that differs from the text shown is added as one more block at done.
+      if (stream.live < 0) { stream.live = stream.next++; stream.shown = '' }
       stream.answer += event.text
-      yield { kind: 'thinking', index: stream.live, text: event.text }
+      stream.shown += event.text
+      yield { kind: 'text', index: stream.live, text: event.text }
+    } else if (event.type === 'row') {
+      if (typeof event.rowId !== 'string' || typeof event.title !== 'string') throw new Error('invalid daemon step')
+      return { row: { rowId: event.rowId, shell: !!event.shell, title: event.title } }
     } else if (event.type === 'tool') {
       if (!['Agent', 'SendMessage'].includes(event.name) || typeof event.callId !== 'string' || !event.input || typeof event.input !== 'object') throw new Error('invalid daemon tool call')
       return { tool: { callId: event.callId, name: event.name, input: event.input } }
@@ -336,6 +346,10 @@ export const register: Register = on => {
     ending = false
     const r = await next(e)
     await $.command.register({ name: 'lord', description: 'List Lord agents or select their next model.', argumentHint: '[model <agentId> <model>]', immediate: true })
+    // Behind ToolSearch, so the main conversation's prompt does not carry them; Lord's agent files list them.
+    for (const family of ['gpt', 'grok', 'gemini'])
+      await $.tool.register({ name: family, description: `One step a Lord ${family} agent took, as its vendor reported it. Display only: calling it does nothing.`,
+        inputSchema: { type: 'object', properties: { step: { type: 'string' } }, required: ['step'] }, isDeferred: true }).catch(() => {})
     void reloadIfUpdated($).catch(() => {})
     return r
   })
@@ -389,7 +403,7 @@ export const register: Register = on => {
     const agent = e.agentId ? await lordAgent($, e.agentId) : undefined
     if (!agent) return yield* next(e)
     const agentId = e.agentId!
-    const stream: Stream = { next: 0, live: -1, answer: '' }
+    const stream: Stream = { next: 0, live: -1, answer: '', shown: '' }
     try {
       if (agent.error) { const error = agent.error; delete agent.error; throw new Error(error.replace(/^lord: error: /, '')) }
       let outcome: Outcome | undefined
@@ -427,9 +441,9 @@ export const register: Register = on => {
         agent.opened = true
         agent.cwd = cwd
         agent.daemon = await socket($)
-        outcome = yield* vendorTurn($, '/turn', { agentId, text: input.text, model: agent.model, effort: agent.effort ?? e.effort }, stream)
+        outcome = yield* vendorTurn($, '/turn', { agentId, text: input.text, model: agent.model, effort: agent.effort ?? e.effort, rows: true }, stream)
       } else if (agent.continuing) {
-        outcome = yield* vendorTurn($, '/continue', { agentId }, stream, await daemonOf($, agent))
+        outcome = yield* vendorTurn($, '/continue', { agentId, rows: true }, stream, await daemonOf($, agent))
       } else {
         // A later step with no lord tool behind it is the engine asking for the StructuredOutput call that a
         // Workflow schema requires. The schema itself reaches only the system prompt, which vendors never see,
@@ -450,8 +464,8 @@ export const register: Register = on => {
           agent.corrected = true
           const text = verdict ? `That JSON was rejected: ${verdict.text}\nReply with only the corrected JSON object.`
             : 'Reply with only a JSON object holding your answer, with no other text.'
-          outcome = yield* vendorTurn($, '/turn', { agentId, text, model: agent.model, effort: agent.effort ?? e.effort }, stream, await daemonOf($, agent))
-          if (!outcome.tool) {
+          outcome = yield* vendorTurn($, '/turn', { agentId, text, model: agent.model, effort: agent.effort ?? e.effort, rows: true }, stream, await daemonOf($, agent))
+          if (!outcome.tool && !outcome.row) {
             agent.lastAnswer = stream.answer
             value = json(stream.answer)
             if (!value) throw new Error('the vendor returned no JSON object for StructuredOutput')
@@ -467,7 +481,17 @@ export const register: Register = on => {
           return { turnId: e.turnId, index: e.index, answer: '', toolUses: [{ name: 'StructuredOutput', input: value }], stopReason: 'tool_use', usage: null }
         }
       }
-      agent.continuing = !!outcome!.tool
+      agent.continuing = !!(outcome!.tool || outcome!.row)
+      if (outcome!.row) {
+        const { rowId, shell, title } = outcome!.row
+        const name = shell ? 'Bash' : stepTool(agent.family), input = shell ? { command: title, description: title.slice(0, 80) } : { step: title }
+        agent.row = rowId
+        await keep($, agentId)
+        yield { kind: 'tool', index: stream.next, id: rowId, name }
+        yield { kind: 'input', index: stream.next, json: JSON.stringify(input) }
+        yield { kind: 'stop', stopReason: 'tool_use', usage: null }
+        return { turnId: e.turnId, index: e.index, answer: '', toolUses: [{ name, input }], stopReason: 'tool_use', usage: null }
+      }
       if (outcome!.tool) {
         const { callId, name, input } = outcome!.tool
         pending.set(callId, agentId)
@@ -486,7 +510,12 @@ export const register: Register = on => {
       agent.lastAnswer = stream.answer
       agent.running = false
       await keep($, agentId)
-      yield { kind: 'text', index: stream.next++, text: stream.answer }
+      // The latest block must read as the final answer: the rest of it is added to the block on screen when that block
+      // is its beginning, and otherwise the answer is a block of its own.
+      if (stream.answer !== stream.shown) {
+        if (stream.live >= 0 && stream.shown && stream.answer.startsWith(stream.shown)) yield { kind: 'text', index: stream.live, text: stream.answer.slice(stream.shown.length) }
+        else yield { kind: 'text', index: stream.next++, text: stream.answer }
+      }
       yield { kind: 'stop', stopReason: 'end_turn', usage: null }
       return result(e, stream.answer)
     } catch (error) {
@@ -546,6 +575,30 @@ export const register: Register = on => {
       await keep($, e.agentId!)
     }
     return r
+  })
+
+  on('tool.call', { tool: ['Bash', ...stepTools] }, async ($, e, next) => {
+    const agent = e.agentId ? await lordAgent($, e.agentId) : undefined
+    if (agent && agent.row === e.tool_use_id) {
+      // The vendor ran this step itself; its row waits for the vendor's report that the step finished.
+      let row: { output?: string; stopped?: boolean } | undefined
+      try { for await (const value of events($, '/row', { agentId: e.agentId, rowId: e.tool_use_id }, await daemonOf($, agent))) row = value }
+      catch (error) { row = { output: errorLine(error), stopped: true } }
+      delete agent.row
+      await keep($, e.agentId!)
+      const output = String(row?.output ?? '')
+      return (e.tool === 'Bash' ? { result: { stdout: output, stderr: '', interrupted: !!row?.stopped } } : { result: output }) as any
+    }
+    // A Lord agent's Bash and Lord's step tools only draw what a vendor did.
+    if (agent || e.tool !== 'Bash') return { deny: 'Lord draws its agents\' vendor steps with this tool; it runs nothing.' }
+    return next(e)
+  })
+
+  on('session.compact', async ($, e, next) => {
+    // A Lord agent's transcript is never sent to a model: its vendor keeps its own context, and Lord answers every
+    // step, so summarizing it would spend Claude tokens on nothing.
+    if (e.agentId && (agents.has(e.agentId) || await lordAgent($, e.agentId))) return { skip: "a Lord agent's vendor keeps its own context" }
+    return next(e)
   })
 
   on('session.send', async ($, e, next) => {

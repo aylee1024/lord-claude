@@ -39,6 +39,8 @@ HOME = Path(os.environ.get('LORD_HOME', Path.home() / '.claude/lord')).expanduse
 LEGACY_SOCKET = HOME / 'lordd.sock'
 SOCKET = Path(os.environ['LORD_DAEMON_SOCKET']) if os.environ.get('LORD_DAEMON_SOCKET') else HOME / f'lordd-{VERSION}.sock'
 LIMIT = 8 * 1024 * 1024
+# A row's output as Claude Code keeps it: the end of what the step printed, where errors land.
+ROW_OUTPUT = 2000
 EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max']
 RANKS = ['minimal', *EFFORTS, 'ultra']
 INSTALL = {'gpt': "install OpenAI's codex CLI (brew install --cask codex, or npm install -g @openai/codex) and sign in with `codex login`",
@@ -169,12 +171,56 @@ def codex_activity(item):
     if kind in ('userMessage', 'agentMessage', 'reasoning', None): return None
     return str(kind)
 
+def codex_step(item):
+    # (kind, title, log line) of a codex tool item. A command's title is the command as the model wrote it, without
+    # codex's `/bin/zsh -lc` wrapper, when codex reports it as one action.
+    line = codex_activity(item)
+    if item.get('type') == 'commandExecution':
+        actions = item.get('commandActions') or []
+        command = actions[0].get('command') if len(actions) == 1 and isinstance(actions[0], dict) else None
+        return 'command', str(command or item.get('command')), line
+    return 'step', line, line
+
+def codex_output(item):
+    kind = item.get('type')
+    if kind == 'commandExecution':
+        code = item.get('exitCode')
+        return str(item.get('aggregatedOutput') or '') + (f'\n(exit code {code})' if code not in (0, None) else '')
+    if kind == 'fileChange':
+        return '\n'.join(str(c.get('diff') or f"{c.get('kind', 'changed')} {c.get('path')}") for c in item.get('changes', []) if isinstance(c, dict))
+    value = item.get('result') if item.get('result') is not None else item.get('error')
+    return value if isinstance(value, str) else dumps(value) if value is not None else ''
+
+def grok_step(update):
+    # (kind, title, log line) of a grok tool call, from its first report: a command, or the tool's label and target.
+    meta = (update.get('_meta') or {}).get('x.ai/tool') or {}
+    raw = update.get('rawInput') or {}
+    if (meta.get('kind') or update.get('kind')) == 'execute' and raw.get('command'):
+        return 'command', str(raw['command']), '$ ' + str(raw['command'])
+    target = next((raw[k] for k in ('target_file', 'file_path', 'path', 'query', 'pattern', 'url') if raw.get(k)), '')
+    title = ' '.join(str(v) for v in (meta.get('label') or update.get('title') or meta.get('name') or 'tool', target) if v)
+    return 'step', title, title
+
+def grok_output(update):
+    parts = []
+    for item in update.get('content') or []:
+        if item.get('type') == 'diff': parts.append(f"{item.get('path')}\n--- before\n{item.get('oldText') or ''}\n+++ after\n{item.get('newText') or ''}")
+        elif isinstance(item.get('content'), dict) and item['content'].get('type') == 'text': parts.append(item['content'].get('text') or '')
+    code = (update.get('rawOutput') or {}).get('exit_code')
+    return '\n'.join(parts) + (f'\n(exit code {code})' if code not in (0, None) else '') + ('\n(failed)' if update.get('status') == 'failed' else '')
+
 def agy_activity(step):
     # A tool step as agy names it, with its parameters: the file, folder, search or command it used.
     info = step.get('tool_info') or {}
     name = info.get('name') or step.get('tool_name')
     if not name: return str(step.get('command') or step.get('step_type', 'Working'))
     return f"{name} {dumps(info['parameters'])[:300]}" if info.get('parameters') else str(name)
+
+def agy_title(step):
+    # A row's title for an agy tool step: the tool's name and its parameters' values, as a reader would write them.
+    info = step.get('tool_info') or {}
+    values = ' '.join(str(v) for v in (info.get('parameters') or {}).values())
+    return f"{info.get('name') or step.get('tool_name')} {values}".strip()[:2000]
 
 def dumps(value):
     return json.dumps(value, separators=(',', ':'), ensure_ascii=True)
@@ -272,6 +318,8 @@ class Agent:
         self.followup, self.earlier, self.carry, self.call_data, self.ended_turns = None, None, [], {}, set()
         self.final_text, self.restart, self.token = '', False, uuid.uuid4().hex
         self.default_model, self.agy_step = False, None
+        # Each vendor tool step's result, by step id, for the plugin's row of it (/row).
+        self.rows = {}
         self.log_path = HOME / 'logs' / f"{record['agentId']}.log"
         self.answer_path = self.log_path.with_suffix('.answer.md')
 
@@ -281,13 +329,27 @@ class Agent:
         if not self.log_path.exists() or self.log_path.stat().st_size < 4 * 1024 * 1024:
             with self.log_path.open('a') as file: file.write(f'{datetime.now(timezone.utc).isoformat()} {REDACT(text)[:2000]}\n')
 
+    def row(self, rid, kind, title, line=None):
+        # A vendor tool step starting: a row in Claude Code's view of the agent. kind 'command' is a shell command
+        # (a Bash row); 'step' is any other tool step. The activity log keeps its usual line.
+        if self.state not in ('running', 'waiting_tool') or rid in self.rows: return
+        self.rows[rid] = asyncio.get_running_loop().create_future()
+        self.emit('row', rowId=rid, shell=kind == 'command', title=REDACT(title)[:2000], text=line or title)
+
+    def row_done(self, rid, output, stopped=False):
+        future = self.rows.get(rid)
+        if future is None or future.done(): return
+        text = REDACT(output)
+        if len(text) > ROW_OUTPUT: text = f'[{len(text) - ROW_OUTPUT} earlier characters not shown]\n{text[-ROW_OUTPUT:]}'
+        future.set_result({'output': text, 'stopped': stopped})
+
     def undelivered(self):
         return bool(self.carry) or not self.events.empty()
 
     def emit(self, kind, **value):
         if self.state not in ('running', 'waiting_tool'): return
         if kind == 'text': self.answer += value['text']
-        if kind == 'activity':
+        if kind in ('activity', 'row'):
             self.activity = value['text'][:300]
             self.note(value['text'])
         if kind == 'error': value['message'] = sign_in_hint(self.family, value['message'])
@@ -296,6 +358,9 @@ class Agent:
             self.finished.set()
             for future in self.calls.values():
                 if not future.done(): future.set_result({'content': [{'type': 'text', 'text': 'Turn ended'}], 'isError': True})
+            # A step still open when the turn ends has no result to wait for.
+            for future in self.rows.values():
+                if not future.done(): future.set_result({'output': '', 'stopped': kind == 'error'})
         self.events.put_nowait({'type': kind, **value})
         if kind == 'done' and value['text'].strip():
             # The latest turn's final answer, kept beside the activity log, so a read-only agent's findings
@@ -441,8 +506,14 @@ class Vendor:
                 elif payload.get('step_type') != 'agent_response':
                     # Text before a tool step is narration; the answer is what agy says after its last one.
                     a.answer = ''
-                    # agy reports a tool step when it starts and again when it ends; the step is noted once.
-                    if payload.get('step_index') is None or payload.get('step_index') != a.agy_step:
+                    info = payload.get('tool_info') or {}
+                    if (info.get('name') or payload.get('tool_name')) and payload.get('step_index') is not None:
+                        # agy reports a tool step when it starts (ACTIVE) and when it ends (DONE), with its output.
+                        rid, name = f"agy-{payload['step_index']}", info.get('name') or payload.get('tool_name')
+                        command = name == 'run_command' and (info.get('parameters') or {}).get('CommandLine')
+                        a.row(rid, 'command' if command else 'step', command or agy_title(payload), agy_activity(payload))
+                        if payload.get('state') == 'DONE': a.row_done(rid, str(info.get('output') or ''))
+                    elif payload.get('step_index') is None or payload.get('step_index') != a.agy_step:
                         a.agy_step = payload.get('step_index')
                         a.emit('activity', text=agy_activity(payload))
             elif event == 'result' and a.state in ('running', 'waiting_tool'):
@@ -450,7 +521,10 @@ class Vendor:
                     a.emit('error', message=self.d.redact(payload.get('error') or payload.get('status')), retryable=True)
                 else:
                     self.d.record_usage(a, usage(payload.get('usage', {})))
-                    a.emit('done', text=payload['response'] if isinstance(payload.get('response'), str) else a.answer, usage=usage(payload.get('usage', {})), model=a.model)
+                    # agy's response joins every message of the turn; the answer is what it said after its last tool step, as
+                    # for the other vendors, and the whole response only when it said nothing after one.
+                    response = payload.get('response') if isinstance(payload.get('response'), str) else ''
+                    a.emit('done', text=a.answer if a.answer.strip() else response or a.answer, usage=usage(payload.get('usage', {})), model=a.model)
             return
         sid = p.get('threadId') or p.get('sessionId')
         a = next((a for a in self.d.agents.values() if a.family == self.family and a.vendorSession == sid), None)
@@ -464,21 +538,30 @@ class Vendor:
             elif kind in ('tool_call', 'tool_call_update'):
                 # Text before a tool call is narration; the answer is what grok says after its last one.
                 a.final_text = ''
-                if kind == 'tool_call' or update.get('title'): a.emit('activity', text=update.get('title') or update.get('kind') or 'tool')
+                rid = update.get('toolCallId') or uuid.uuid4().hex
+                if kind == 'tool_call': a.row(rid, *grok_step(update))
+                elif update.get('status') in ('completed', 'failed'):
+                    a.row(rid, *grok_step(update))
+                    a.row_done(rid, grok_output(update))
         elif method == 'turn/started' and p['turn']['id'] not in a.ended_turns: a.turn_id = p['turn']['id']
         elif method == 'item/agentMessage/delta':
             a.items[p['itemId']] = a.items.get(p['itemId'], '') + p['delta']
             a.emit('text', text=p['delta'])
+        elif method == 'item/completed' and codex_activity(p['item']):
+            item = p['item']
+            rid = item.get('id') or uuid.uuid4().hex
+            a.row(rid, *codex_step(item))
+            a.row_done(rid, codex_output(item))
         elif method == 'item/completed' and p['item'].get('type') == 'agentMessage':
             item = p['item']
             seen = a.items.get(item['id'], '')
             if item['text'].startswith(seen) and len(item['text']) > len(seen): a.emit('text', text=item['text'][len(seen):])
             a.items[item['id']] = item['text']
             a.final_text = item['text']
-        elif method == 'item/started' and (line := codex_activity(p['item'])):
+        elif method == 'item/started' and codex_activity(p['item']):
             # A message before a tool action is narration; the answer is the agent message after the last action.
             a.final_text = ''
-            a.emit('activity', text=line)
+            a.row(p['item'].get('id') or uuid.uuid4().hex, *codex_step(p['item']))
         elif method == 'thread/tokenUsage/updated':
             a.total = p['tokenUsage']['total']
             a.tokens = usage({k: max(0, v - a.base.get(k, 0)) for k, v in a.total.items() if isinstance(v, int)})
@@ -843,7 +926,7 @@ class Daemon:
         a.state, a.answer, a.final_text, a.items = 'running', '', '', {}
         a.base, a.tokens, a.turn_id = dict(a.total), usage({}), None
         a.finished.clear()
-        a.dispatched, a.agy_step = False, None
+        a.dispatched, a.agy_step, a.rows = False, None, {}
         a.note(f'turn: {a.family} {a.model} effort {a.effort}')
         self.save(a)
         a.turn_task = self.task(self.run_turn(a, body))
@@ -981,6 +1064,11 @@ class Daemon:
                 if a.agentId in self.vendors: self.vendors[a.agentId].last = time.monotonic()
                 future.set_result({'content': [{'type': 'text', 'text': body['text']}], 'isError': bool(body.get('isError'))})
             elif path == '/mcp': return await self.mcp_call(a, body['name'], body.get('arguments', {}), body.get('token'))
+            elif path == '/row':
+                # Answers once the vendor reports the step finished, or the turn ends.
+                future = a.rows.get(body.get('rowId'))
+                if future is None: raise ValueError('No such step')
+                return await asyncio.shield(future)
             elif path == '/steer':
                 steered = a.family == 'gpt' and a.state in ('running', 'waiting_tool') and bool(a.turn_id)
                 if steered:
@@ -1014,12 +1102,22 @@ class Daemon:
             if method == 'POST' and path in ('/turn', '/continue'):
                 a = self.agents[body['agentId']]
                 if a.stream_lock.locked(): raise ValueError('A stream is already attached')
+                # A client that draws rows gets each tool step as a row event that ends its stream; any other gets the
+                # step as one activity line.
+                rows = bool(body.get('rows'))
                 if path == '/turn':
                     if not isinstance(body['text'], str): raise ValueError('text must be a string')
                     # A turn whose client went away keeps running; its result is delivered first and this
                     # text becomes the next turn in the same stream.
                     if a.state in ('running', 'waiting_tool') or a.undelivered():
                         a.followup = body
+                        # The earlier turn's steps and narration stay unshown: only its result and any tool call it
+                        # is waiting on carry over into the new turn.
+                        a.carry[:] = [e for e in a.carry if e['type'] not in ('row', 'text', 'activity')]
+                        queued = []
+                        while not a.events.empty(): queued.append(a.events.get_nowait())
+                        for e in queued:
+                            if e['type'] not in ('row', 'text', 'activity'): a.events.put_nowait(e)
                         # A tool call whose client went away is offered again, so the new client can run it.
                         if a.state == 'waiting_tool':
                             queued = []
@@ -1058,6 +1156,7 @@ class Daemon:
                                 event = ({**event, 'text': f'{earlier}Reply to the new message:\n{event["text"]}'} if event['type'] == 'done'
                                          else {**event, 'message': f'{earlier}The new message failed: {event["message"]}'})
                                 a.earlier = None
+                            if event['type'] == 'row' and not rows: event = {'type': 'activity', 'text': event['text']}
                             line = (dumps(event) + '\n').encode()
                             try:
                                 writer.write(f'{len(line):x}\r\n'.encode() + line + b'\r\n')
@@ -1065,7 +1164,7 @@ class Daemon:
                             except (BrokenPipeError, ConnectionResetError):
                                 a.carry.insert(0, event)
                                 raise
-                            if event['type'] in ('tool', 'done', 'error'): break
+                            if event['type'] in ('tool', 'row', 'done', 'error'): break
                         writer.write(b'0\r\n\r\n')
                     finally:
                         for task in (disconnected, pending):

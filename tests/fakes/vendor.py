@@ -84,6 +84,7 @@ async def turn(sid, text, request_id=None):
     tid = str(uuid.uuid4())
     TURNS[sid] = {'id': tid, 'wake': asyncio.Event(), 'cancel': False, 'steer': None}
     live = TURNS[sid]
+    narration = ''
     if FAMILY == 'gpt':
         send({'method': 'turn/started', 'params': {'threadId': sid, 'turn': {'id': tid}}})
         send({'id': request_id, 'result': {'turn': {'id': tid}}})
@@ -112,7 +113,33 @@ async def turn(sid, text, request_id=None):
         session['crashed'] = True
         save(sid)
         os._exit(9)
-    if text == 'COMMAND':
+    if text == 'STEPS':
+        # One command (long output ending in a token, exit code 2) and one file edit, shaped as each vendor reports them.
+        output = 'x' * 3000 + ' sk-abcdefghijklmnopqrstuv'
+        if FAMILY == 'gpt':
+            command = {'type': 'commandExecution', 'id': 'c1', 'command': '/bin/zsh -lc "printf hi"', 'commandActions': [{'type': 'unknown', 'command': 'printf hi'}]}
+            edit = {'type': 'fileChange', 'id': 'f1', 'changes': [{'path': 'a.txt', 'kind': 'add', 'diff': '+done'}]}
+            for item, done in ((command, {'aggregatedOutput': output, 'exitCode': 2}), (edit, {})):
+                send({'method': 'item/started', 'params': {'threadId': sid, 'item': item}})
+                send({'method': 'item/completed', 'params': {'threadId': sid, 'item': {**item, **done}}})
+        elif FAMILY == 'grok':
+            update(sid, 'tool_call', toolCallId='g1', title='run_terminal_command', rawInput={'command': 'printf hi'},
+                   _meta={'x.ai/tool': {'name': 'run_terminal_command', 'kind': 'execute', 'label': 'Run Command'}})
+            update(sid, 'tool_call', toolCallId='g2', title='search_replace', rawInput={'file_path': 'a.txt', 'old_string': '', 'new_string': 'done'},
+                   _meta={'x.ai/tool': {'name': 'search_replace', 'kind': 'edit', 'label': 'Edit'}})
+            update(sid, 'tool_call_update', toolCallId='g1', status='completed', content=[{'type': 'content', 'content': {'type': 'text', 'text': output}}], rawOutput={'exit_code': 2})
+            update(sid, 'tool_call_update', toolCallId='g2', status='completed', content=[{'type': 'diff', 'path': 'a.txt', 'oldText': '', 'newText': 'done'}])
+        else:
+            # agy narrates before its steps and joins every message into its final response.
+            narration = 'Starting. '
+            send({'event': 'step_update', 'step_update': {'step_type': 'agent_response', 'text_delta': narration}})
+            for index, info, out in ((5, {'name': 'run_command', 'parameters': {'CommandLine': 'printf hi'}}, output + '\n(exit code 2)'),
+                                     (6, {'name': 'write_file', 'parameters': {'Path': 'a.txt'}}, 'a.txt +done')):
+                for state in ('ACTIVE', 'DONE'):
+                    send({'event': 'step_update', 'step_update': {'step_index': index, 'state': state, 'step_type': 'tool', 'tool_name': info['name'],
+                          'tool_info': {**info, **({'output': out} if state == 'DONE' else {})}}})
+        answer = 'STEPS'
+    elif text == 'COMMAND':
         # codex ends an interrupted turn but leaves the command it was running alive, in a session of its own.
         child = subprocess.Popen(['sleep', '300'], start_new_session=True)
         audit(command_pid=child.pid)
@@ -170,7 +197,7 @@ async def turn(sid, text, request_id=None):
         (folder / 'usage.json').write_text(json.dumps({'session': row, 'turns': [row]}))
         send({'id': request_id, 'result': {'stopReason': 'cancelled' if live['cancel'] else 'end_turn'}})
     else:
-        send({'event': 'result', 'result': {'status': 'SUCCESS', 'response': answer, 'usage': {'input_tokens': 10, 'output_tokens': 5, 'cache_read_tokens': 2}}})
+        send({'event': 'result', 'result': {'status': 'SUCCESS', 'response': narration + answer, 'usage': {'input_tokens': 10, 'output_tokens': 5, 'cache_read_tokens': 2}}})
 
 
 async def handle(value):

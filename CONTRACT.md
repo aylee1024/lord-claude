@@ -48,8 +48,9 @@ can reach them; grok's Lord profiles deny reading it); without it the reply is 4
 |---|---|---|---|
 | GET | /health | - | `{ok, pid, version}` (`version` from the daemon's own plugin.json) |
 | POST | /open | `{agentId, family, cwd, version?, model?, effort?, readonly?, net?, nosandbox?, dirs?, memory_gb?, hang_s?, wall_s?, tools?}` | `{vendorSession, model, effort}`; idempotent; resumes after a daemon restart from the journal. A new agent whose configured default model the vendor does not list gets the vendor's own default (codex `isDefault`, grok's current `model` option, agy's first listed model), logged. A later `readonly`, `net`, `nosandbox`, `tools` or new `dirs` restarts the vendor session before the next turn. Refused with the reason: a named model the vendor does not list (the vendor's list), `dirs` for grok/gemini, `nosandbox` for grok/gemini or with `readonly`, `readonly` for gemini, for gpt with `net`, or for grok under a temp folder or `~/.grok` (an existing agent is judged by its own folder), `/` or the home folder as cwd |
-| POST | /turn | `{agentId, text, model?, effort?}` | NDJSON stream; if the agent has a running or undelivered turn (its client went away), that turn streams first (a pending lord tool call is offered again) and this text starts when it ends, its done text prefixed with the earlier result. An interrupted turn leaves nothing to deliver |
-| POST | /continue | `{agentId}` | NDJSON stream of the same turn after a tool result |
+| POST | /turn | `{agentId, text, model?, effort?, rows?}` | NDJSON stream; if the agent has a running or undelivered turn (its client went away), that turn streams first (a pending lord tool call is offered again, its queued steps and text are dropped) and this text starts when it ends, its done text prefixed with the earlier result. An interrupted turn leaves nothing to deliver |
+| POST | /continue | `{agentId, rows?}` | NDJSON stream of the same turn after a tool result or a row |
+| POST | /row | `{agentId, rowId}` | `{output, stopped}` once the vendor reports the step finished, or the turn ends (`stopped` when it ended in an error or a stop); `output` is the step's output, redacted, its last 2,000 characters with a line counting the rest |
 | POST | /tool_result | `{agentId, callId, text, isError}` | `{ok}` |
 | POST | /steer | `{agentId, text}` | `{ok, steered}` (codex `turn/steer` while a turn runs) |
 | POST | /interrupt, /close | `{agentId}` | `{ok}` (codex `turn/interrupt`, then the codex process is stopped once a started turn ends, since codex leaves the running command alive; grok `session/cancel`; agy process kill; close also stops the process) |
@@ -57,9 +58,18 @@ can reach them; grok's Lord profiles deny reading it); without it the reply is 4
 | POST | /prune | `{days}` | `{ok, pruned}`; also at daemon start and hourly: journal records unused for `prune_days`; codex threads archived, vendor history otherwise kept |
 | GET | /agents | - | `[{agentId, family, model, effort, state, activity, cwd, log, answer, usage}]` (`answer`: the answer file's path, null before a first answer) (`usage`: the vendor's last turn; codex input excludes its cached tokens) |
 
-NDJSON events: `text` (vendor text as it streams), `activity` (one line of vendor work), `tool` (`{callId, name: Agent|
+NDJSON events: `text` (vendor text as it streams), `activity` (one line of vendor work), `row` (`{rowId, shell, title,
+text}`, only to a stream that asked with `rows: true`: a vendor tool step starting, `shell` for a shell command; the stream
+ends and the vendor keeps working; any other stream gets the step as one `activity` line), `tool` (`{callId, name: Agent|
 SendMessage, input}`; the stream ends, the vendor waits), `done` (`{text, usage, model}`; `text` is the final answer
-only: codex's last agent message, grok's text after its last tool call, agy's response), `error` (`{message, retryable}`).
+only: codex's last agent message, grok's text after its last tool call, agy's text after its last tool step, else its
+whole response), `error` (`{message, retryable}`).
+
+Rows: the plugin draws a `row` as a `Bash` tool call (`shell`) or a call of its step tool `mcp__lord__<family>`
+(`{step}`), both listed in the agent files, and answers that call itself from `/row`, so nothing runs and no
+permission check or PreToolUse hook applies. Any other Bash or step-tool call from a Lord agent is refused. Steps come
+from codex `item/started`/`item/completed`, grok `tool_call`/`tool_call_update` (completed or failed), agy `step_update`
+tool steps (ACTIVE/DONE).
 A refused request answers `{error}`. A client disconnect never interrupts a turn; only /interrupt or /close does; an
 event taken off the queue as the client leaves is kept for the next client. The daemon does not idle-exit while a result
 waits undelivered, for up to `keep_undelivered_s` (a day).

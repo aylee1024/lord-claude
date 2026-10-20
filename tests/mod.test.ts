@@ -9,6 +9,9 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
   let modelCalls = 0
   let opened: string | undefined
   let streamFinished = false
+  // Each /turn or /continue stream takes the next queued event list, else `events`; /row answers `replies.row`.
+  const sequence: unknown[][] = []
+  const replies: { row: unknown } = { row: { output: 'row output', stopped: false } }
   mock.env(on, { HOME: '/test', ...(socket ? { LORD_DAEMON_SOCKET: socket } : {}), ...env })
   let spawned = 'lord:gpt'
   const clock = mock.clock(on)
@@ -21,7 +24,7 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
     } else {
       const path = e.argv[e.argv.length - 1].replace('http://lord', '')
       requests.push({ path, body: JSON.parse(e.input ?? '{}'), socket: e.argv[e.argv.indexOf('--unix-socket') + 1] })
-      const raw = events.map(x => JSON.stringify(x)).join('\n') + '\n'
+      const raw = path === '/row' ? JSON.stringify(replies.row) : (sequence.length ? sequence.shift()! : events).map(x => JSON.stringify(x)).join('\n') + '\n'
       for (let i = 0; i < raw.length; i += 11) yield { stream: 'stdout', text: raw.slice(i, i + 11) }
       streamFinished = true
     }
@@ -75,7 +78,7 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
     modelCalls++
     return { turnId: e.turnId, index: e.index, answer: 'MODEL CALLED', toolUses: [], stopReason: 'end_turn', usage: null }
   })
-  return { events, tools, requests, statuses, processes, deliveries, clock, spawnInputs, toolCalls, commands, toasts, roster, modelCalls: () => modelCalls, streamFinished: () => streamFinished }
+  return { sequence, replies, events, tools, requests, statuses, processes, deliveries, clock, spawnInputs, toolCalls, commands, toasts, roster, modelCalls: () => modelCalls, streamFinished: () => streamFinished }
 }
 
 // The session's state as the host keeps it, which a test writes as the copy of the code before a reload would.
@@ -111,7 +114,7 @@ test('lord turns use the daemon and return explicit results without Claude', asy
   expect(result.usage).toBeNull()
   expect(chunks).toContainEqual({ kind: 'text', index: 0, text: 'fake answer' })
   expect(w.modelCalls()).toBe(0)
-  expect(w.requests.find(x => x.path === '/turn')?.body).toEqual({ agentId: 'a1', text: 'hello', effort: 'xhigh' })
+  expect(w.requests.find(x => x.path === '/turn')?.body).toEqual({ agentId: 'a1', text: 'hello', effort: 'xhigh', rows: true })
 })
 
 test('activity is yielded before the daemon finishes sending its response', async ($, on) => {
@@ -161,14 +164,22 @@ test('the done event supplies the remaining final answer without repeating strea
   expect(w.modelCalls()).toBe(0)
 })
 
-test('streamed text is shown live and recorded once as one final text block', async ($, on) => {
+test('streamed text is recorded as it arrives, and a final answer that differs is the last block', async ($, on) => {
   world(on, [{ type: 'text', text: 'hel' }, { type: 'text', text: 'lo ' }, { type: 'activity', text: 'cmd' },
     { type: 'text', text: 'wor' }, { type: 'done', text: 'hello world' }])
   await spawn($)
   const { result, chunks } = await step($, 'hello')
-  expect(chunks.filter(x => x.kind === 'text')).toEqual([{ kind: 'text', index: 3, text: 'hello world' }])
-  expect(chunks.filter(x => x.kind === 'thinking').map(x => [x.index, x.text])).toEqual([[0, 'hel'], [0, 'lo '], [1, 'cmd'], [2, 'wor']])
+  expect(chunks.filter(x => x.kind === 'text').map(x => [x.index, x.text])).toEqual([[0, 'hel'], [0, 'lo '], [2, 'wor'], [3, 'hello world']])
+  expect(chunks.filter(x => x.kind === 'thinking').map(x => [x.index, x.text])).toEqual([[1, 'cmd']])
   expect(result.answer).toBe('hello world')
+})
+
+test('a final answer already shown whole is not shown again', async ($, on) => {
+  world(on, [{ type: 'text', text: 'all ' }, { type: 'text', text: 'done' }, { type: 'done', text: 'all done' }])
+  await spawn($)
+  const { result, chunks } = await step($, 'hello')
+  expect(chunks.filter(x => x.kind === 'text').map(x => [x.index, x.text])).toEqual([[0, 'all '], [0, 'done']])
+  expect(result.answer).toBe('all done')
 })
 
 test('an error after partial output appears on its own line', async ($, on) => {
@@ -178,11 +189,83 @@ test('an error after partial output appears on its own line', async ($, on) => {
   expect(result.answer).toBe('lord: error: failed now')
 })
 
+test('a vendor command is drawn as a Bash row answered with its output, and the turn continues after it', async ($, on) => {
+  const w = world(on)
+  w.sequence.push([{ type: 'text', text: 'Looking. ' }, { type: 'row', rowId: 'r1', shell: true, title: 'ls -la' }], [{ type: 'done', text: 'Two files.' }])
+  await spawn($)
+  const first = await step($, 'hello')
+  expect(first.chunks.map(x => x.kind)).toEqual(['text', 'tool', 'input', 'stop'])
+  expect(first.chunks[1]).toMatchObject({ kind: 'tool', id: 'r1', name: 'Bash' })
+  expect(JSON.parse(first.chunks[2].json)).toMatchObject({ command: 'ls -la' })
+  expect(first.result.stopReason).toBe('tool_use')
+  const r: any = await $.tool.call({ tool: 'Bash', tool_use_id: 'r1', agentId: 'a1', command: 'ls -la' } as any)
+  expect(r.result).toEqual({ stdout: 'row output', stderr: '', interrupted: false })
+  expect(w.requests.find(x => x.path === '/row')?.body).toEqual({ agentId: 'a1', rowId: 'r1' })
+  expect(w.toolCalls).toEqual([])
+  const second = await step($, 'hello', 1)
+  expect(w.requests.find(x => x.path === '/continue')?.body).toEqual({ agentId: 'a1', rows: true })
+  expect(second.result.answer).toBe('Two files.')
+})
+
+test('any other vendor step is drawn under the vendor\'s own step tool', async ($, on) => {
+  const w = world(on)
+  w.sequence.push([{ type: 'row', rowId: 'r2', shell: false, title: 'Read notes.txt' }])
+  await spawn($)
+  const { chunks } = await step($, 'hello')
+  expect(chunks[0]).toMatchObject({ kind: 'tool', id: 'r2', name: 'mcp__lord__gpt' })
+  expect(JSON.parse(chunks[1].json)).toEqual({ step: 'Read notes.txt' })
+  const r: any = await $.tool.call({ tool: 'mcp__lord__gpt', tool_use_id: 'r2', agentId: 'a1', step: 'Read notes.txt' } as any)
+  expect(r.result).toBe('row output')
+})
+
+test('a step the vendor stopped reads as interrupted', async ($, on) => {
+  const w = world(on)
+  w.sequence.push([{ type: 'row', rowId: 'r3', shell: true, title: 'sleep 300' }])
+  w.replies.row = { output: '', stopped: true }
+  await spawn($)
+  await step($, 'hello')
+  const r: any = await $.tool.call({ tool: 'Bash', tool_use_id: 'r3', agentId: 'a1', command: 'sleep 300' } as any)
+  expect(r.result.interrupted).toBe(true)
+})
+
+test('only a vendor step may use a Lord agent\'s Bash or the step tools; other Bash calls pass', async ($, on) => {
+  const w = world(on)
+  await spawn($)
+  await step($, 'hello')
+  const own: any = await $.tool.call({ tool: 'Bash', tool_use_id: 'x1', agentId: 'a1', command: 'rm -rf /' } as any)
+  expect(own.deny).toContain('runs nothing')
+  const tool: any = await $.tool.call({ tool: 'mcp__lord__grok', tool_use_id: 'x2', step: 'anything' } as any)
+  expect(tool.deny).toContain('runs nothing')
+  await $.tool.call({ tool: 'Bash', tool_use_id: 'x3', command: 'ls' } as any)
+  expect(w.toolCalls.map((x: any) => x.tool_use_id)).toEqual(['x3'])
+})
+
+test('a step still waiting when this code is reloaded is answered by the new copy', async ($, on) => {
+  const w = world(on)
+  const state = sessionState(on)
+  state.put('agent', 'a1', { family: 'gpt', opened: true, cwd: '/work', running: true, continuing: true, row: 'r9' })
+  const r: any = await $.tool.call({ tool: 'Bash', tool_use_id: 'r9', agentId: 'a1', command: 'make' } as any)
+  expect(r.result.stdout).toBe('row output')
+  expect(state.get('agent', 'a1').row).toBeUndefined()
+})
+
+test('a Lord agent\'s transcript is never summarized; any other is', async ($, on) => {
+  world(on)
+  const kept = [{ role: 'user', text: 'summary', toolUses: [] }]
+  on('session.compact', () => ({ messages: kept }) as any)
+  await spawn($)
+  await step($, 'hello')
+  const lord: any = await $.session.compact({ agentId: 'a1', trigger: 'auto', messages: kept } as any)
+  expect(lord.skip).toContain('own context')
+  const main: any = await $.session.compact({ trigger: 'auto', messages: kept } as any)
+  expect(main.messages).toHaveLength(1)
+})
+
 test('first-line directives in a resumed SendMessage survive the coordinator envelope', async ($, on) => {
   const w = world(on)
   await spawn($)
   await step($, 'The coordinator sent a message while you were working:\n@model next-model\n@readonly\n@net\nSECOND\n\nAddress this before completing your current task.')
-  expect(w.requests.find(x => x.path === '/turn')?.body).toEqual({ agentId: 'a1', text: 'SECOND', model: 'next-model', effort: 'xhigh' })
+  expect(w.requests.find(x => x.path === '/turn')?.body).toEqual({ agentId: 'a1', text: 'SECOND', model: 'next-model', effort: 'xhigh', rows: true })
 })
 
 test('vendor tools run through native chunks and their results return before continue', async ($, on) => {

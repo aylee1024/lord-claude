@@ -16,6 +16,8 @@ The vendor program reads and acts on files with its own tools, as it would if yo
 - `logs/<agentId>.log`: the commands and file actions the vendor reported for that agent, with secret values and common token shapes redacted, at most 4 MB each, removed with the agent's line.
 - `lordd.log`: the daemon's own log, at most 1 MB plus one older copy.
 
+Claude Code keeps its own transcript of each Lord agent under `~/.claude/projects/`, as it does for a Claude subagent: since 2.1.0 that transcript holds what the vendor wrote and each step it took, with the step's output redacted and cut to its last 2,000 characters.
+
 Vendor conversation history is kept by each vendor program in its usual place, as when you use it directly.
 
 **Contact.** Questions and reports: https://github.com/aylee1024/lord-claude/issues
