@@ -904,6 +904,7 @@ class Daemon:
             a.cancel_requested = True
             for future in list(a.calls.values()):
                 if not future.done(): future.set_result({'content': [{'type': 'text', 'text': 'interrupted'}], 'isError': True})
+            started = a.family == 'gpt' and a.turn_id
             if a.family == 'gpt':
                 # Before dispatch run_turn sees cancel_requested and ends the turn itself.
                 if a.turn_id: await v.rpc('turn/interrupt', {'threadId': a.vendorSession, 'turnId': a.turn_id})
@@ -917,6 +918,11 @@ class Daemon:
             except TimeoutError:
                 await kill_tree(v.process)
                 a.emit('error', message='interrupted', retryable=False)
+            if started:
+                # codex ends an interrupted turn but leaves the command it was running alive; closing the process
+                # stops that command, and the next turn resumes the thread in a new one.
+                await v.close()
+                a.generation = 0
         # An interrupted turn leaves nothing to deliver, also when it finished just before the interrupt arrived.
         if not a.stream_lock.locked():
             a.carry.clear()

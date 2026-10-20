@@ -52,7 +52,7 @@ can reach them; grok's Lord profiles deny reading it); without it the reply is 4
 | POST | /continue | `{agentId}` | NDJSON stream of the same turn after a tool result |
 | POST | /tool_result | `{agentId, callId, text, isError}` | `{ok}` |
 | POST | /steer | `{agentId, text}` | `{ok, steered}` (codex `turn/steer` while a turn runs) |
-| POST | /interrupt, /close | `{agentId}` | `{ok}` (codex `turn/interrupt`, grok `session/cancel`, agy process kill; close also stops the process) |
+| POST | /interrupt, /close | `{agentId}` | `{ok}` (codex `turn/interrupt`, then the codex process is stopped once a started turn ends, since codex leaves the running command alive; grok `session/cancel`; agy process kill; close also stops the process) |
 | POST | /mcp | `{agentId, name, arguments, token}` | the lord tool call of a vendor's MCP server; the per-agent token is required |
 | POST | /prune | `{days}` | `{ok, pruned}`; also at daemon start and hourly: journal records unused for `prune_days`; codex threads archived, vendor history otherwise kept |
 | GET | /agents | - | `[{agentId, family, model, effort, state, activity, cwd, log, answer, usage}]` (`answer`: the answer file's path, null before a first answer) (`usage`: the vendor's last turn; codex input excludes its cached tokens) |

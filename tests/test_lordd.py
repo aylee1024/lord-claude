@@ -218,6 +218,23 @@ def test_interrupt_mid_turn_and_resume_memory(rig, family):
     assert rig.request('/agents')[0]['state'] == 'idle'
 
 
+
+def test_a_stopped_gpt_turn_leaves_no_command_running(rig):
+    rig.open('gpt')
+    assert rig.turn('secret-word')[-1]['type'] == 'done'
+    stream = rig.stream('/turn', {'agentId': 'a', 'text': 'COMMAND'})
+    assert next(stream)['type'] == 'activity'
+    assert rig.request('/interrupt', {'agentId': 'a'}) == {'ok': True}
+    assert list(stream)[-1]['type'] == 'error'
+    pid = [e['command_pid'] for e in rig.audit() if 'command_pid' in e][-1]
+    deadline = time.monotonic() + 5
+    while True:
+        try: os.kill(pid, 0)
+        except ProcessLookupError: break
+        assert time.monotonic() < deadline, 'the stopped turn left its command running'
+        time.sleep(.05)
+    assert rig.turn('REMEMBER')[-1]['text'] == 'secret-word'
+
 def test_steer_and_effort_nearest_supported(rig):
     assert rig.open('gpt', model='gpt-6-luna', effort='max')['effort'] == 'high'
     assert rig.request('/steer', {'agentId': 'a', 'text': 'idle'}) == {'ok': True, 'steered': False}

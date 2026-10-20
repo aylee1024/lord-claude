@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import uuid
 from urllib.parse import quote
@@ -111,7 +112,13 @@ async def turn(sid, text, request_id=None):
         session['crashed'] = True
         save(sid)
         os._exit(9)
-    if text in ('SLOW', 'TEXT_WAIT'):
+    if text == 'COMMAND':
+        # codex ends an interrupted turn but leaves the command it was running alive, in a session of its own.
+        child = subprocess.Popen(['sleep', '300'], start_new_session=True)
+        audit(command_pid=child.pid)
+        await live['wake'].wait()
+        answer = ''
+    elif text in ('SLOW', 'TEXT_WAIT'):
         if text == 'TEXT_WAIT':
             if FAMILY == 'gpt':
                 send({'method': 'item/agentMessage/delta', 'params': {'threadId': sid, 'itemId': tid, 'delta': 'partial'}})
