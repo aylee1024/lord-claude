@@ -717,7 +717,7 @@ class Daemon:
         for key, value in (found.items() if isinstance(found, dict) else []):
             parts = key.split(' ', 1)
             if len(parts) == 2 and isinstance(value, list) and len(value) == 2 and isinstance(value[0], (int, float)) \
-                    and not isinstance(value[0], bool) and value[0] == value[0] and value[0] > time.time() and isinstance(value[1], str):
+                    and not isinstance(value[0], bool) and time.time() < value[0] < time.time() + 366 * 86400 and isinstance(value[1], str):
                 quota[(parts[0], parts[1])] = (float(value[0]), value[1])
         self.quota = quota
 
@@ -943,9 +943,10 @@ class Daemon:
         # A result held for this agent is handed over by /turn without the vendor, and a vendor that failed to start here
         # would strand it; the next turn's start attaches the vendor instead.
         if not a.undelivered(): await self.attach(a)
-        if a.family == 'gemini' and body.get('model'): await self.agy_efforts(body['model'])
-        # A model change applies at the next turn; refusing it here keeps the mod from adopting it.
-        if body.get('model') and (models := self.known_models(a)) and body['model'] not in models:
+        # A model change applies at the next turn; refusing it here keeps the mod from adopting it. With a result held,
+        # the turn's start checks it instead, after that result is handed over.
+        if a.family == 'gemini' and body.get('model') and not a.undelivered(): await self.agy_efforts(body['model'])
+        if body.get('model') and not a.undelivered() and (models := self.known_models(a)) and body['model'] not in models:
             raise ValueError(f'unknown {a.family} model {body["model"]}; {a.family} lists {", ".join(models)}')
         if a.state == 'closed': a.state = 'idle'
         a.default_model = False

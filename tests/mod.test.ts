@@ -1044,6 +1044,11 @@ test('kept steps open on an assistant message, and the step in flight stays even
   const none: any = await $.session.compact({ agentId: 'a1', trigger: 'auto', messages: [task, ...countless] } as any)
   expect(none.messages.at(-2).toolUses[0].input.dropped).toMatch(/^\[input of \d+ characters dropped/)
   expect(JSON.stringify(none.messages).length).toBeLessThan(150_000)
+  // A thousand parallel results still fit once each is only a note.
+  const fan = [{ role: 'assistant', text: '', toolUses: Array.from({ length: 1000 }, (_, i) => ({ tool_use_id: `t${i}`, tool: 'Bash', input: { command: 'x'.repeat(100) } })), handle: 'a-t' },
+    { role: 'user', text: '', toolUses: [], toolResults: Array.from({ length: 1000 }, (_, i) => ({ tool_use_id: `t${i}`, text: 'o'.repeat(500) })), handle: 'u-t' }]
+  const many: any = await $.session.compact({ agentId: 'a1', trigger: 'auto', messages: [task, ...fan] } as any)
+  expect(JSON.stringify(many.messages).length).toBeLessThan(150_000)
   // A long text nested inside a tool's input is cut too.
   const nested = [{ role: 'assistant', text: '', toolUses: [{ tool_use_id: 'n', tool: 'Agent', input: { payload: { nested: ['word '.repeat(200000)] } } }], handle: 'a-n' },
     { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'n', text: 'ok' }], handle: 'u-n' }]

@@ -133,8 +133,8 @@ function shortened(message: SessionMessage): SessionMessage {
     if (size(result) <= KEEP_CHARS / 4) return result
   }
   return { ...copy, text: message.text.length > 64 ? dropped('text', message.text.length) : message.text,
-    toolUses: message.toolUses.map(use => ({ ...use, input: { dropped: dropped('input', JSON.stringify(use.input).length) }, result: undefined, text: undefined })),
-    ...(message.toolResults ? { toolResults: message.toolResults.map(result => ({ ...result, result: undefined, text: dropped('result', String(result.text ?? '').length) })) } : {}) }
+    toolUses: message.toolUses.map((use, i) => ({ ...use, input: { dropped: i ? '[dropped]' : dropped('input', JSON.stringify(use.input).length) }, result: undefined, text: undefined })),
+    ...(message.toolResults ? { toolResults: message.toolResults.map(result => ({ ...result, result: undefined, text: '[dropped]' })) } : {}) }
 }
 
 function compacted(messages: readonly SessionMessage[]): SessionMessage[] | undefined {

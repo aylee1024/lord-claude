@@ -1790,7 +1790,7 @@ def test_a_held_answer_survives_a_closed_vendor_and_a_spent_quota(rig):
 
 def test_a_malformed_quota_file_does_not_stop_the_daemon(rig):
     rig.stop()
-    (rig.home / 'quota.json').write_text(json.dumps({'gemini gemini-3.8-flash': ['soon', 'reason'], 'nospace': [1, 'x'], 'gemini x': 'text'}))
+    (rig.home / 'quota.json').write_text('{"gemini gemini-3.8-flash": ["soon", "reason"], "nospace": [1, "x"], "gemini x": "text", "gemini y": [1e309, "x"], "gemini z": [' + '9' * 401 + ', "x"]}')
     rig.start()
     rig.open('gemini')
     assert rig.turn('PING')[-1]['text'] == 'PONG'
@@ -1841,3 +1841,14 @@ def test_a_held_answer_is_delivered_even_when_its_vendor_will_not_start(tmp_path
         await d.open({'agentId': 'a', 'family': 'gemini', 'cwd': str(tmp_path.resolve())})
         return a.undelivered()
     assert asyncio.run(main()) is True
+
+
+def test_a_held_answer_is_delivered_when_the_follow_up_names_an_unknown_model(rig):
+    rig.open('gemini')
+    conn, file, status, _ = rig.connect('/turn', {'agentId': 'a', 'text': 'WAIT1'})
+    file.close(); conn.close()
+    deadline = time.monotonic() + 10
+    while rig.request('/agents')[0]['state'] != 'idle' and time.monotonic() < deadline: time.sleep(.1)
+    assert rig.open('gemini', model='no-such-model')['vendorSession']
+    last = rig.turn('PING', model='no-such-model')[-1]
+    assert last['type'] == 'done' and last['text'].startswith('Result of the earlier task') and 'no-such-model' in last['text']
