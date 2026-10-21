@@ -1754,6 +1754,8 @@ def test_a_quota_agy_reports_at_start_up_is_named_and_not_retried(rig):
         file.close(); conn.close()
     assert status != 200 and 'RESOURCE_EXHAUSTED' in body['error']
     assert len([e for e in rig.audit() if e.get('launch')]) == 1
+    # A new agent refused at its first start has no log of its own, which nothing would remove.
+    assert 'a: refused: gemini quota reached' in (rig.home / 'lordd.log').read_text() and not (rig.home / 'logs' / 'a.log').exists()
 
 
 def test_a_held_answer_is_still_delivered_while_its_models_quota_is_spent(rig):
@@ -1790,10 +1792,14 @@ def test_a_held_answer_survives_a_closed_vendor_and_a_spent_quota(rig):
 
 def test_a_malformed_quota_file_does_not_stop_the_daemon(rig):
     rig.stop()
-    (rig.home / 'quota.json').write_text('{"gemini gemini-3.8-flash": ["soon", "reason"], "nospace": [1, "x"], "gemini x": "text", "gemini y": [1e309, "x"], "gemini z": [' + '9' * 401 + ', "x"]}')
+    later = time.time() + 3600
+    (rig.home / 'quota.json').write_text('{"gemini gemini-3.8-flash": ["soon", "reason"], "nospace": [1, "x"], "gemini x": "text", "gemini y": [1e309, "x"], "gemini z": [' + '9' * 401 + ', "x"]'
+                                        f', "gemini gemini-4-argon": [{later}, 5], "grok grok-4.7": [true, "x"], "gpt gpt-6.1-sol": [NaN, "x"]}}')
     rig.start()
     rig.open('gemini')
     assert rig.turn('PING')[-1]['text'] == 'PONG'
+    # An entry whose reason is not text is ignored too.
+    assert rig.open('gemini', agent='b', model='gemini-4-argon')['vendorSession']
 
 
 def test_a_quota_named_after_agy_closes_its_output_at_start_up_is_still_named(rig):
@@ -1852,3 +1858,22 @@ def test_a_held_answer_is_delivered_when_the_follow_up_names_an_unknown_model(ri
     assert rig.open('gemini', model='no-such-model')['vendorSession']
     last = rig.turn('PING', model='no-such-model')[-1]
     assert last['type'] == 'done' and last['text'].startswith('Result of the earlier task') and 'no-such-model' in last['text']
+
+
+def test_save_quota_keeps_a_reset_another_daemon_wrote_after_this_one_last_read(tmp_path, monkeypatch):
+    monkeypatch.setenv('LORD_HOME', str(tmp_path))
+    m = load('lordd_quota_merge')
+    d = object.__new__(m.Daemon); d.log = lambda text: None
+    d.quota = {}
+    later = time.time() + 3600
+    (tmp_path / 'quota.json').write_text(json.dumps({'grok grok-4.7': [later, 'written by another daemon']}))
+    d.save_quota(('gemini', 'gemini-3.8-flash'), (later, 'mine'))
+    assert set(json.loads((tmp_path / 'quota.json').read_text())) == {'grok grok-4.7', 'gemini gemini-3.8-flash'}
+
+
+def test_prune_removes_the_earlier_log_generation_too(rig):
+    rig.open('gpt')
+    rig.turn('PING')
+    (rig.home / 'logs' / 'a.log.1').write_text('older\n')
+    assert rig.request('/prune', {'days': 0})['pruned'] == ['a']
+    assert not (rig.home / 'logs' / 'a.log.1').exists()

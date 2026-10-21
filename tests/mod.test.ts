@@ -1033,6 +1033,9 @@ test('kept steps open on an assistant message, and the step in flight stays even
     { role: 'user', text: '', toolUses: [], toolResults: Array.from({ length: 20 }, (_, i) => ({ tool_use_id: `w${i}`, text: 'o'.repeat(50000) })), handle: 'u-wide' }]
   const fields = [{ role: 'assistant', text: '', toolUses: [{ tool_use_id: 'f', tool: 'StructuredOutput', input: Object.fromEntries(Array.from({ length: 100 }, (_, i) => [`f${i}`, 'x'.repeat(10000)])) }], handle: 'a-f' },
     { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'f', text: 'ok' }], handle: 'u-f' }]
+  // A hundred short fields keep each field's end, halved to fit, rather than nothing.
+  const kept: any = await $.session.compact({ agentId: 'a1', trigger: 'auto', messages: [task, ...fields] } as any)
+  expect(kept.messages.at(-2).toolUses[0].input.f0).toMatch(/earlier characters dropped/)
   for (const last of [wide, fields]) {
     const huge: any = await $.session.compact({ agentId: 'a1', trigger: 'auto', messages: [task, ...pair('old', 10, 10), ...last] } as any)
     expect(huge.messages.slice(-2).map((m: any) => m.toolUses[0]?.tool_use_id ?? m.toolResults?.[0]?.tool_use_id)).toEqual([last[0].toolUses[0].tool_use_id, last[0].toolUses[0].tool_use_id])
@@ -1089,14 +1092,29 @@ test('a withdrawal clears the kept answer, so it stands after a compaction drops
 })
 
 test('after one refused delivery the run answers in plain text, never calling SubagentHandback again', async ($, on) => {
-  const w = world(on)
+  const w = world(on, [{ type: 'done', text: 'Done. The config is now {"retries": 3}.' }])
   transcript(on, ['task', REMINDER, ENFORCE])
   await spawn($)
   await step($, 'task')
   w.tools.answer = { result: {}, isError: true, text: 'Nothing was sent: SubagentHandback is not active for this agent.' }
   await $.tool.call({ tool: 'SubagentHandback', tool_use_id: 'lord_handback_t1_0', agentId: 'a1', message: 'fake answer' } as any)
-  expect((await step($, '', 1)).result).toMatchObject({ answer: 'fake answer', toolUses: [] })
-  for (const index of [2, 3]) expect((await step($, '', index)).result.toolUses).toEqual([])
+  expect((await step($, '', 1)).result).toMatchObject({ answer: 'Done. The config is now {"retries": 3}.', toolUses: [] })
+  const turns = w.requests.filter(x => x.path === '/turn').length
+  for (const index of [2, 3]) expect((await step($, '', index)).result).toMatchObject({ toolUses: [], answer: '' })
+  // No new vendor turn, and no StructuredOutput call taken from the answer's JSON.
+  expect(w.requests.filter(x => x.path === '/turn').length).toBe(turns)
+})
+
+test('a refusal in one run does not stop the next run from delivering through SubagentHandback', async ($, on) => {
+  const w = world(on)
+  transcript(on, ['task', REMINDER, ENFORCE])
+  await spawn($)
+  await step($, 'task')
+  w.tools.answer = { result: {}, isError: true, text: 'Nothing was sent.' }
+  await $.tool.call({ tool: 'SubagentHandback', tool_use_id: 'lord_handback_t1_0', agentId: 'a1', message: 'fake answer' } as any)
+  await step($, '', 1)
+  const { result } = await step($, '@effort bogus\nnext task')
+  expect(result.toolUses).toEqual([{ name: 'SubagentHandback', input: { message: 'lord: error: option line not understood: @effort bogus' } }])
 })
 
 for (const [name, failing] of [['a failed follow-up', { type: 'done', text: 'Result of the earlier task:\n{"word":"old"}\n\nThe new message failed: quota', failed: true }], ['an error', { type: 'error', message: 'quota' }]] as const) {

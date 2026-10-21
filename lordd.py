@@ -750,8 +750,9 @@ class Daemon:
             vendor = self.backend(a)
             try: await vendor.ensure()
             except Exception as error:
-                # A start that failed on a spent quota is not retried.
-                self.quota_refusal(a.family, a.model, a)
+                # A start that failed on a spent quota is not retried. An agent never saved yet has no log pruning would
+                # remove, so its refusal goes to lordd.log.
+                self.quota_refusal(a.family, a.model, a if a.record.get('used') else None, a.agentId)
                 self.log(f'{a.agentId}: {a.family} failed to start ({self.redact(error)}); retrying once')
                 await asyncio.sleep(self.config.get('retry_delay_s', 3))
                 await vendor.ensure()

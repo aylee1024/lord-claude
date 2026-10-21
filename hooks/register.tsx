@@ -485,6 +485,8 @@ export const register: Register = on => {
     if (!agent) return yield* next(e)
     const agentId = e.agentId!
     const stream: Stream = { next: 0, live: -1, answer: '', shown: '' }
+    // A refused delivery holds for its own run only; a new run may deliver again.
+    if (e.index === 0) agent.refused = undefined
     try {
       if (agent.error) { const error = agent.error; delete agent.error; throw new Error(error.replace(/^lord: error: /, '')) }
       let outcome: Outcome | undefined
@@ -500,7 +502,6 @@ export const register: Register = on => {
         delete agent.pending
         agent.notice = started.notice
         // Seen now, before a long turn's compaction can drop the reminder.
-        agent.refused = undefined
         await handbackActive($, agentId, agent)
         agent.structured = undefined
         agent.corrected = false
@@ -544,6 +545,12 @@ export const register: Register = on => {
         yield { kind: 'text', index: 0, text: report }
         yield { kind: 'stop', stopReason: 'end_turn', usage: null }
         return result(e, report)
+      } else if (agent.refused) {
+        // The engine refused this run's delivery and keeps asking: the report was already shown as text; end quietly.
+        agent.running = false
+        await keep($, agentId)
+        yield { kind: 'stop', stopReason: 'end_turn', usage: null }
+        return result(e, '')
       } else if (await handbackActive($, agentId, agent)) {
         // A reminder that the report was never delivered; never a Workflow schema step, which handback excludes.
         const report = agent.report ?? agent.lastAnswer ?? 'lord: error: the agent recorded no answer'
