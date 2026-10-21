@@ -121,7 +121,10 @@ function shortened(message: SessionMessage): SessionMessage {
   const room = KEEP_CHARS / 8
   const cut = (text: string) => text.length > room ? `[${text.length - room} earlier characters dropped; the Lord log keeps the step]\n${text.slice(-room)}` : text
   const { handle: _, ...copy } = message
-  const input = (value: Record<string, unknown>) => Object.fromEntries(Object.entries(value).map(([key, field]) => [key, typeof field === 'string' ? cut(field) : field]))
+  // Every string, at any depth: a tool's input may nest its long text inside objects and lists.
+  const deep = (value: unknown): unknown => typeof value === 'string' ? cut(value) : Array.isArray(value) ? value.map(deep)
+    : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([key, field]) => [key, deep(field)])) : value
+  const input = (value: Record<string, unknown>) => deep(value) as Record<string, unknown>
   return { ...copy, text: cut(message.text), toolUses: message.toolUses.map(use => ({ ...use, input: input(use.input), result: undefined, ...(use.text ? { text: cut(use.text) } : {}) })),
     ...(message.toolResults ? { toolResults: message.toolResults.map(result => ({ ...result, result: undefined, text: cut(String(result.text ?? '')) })) } : {}) }
 }

@@ -1032,6 +1032,11 @@ test('kept steps open on an assistant message, and the step in flight stays even
     { role: 'user', text: '', toolUses: [], toolResults: Array.from({ length: 20 }, (_, i) => ({ tool_use_id: `w${i}`, text: 'o'.repeat(50000) })), handle: 'u-wide' }]
   const huge: any = await $.session.compact({ agentId: 'a1', trigger: 'auto', messages: [task, ...pair('old', 10, 10), ...wide] } as any)
   expect(huge.messages.map((m: any) => m.toolUses[0]?.tool_use_id ?? m.toolResults?.[0]?.tool_use_id ?? m.handle)).toEqual(['task', 'w0', 'w0'])
+  // A long text nested inside a tool's input is cut too.
+  const nested = [{ role: 'assistant', text: '', toolUses: [{ tool_use_id: 'n', tool: 'Agent', input: { payload: { nested: ['word '.repeat(200000)] } } }], handle: 'a-n' },
+    { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'n', text: 'ok' }], handle: 'u-n' }]
+  const deep: any = await $.session.compact({ agentId: 'a1', trigger: 'auto', messages: [task, ...nested] } as any)
+  expect(JSON.stringify(deep.messages).length).toBeLessThan(150_000)
 })
 
 test('after a run Claude Code ended on its own error, a message goes to the engine and the caller is told the vendor works on', async ($, on) => {

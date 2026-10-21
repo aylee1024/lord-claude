@@ -116,6 +116,13 @@ async def turn(sid, text, request_id=None):
         print('AGY_ERROR: ' + json.dumps({'short_error': short, 'status': 'RESOURCE_EXHAUSTED', 'error_code': 429, 'retryable': True}), file=sys.stderr, flush=True)
         await asyncio.sleep(.1)
         os._exit(1)
+    if text == 'QUOTA_UNICODE' and FAMILY == 'gemini':
+        # An error line holding a character a Latin-1 log cannot encode.
+        # agy writes UTF-8 whatever the locale.
+        sys.stderr.buffer.write(('AGY_ERROR: ' + json.dumps({'short_error': 'RESOURCE_EXHAUSTED (code 429): quota \u2713 reached. Resets in 1h0m0s.', 'error_code': 429}, ensure_ascii=False) + '\n').encode('utf-8'))
+        sys.stderr.buffer.flush()
+        await asyncio.sleep(.1)
+        os._exit(1)
     if text in ('QUOTA_LATE', 'AGYFAIL') and FAMILY == 'gemini':
         # QUOTA_LATE: agy's stdout closes before its stderr line arrives. AGYFAIL: a failure that is not a quota.
         short = ('RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 1h0m0s.' if text == 'QUOTA_LATE'

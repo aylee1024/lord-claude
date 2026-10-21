@@ -632,8 +632,7 @@ class Daemon:
         # (family, model) -> (when a spent quota resets, the vendor's error), from the vendor's own report. Kept in
         # quota.json, so a daemon started before the reset still refuses.
         self.quota = {}
-        try: self.quota = {tuple(key.split(' ', 1)): tuple(value) for key, value in json.loads((HOME / 'quota.json').read_text()).items() if value[0] > time.time()}
-        except (OSError, ValueError, TypeError, AttributeError, IndexError): pass
+        self.load_quota()
         # Daemons of every version from 2.0.18 append to journal.jsonl and merge when they rewrite it. sessions.jsonl
         # belongs to earlier daemons, which rewrite it with only their own agents; it is read, never written.
         self.journal, self.legacy_journal = HOME / 'journal.jsonl', HOME / 'sessions.jsonl'
@@ -678,7 +677,7 @@ class Daemon:
         path = HOME / 'lordd.log'
         line = f'{datetime.now(timezone.utc).isoformat()} {self.redact(text).strip()[:8192]}\n'
         if path.exists() and path.stat().st_size + len(line.encode()) > 1024 * 1024: path.replace(HOME / 'lordd.log.1')
-        with path.open('a') as file: file.write(line)
+        with path.open('a', encoding='utf-8') as file: file.write(line)
 
     def task(self, coroutine):
         task = asyncio.create_task(coroutine)
@@ -708,11 +707,20 @@ class Daemon:
         if code == 0: self.agy_registered = list(program)
         else: self.log(f'agy mcp add failed; gemini agents lack lord tools until it succeeds: {out}')
 
+    def load_quota(self):
+        # Daemons of every version share quota.json: each reads it before deciding and merges into it when it writes.
+        try: found = {tuple(key.split(' ', 1)): tuple(value) for key, value in json.loads((HOME / 'quota.json').read_text(encoding='utf-8')).items()}
+        except (OSError, ValueError, TypeError, AttributeError, IndexError): found = {}
+        for key, value in found.items():
+            if len(key) == 2 and len(value) == 2 and value[0] > max(time.time(), self.quota.get(key, (0,))[0]): self.quota[key] = value
+
     def save_quota(self):
         try:
-            scratch = HOME / 'quota.json.tmp'
-            scratch.write_text(dumps({f'{family} {model}': list(value) for (family, model), value in self.quota.items() if value[0] > time.time()}))
-            scratch.replace(HOME / 'quota.json')
+            with self.journal_lock():
+                self.load_quota()
+                scratch = HOME / f'quota.json.{os.getpid()}'
+                scratch.write_text(dumps({f'{family} {model}': list(value) for (family, model), value in self.quota.items() if value[0] > time.time()}), encoding='utf-8')
+                scratch.replace(HOME / 'quota.json')
         except OSError as error: self.log(f'quota.json not written: {error}')
 
     def record_usage(self, a, tokens):
@@ -858,7 +866,7 @@ class Daemon:
             # grok's read-only base profile leaves the temp folders and grok's own folder writable.
             if body.get('readonly') and family == 'grok' and inside(canon(a.cwd if a else cwd), (*TEMP_ROOTS, canon(str(grok_home())))):
                 raise ValueError("grok's read-only profile leaves temp folders and ~/.grok writable; pin a read-only grok outside /tmp, /var/tmp, /var/folders and ~/.grok")
-            self.quota_refusal(family, body.get('model') or (a.model if a else self.config[family]['model']), a)
+            self.quota_refusal(family, body.get('model') or (a.model if a else self.config[family]['model']), a, aid)
             new = a is None
             saved = None if new else (json.loads(dumps(a.record)), a.restart)
             try: return await self.open_agent(aid, family, cwd, body, a)
@@ -944,13 +952,15 @@ class Daemon:
         try: await self.begin_starting(a, body)
         finally: a.starting = False
 
-    def quota_refusal(self, family, model, a=None):
+    def quota_refusal(self, family, model, a=None, agent_id=None):
         # Refused at /open, before a vendor process starts, and again at a turn's start; the refusal is in the agent's log.
+        self.load_quota()
         quota = self.quota.get((family, model))
         if not quota or quota[0] <= time.time(): return
         until = datetime.fromtimestamp(quota[0]).astimezone().strftime('%Y-%m-%d %H:%M %Z')
         message = f'{family} quota reached ({quota[1]}); Lord refuses new {model} turns until it resets, about {until}'
-        if a: a.note('refused: ' + message)
+        # A new agent refused at its first /open has no record yet; its log is written all the same.
+        if a or agent_id: (a or Agent({'agentId': agent_id, 'family': family, 'cwd': str(HOME)})).note('refused: ' + message)
         raise ValueError(message)
 
     async def begin_starting(self, a, body):

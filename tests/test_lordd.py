@@ -1703,3 +1703,31 @@ def test_an_earlier_agy_error_does_not_name_a_later_crash(rig):
     assert first['type'] == 'error' and 'boom' in first['message'] and first['retryable'] is False
     later = rig.turn('CRASH')[-1]
     assert later['type'] == 'error' and 'boom' not in later['message']
+
+
+def test_daemons_sharing_quota_json_keep_each_others_resets_and_a_new_agents_refusal_is_logged(rig):
+    later = time.time() + 3600
+    (rig.home / 'quota.json').write_text(json.dumps({'gemini gemini-4-argon': [later, 'written by another daemon']}))
+    rig.open('gemini')
+    rig.turn('QUOTA')
+    saved = json.loads((rig.home / 'quota.json').read_text())
+    assert set(saved) == {'gemini gemini-4-argon', 'gemini gemini-3.8-flash'}
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'b', 'family': 'gemini', 'cwd': str(rig.home), 'model': 'gemini-4-argon'})
+    try:
+        body = json.loads(file.read())
+    finally:
+        file.close(); conn.close()
+    assert status == 400 and 'written by another daemon' in body['error']
+    assert 'refused: gemini quota reached' in (rig.home / 'logs' / 'b.log').read_text()
+
+
+def test_a_latin1_locale_does_not_break_the_logs(rig):
+    rig.stop()
+    rig.env.update(LC_ALL='en_US.ISO8859-1', LANG='en_US.ISO8859-1', PYTHONUTF8='0')
+    rig.start()
+    rig.open('gpt')
+    assert rig.turn('HEREDOC')[-1]['type'] == 'done'
+    rig.open('gemini', agent='g')
+    failed = rig.turn('QUOTA_UNICODE', agent='g')[-1]
+    assert failed['type'] == 'error' and 'RESOURCE_EXHAUSTED' in failed['message']
+    assert '\u2713' in (rig.home / 'lordd.log').read_text(encoding='utf-8')
