@@ -173,7 +173,7 @@ async def turn(sid, text, request_id=None):
             await asyncio.sleep(0)
         answer = f'ROWS {count}'
     elif text == 'HEREDOC' and FAMILY == 'gpt':
-        item = {'type': 'commandExecution', 'id': 'h1', 'command': "/bin/zsh -lc 'cat <<EOF\nline one\nline two\rline three\nEOF'", 'commandActions': [{'type': 'unknown', 'command': 'cat <<EOF\nline one\nline two\rline three\nEOF'}]}
+        item = {'type': 'commandExecution', 'id': 'h1', 'command': "/bin/zsh -lc 'cat <<EOF\nline one\nline two\rline three\u2028line four\fline five\nEOF'", 'commandActions': [{'type': 'unknown', 'command': 'cat <<EOF\nline one\nline two\rline three\nEOF'}]}
         send({'method': 'item/started', 'params': {'threadId': sid, 'item': item}})
         send({'method': 'item/completed', 'params': {'threadId': sid, 'item': {**item, 'aggregatedOutput': 'line one\nline two\n', 'exitCode': 0}}})
         answer = 'HEREDOC'
@@ -325,6 +325,11 @@ async def main():
     global AGY_SESSION
     audit(launch=True, argv=sys.argv[3:], path=os.environ.get('PATH', ''), grok_env={k: v for k, v in os.environ.items() if k.startswith('GROK_')}, env={k: v for k, v in os.environ.items() if 'must-not-reach' in v})
     print('fixture Bearer fake-bearer-value', file=sys.stderr, flush=True)
+    if FAMILY == 'gemini' and (DATA / 'start-quota').exists():
+        # agy failing at start-up, before its init event, on a spent quota.
+        print('AGY_ERROR: ' + json.dumps({'short_error': 'RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 1h0m0s.', 'error_code': 429}), file=sys.stderr, flush=True)
+        await asyncio.sleep(.1)
+        os._exit(1)
     if FAMILY == 'gemini':
         args = sys.argv[3:]
         assert '--effort' in args and '--model' in args

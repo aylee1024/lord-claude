@@ -107,10 +107,12 @@ the family's `no_progress_s` while running (grok and gemini 2400 s, gpt off), is
 `hang_s`), or a turn past its `wall_s`; progress is vendor stdout since the turn's dispatch (stderr is logging); the turn ends with an error naming
 the reason. Every stop kills the vendor's whole process tree by pid as well as its group. A failed vendor start is
 retried once; a crash, or a codex turn that ends failed, restarts the vendor on the next turn, never in a loop. Each turn's activity log starts with a `turn: <family> <model> effort <effort>` line; every record is one line (a
-newline inside it is shown as `⏎`), and a turn that fails adds an `error: <reason>` line. agy states a failure only on
+line break inside it, of any kind, is shown as `⏎`), and a turn that fails adds an `error: <reason>` line. agy states a failure only on
 stderr (`AGY_ERROR: {...}`) before it exits: its `short_error` is the turn's error, and a 429 that names its reset
 (`Resets in 104h27m0s`) makes the daemon refuse that gemini model's `/open` and turns until then, saying when, before
-any agy process starts; the reset is kept in `quota.json`, and each refusal is a `refused:` line in the agent's log. A process idle for `process_idle_s`
+any agy process starts (a failed start is not retried), except an `/open` of an agent with a turn running or a result
+not yet handed over, which still delivers that result first; the reset is kept in `quota.json`, which daemons of every
+version merge, and each refusal is a `refused:` line in the agent's log. A process idle for `process_idle_s`
 (default 60 s) is closed, the codex process that archives pruned threads included, and its session resumed on the next turn.
 
 ## Lord tools given to every vendor session (MCP, `lordd.py --mcp [agentId]`)

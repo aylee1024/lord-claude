@@ -332,7 +332,7 @@ class Agent:
         self.log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if not self.log_path.exists() or self.log_path.stat().st_size < 4 * 1024 * 1024:
             # One line per record, so every line starts with its time: a multi-line command reads as one line.
-            line = REDACT(text)[:2000].replace('\r\n', '\n').replace('\r', '\n').replace('\n', ' ⏎ ')
+            line = re.sub(r'\r\n|[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]', ' ⏎ ', REDACT(text)[:2000])
             with self.log_path.open('a', encoding='utf-8') as file: file.write(f'{datetime.now(timezone.utc).isoformat()} {line}\n')
 
     def row(self, rid, kind, title, line=None):
@@ -493,12 +493,12 @@ class Vendor:
             if self.stopping or self.d.stopping or self.process is not process: return
             self.ready = False
             self.reaped.clear()
-            for future in list(self.pending.values()):
-                if not future.done(): future.set_exception(RuntimeError(str(error)))
-            if self.family == 'gemini' and not self.initialized.done(): self.initialized.set_exception(RuntimeError(str(error)))
-            reason, self.reason = self.reason, None
-            # agy writes its reason to stderr just before it exits; let that reader finish first.
+            # agy writes its reason to stderr just before it exits, at start-up too; let that reader finish first.
             if self.stderr_task and not self.stderr_task.done(): await asyncio.wait([self.stderr_task], timeout=1)
+            for future in list(self.pending.values()):
+                if not future.done(): future.set_exception(RuntimeError(self.error or str(error)))
+            if self.family == 'gemini' and not self.initialized.done(): self.initialized.set_exception(RuntimeError(self.error or str(error)))
+            reason, self.reason = self.reason, None
             for a in self.d.agents.values():
                 if self.d.backend(a) is self:
                     a.generation = 0
@@ -741,6 +741,8 @@ class Daemon:
             vendor = self.backend(a)
             try: await vendor.ensure()
             except Exception as error:
+                # A start that failed on a spent quota is not retried.
+                self.quota_refusal(a.family, a.model, a)
                 self.log(f'{a.agentId}: {a.family} failed to start ({self.redact(error)}); retrying once')
                 await asyncio.sleep(self.config.get('retry_delay_s', 3))
                 await vendor.ensure()
@@ -866,7 +868,10 @@ class Daemon:
             # grok's read-only base profile leaves the temp folders and grok's own folder writable.
             if body.get('readonly') and family == 'grok' and inside(canon(a.cwd if a else cwd), (*TEMP_ROOTS, canon(str(grok_home())))):
                 raise ValueError("grok's read-only profile leaves temp folders and ~/.grok writable; pin a read-only grok outside /tmp, /var/tmp, /var/folders and ~/.grok")
-            self.quota_refusal(family, body.get('model') or (a.model if a else self.config[family]['model']), a, aid)
+            # An agent with a turn running or a result not yet handed over still opens: /turn delivers that result first,
+            # and the turn's start then refuses the new message.
+            if not (a and (a.state in ('running', 'waiting_tool') or a.undelivered())):
+                self.quota_refusal(family, body.get('model') or (a.model if a else self.config[family]['model']), a, aid)
             new = a is None
             saved = None if new else (json.loads(dumps(a.record)), a.restart)
             try: return await self.open_agent(aid, family, cwd, body, a)

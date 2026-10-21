@@ -1688,7 +1688,7 @@ def test_each_log_record_is_one_line(rig):
     rig.turn('HEREDOC')
     lines = (rig.home / 'logs' / 'a.log').read_text().splitlines()
     record = next(line for line in lines if 'line one' in line)
-    assert 'line two' in record and 'line three' in record and all(line[:4].isdigit() for line in lines)
+    assert all(part in record for part in ('line two', 'line three', 'line four', 'line five')) and all(line[:4].isdigit() for line in lines)
 
 
 def test_agys_error_line_counts_when_it_arrives_after_its_output_closes(rig):
@@ -1731,3 +1731,28 @@ def test_a_latin1_locale_does_not_break_the_logs(rig):
     failed = rig.turn('QUOTA_UNICODE', agent='g')[-1]
     assert failed['type'] == 'error' and 'RESOURCE_EXHAUSTED' in failed['message']
     assert '\u2713' in (rig.home / 'lordd.log').read_text(encoding='utf-8')
+
+
+def test_a_quota_agy_reports_at_start_up_is_named_and_not_retried(rig):
+    rig.data.mkdir(parents=True, exist_ok=True)
+    (rig.data / 'start-quota').touch()
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'a', 'family': 'gemini', 'cwd': str(rig.home)})
+    try:
+        body = json.loads(file.read())
+    finally:
+        file.close(); conn.close()
+    assert status != 200 and 'RESOURCE_EXHAUSTED' in body['error']
+    assert len([e for e in rig.audit() if e.get('launch')]) == 1
+
+
+def test_a_held_answer_is_still_delivered_while_its_models_quota_is_spent(rig):
+    rig.open('gemini')
+    conn, file, status, _ = rig.connect('/turn', {'agentId': 'a', 'text': 'WAIT1'})
+    file.close(); conn.close()
+    deadline = time.monotonic() + 10
+    while rig.request('/agents')[0]['state'] != 'idle' and time.monotonic() < deadline: time.sleep(.1)
+    rig.open('gemini', agent='b')
+    rig.turn('QUOTA', agent='b')
+    assert rig.open('gemini')['vendorSession']
+    events = rig.turn('PING')
+    assert events[-1]['message'].startswith('Result of the earlier task') and 'quota reached' in events[-1]['message']

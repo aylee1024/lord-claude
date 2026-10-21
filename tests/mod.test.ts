@@ -1039,7 +1039,7 @@ test('kept steps open on an assistant message, and the step in flight stays even
   expect(JSON.stringify(deep.messages).length).toBeLessThan(150_000)
 })
 
-test('after a run Claude Code ended on its own error, a message goes to the engine and the caller is told the vendor works on', async ($, on) => {
+test('after a run Claude Code ended on its own error, a message goes to the engine and the screen says the vendor works on', async ($, on) => {
   const w = world(on, [{ type: 'row', rowId: 'r1', shell: true, title: 'edit' }])
   await spawn($)
   await step($, 'work')
@@ -1048,4 +1048,25 @@ test('after a run Claude Code ended on its own error, a message goes to the engi
   await $.session.send({ to: 'a1', text: 'status?', origin: { kind: 'model' } })
   expect(w.requests.filter(x => x.path === '/steer')).toEqual([])
   expect(w.deliveries).toEqual(['status?'])
+})
+
+test('the enforce reminder alone marks a run whose report goes through SubagentHandback', async ($, on) => {
+  world(on)
+  transcript(on, ['task', ENFORCE])
+  await spawn($)
+  expect((await step($, 'task')).result.toolUses).toEqual([{ name: 'SubagentHandback', input: { message: 'fake answer' } }])
+})
+
+test('a withdrawal clears the kept answer, so it stands after a compaction drops every reminder', async ($, on) => {
+  const w = world(on)
+  const texts = ['task', REMINDER]
+  on('session.messages', (_, e: any) => ({ value: e.as === 'api' ? texts.map(text => ({ role: 'user', content: [{ type: 'text', text }] })) : [] }) as any)
+  await spawn($)
+  await step($, 'task')
+  texts.push(WITHDRAWN)
+  w.sequence.push([{ type: 'done', text: 'second' }])
+  expect((await step($, 'again')).result.toolUses).toEqual([])
+  texts.splice(0, texts.length, 'task')
+  w.sequence.push([{ type: 'done', text: 'third' }])
+  expect((await step($, 'once more')).result).toMatchObject({ answer: 'third', toolUses: [] })
 })
