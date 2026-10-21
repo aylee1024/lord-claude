@@ -106,7 +106,10 @@ Every `guard_interval_s` (5 s): an agent's whole process tree over `memory_ceili
 the family's `no_progress_s` while running (grok and gemini 2400 s, gpt off), is killed (per agent: `memory_gb`,
 `hang_s`), or a turn past its `wall_s`; progress is vendor stdout since the turn's dispatch (stderr is logging); the turn ends with an error naming
 the reason. Every stop kills the vendor's whole process tree by pid as well as its group. A failed vendor start is
-retried once; a crash, or a codex turn that ends failed, restarts the vendor on the next turn, never in a loop. Each turn's activity log starts with a `turn: <family> <model> effort <effort>` line. A process idle for `process_idle_s`
+retried once; a crash, or a codex turn that ends failed, restarts the vendor on the next turn, never in a loop. Each turn's activity log starts with a `turn: <family> <model> effort <effort>` line; every record is one line (a
+newline inside it is shown as `⏎`), and a turn that fails adds an `error: <reason>` line. agy states a failure only on
+stderr (`AGY_ERROR: {...}`) before it exits: its `short_error` is the turn's error, and a 429 that names its reset
+(`Resets in 104h27m0s`) makes the daemon refuse that gemini model's turns until then, saying when. A process idle for `process_idle_s`
 (default 60 s) is closed, the codex process that archives pruned threads included, and its session resumed on the next turn.
 
 ## Lord tools given to every vendor session (MCP, `lordd.py --mcp [agentId]`)
@@ -142,14 +145,24 @@ goes as an `@model` first line); `send_message(to, text)` becomes SendMessage; `
   the Agent call's effort, which only reaches low to max), `@readonly`, `@net`, `@cwd <path>`
   (first turn only; a different one later is an error), `@dir <path>` (repeatable), `@memory <GB>`, `@hang <seconds>`, `@wall <seconds>`, `@tools` (the user's own vendor
   tool servers and grok's Claude imports, which a new process loads).
-- `turn.step`: index 0 opens and starts the turn; a later step after a lord tool continues it; any other later step is
-  the engine asking for StructuredOutput (Workflow schema): the mod emits it from the vendor's last answer's JSON, asks
-  the vendor for JSON when there is none, and passes a validation error back for a corrected object.
+- `turn.step`: index 0 opens and starts the turn; a later step after a lord tool continues it. In auto permission mode
+  Claude Code delivers a subagent's report only through its `SubagentHandback` tool (its reminder is in the API form of
+  the agent's messages, `$.session.messages({ agentId, as: 'api' })`); there a finished or failed turn ends with a
+  `SubagentHandback({message})` call carrying the answer or the `lord: error:` line, a later "[handback-send-enforce]"
+  step delivers the last report again, the step after a delivery ends quietly, and a refused delivery falls back to
+  the report as plain text. Otherwise any other later step is the engine asking for StructuredOutput (Workflow schema):
+  the mod emits it from the vendor's last answer's JSON, asks the vendor for JSON when there is none, and passes a
+  validation error back for a corrected object.
 - Streamed vendor text and activity are shown as thinking (not recorded); the done text is recorded once as the last
   text block, which the engine uses as the agent's result. An empty answer on a run woken only by a background task's
   notification keeps the agent's previous answer as its result. Any other empty answer or failure ends the turn with only a
   `lord: error: ...` line carrying the daemon's reason. Steps report no usage: the engine would read the vendor's
   token count as this agent's context and auto-compact it with a Claude model.
+- `session.compact` for a Lord agent is answered without a model: Claude Code assumes a 180,000-token window for a
+  vendor model it does not know and fails the agent ("Prompt is too long") if compaction is refused, so the mod keeps
+  the task and the newest steps up to 150,000 characters, opening on an assistant message, and drops older steps (the
+  activity log keeps them). A run Claude Code ends on its own error (`turn.complete` reason `error`) leaves the vendor to
+  finish its turn; the daemon holds the result for the next message.
 - Task notifications from children are unwrapped with their result verbatim.
 - TaskStop or Esc sends /interrupt; once `session.end` fires for a quit (not `/clear` or a resume), aborted turns are
   left running in the daemon.
