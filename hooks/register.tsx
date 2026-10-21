@@ -81,6 +81,26 @@ function errorLine(error: unknown): string {
   return 'lord: error: ' + String(error instanceof Error ? error.message : error).replace(/\s+/g, ' ').trim()
 }
 
+const HANDBACK = 'SubagentHandback'
+
+// In auto permission mode Claude Code delivers a subagent's report only through its SubagentHandback tool: a reminder
+// at the start of the agent's transcript says so, plain text at the end is withheld, and each turn end without the call
+// adds a "[handback-send-enforce]" reminder. Reminders are left out of the transcript's rows; the API form holds them.
+async function handbackActive($: EngineInterface, agentId: string): Promise<boolean> {
+  const messages = await $.session.messages({ agentId, as: 'api' }).catch(() => undefined)
+  if (!Array.isArray(messages)) return false
+  return messages.some(message => message.role === 'user' && (typeof message.content === 'string' ? [{ type: 'text', text: message.content }] : message.content)
+    .some((block: any) => block?.type === 'text' && String(block.text).includes(`delivered through ${HANDBACK}`)))
+}
+
+function* deliver(e: TurnStepInput, index: number, message: string): Generator<any, TurnStepResult> {
+  // The engine runs the call itself; it hands the report to the caller and ends the agent's run.
+  yield { kind: 'tool', index, id: `lord_handback_${e.turnId}_${e.index}`, name: HANDBACK }
+  yield { kind: 'input', index, json: JSON.stringify({ message }) }
+  yield { kind: 'stop', stopReason: 'tool_use', usage: null }
+  return { turnId: e.turnId, index: e.index, answer: '', toolUses: [{ name: HANDBACK, input: { message } }], stopReason: 'tool_use', usage: null }
+}
+
 function result(e: TurnStepInput, answer: string): TurnStepResult {
   // Usage stays in the daemon (/lord): the engine reads a step's usage as this agent's context size and would
   // auto-compact the transcript with a Claude model, while the vendor manages its own context.
@@ -444,6 +464,27 @@ export const register: Register = on => {
         outcome = yield* vendorTurn($, '/turn', { agentId, text: input.text, model: agent.model, effort: agent.effort ?? e.effort, rows: true }, stream)
       } else if (agent.continuing) {
         outcome = yield* vendorTurn($, '/continue', { agentId, rows: true }, stream, await daemonOf($, agent))
+      } else if (agent.handback) {
+        // The step after the report's delivery: nothing more to say. A refused delivery (the tool inactive) falls
+        // back to the report as plain text, which is then what reaches the caller.
+        const verdict = agent.handback, report = agent.report ?? ''
+        delete agent.handback
+        agent.running = false
+        await keep($, agentId)
+        if (verdict === 'done' || verdict === 'sent' || !report) {
+          yield { kind: 'stop', stopReason: 'end_turn', usage: null }
+          return result(e, '')
+        }
+        yield { kind: 'text', index: 0, text: report }
+        yield { kind: 'stop', stopReason: 'end_turn', usage: null }
+        return result(e, report)
+      } else if (await handbackActive($, agentId)) {
+        // A reminder that the report was never delivered; never a Workflow schema step, which handback excludes.
+        const report = agent.report ?? agent.lastAnswer ?? 'lord: error: the agent recorded no answer'
+        agent.handback = 'sent'
+        agent.running = false
+        await keep($, agentId)
+        return yield* deliver(e, 0, report)
       } else {
         // A later step with no lord tool behind it is the engine asking for the StructuredOutput call that a
         // Workflow schema requires. The schema itself reaches only the system prompt, which vendors never see,
@@ -516,6 +557,13 @@ export const register: Register = on => {
         if (stream.live >= 0 && stream.shown && stream.answer.startsWith(stream.shown)) yield { kind: 'text', index: stream.live, text: stream.answer.slice(stream.shown.length) }
         else yield { kind: 'text', index: stream.next++, text: stream.answer }
       }
+      agent.report = stream.answer
+      if (await handbackActive($, agentId)) {
+        agent.handback = 'sent'
+        await keep($, agentId)
+        return yield* deliver(e, stream.next, stream.answer)
+      }
+      await keep($, agentId)
       yield { kind: 'stop', stopReason: 'end_turn', usage: null }
       return result(e, stream.answer)
     } catch (error) {
@@ -530,6 +578,13 @@ export const register: Register = on => {
       // partial text was already shown live.
       const text = errorLine(error)
       yield { kind: 'text', index: stream.next, text }
+      agent.report = text
+      if (await handbackActive($, agentId)) {
+        agent.handback = 'sent'
+        await keep($, agentId).catch(() => {})
+        return yield* deliver(e, stream.next + 1, text)
+      }
+      await keep($, agentId).catch(() => {})
       yield { kind: 'stop', stopReason: 'end_turn', usage: null }
       return result(e, text)
     }
@@ -546,7 +601,7 @@ export const register: Register = on => {
     return result(e, line)
   })
 
-  on('tool.call', { tool: ['Agent', 'SendMessage', 'StructuredOutput'] }, async ($, e, next) => {
+  on('tool.call', { tool: ['Agent', 'SendMessage', 'StructuredOutput', HANDBACK] }, async ($, e, next) => {
     // A named Agent call starts an agent-team teammate in its own Claude process, whose turns no Lord hook answers.
     if (e.tool === 'Agent' && String((e as any).subagent_type ?? '').startsWith('lord:') && (e as any).name)
       return { deny: `lord agents cannot be named: a named Agent call starts a separate Claude process instead of ${String((e as any).subagent_type).slice(5)}. Launch it without name and message it by the agent id the launch returns.` }
@@ -562,7 +617,12 @@ export const register: Register = on => {
     }
     const r = await next(call)
     const agent = e.agentId ? await lordAgent($, e.agentId) : undefined
-    if (e.tool === 'StructuredOutput') {
+    if (e.tool === HANDBACK) {
+      if (agent?.handback === 'sent') {
+        agent.handback = r.isError || r.deny ? { isError: true, text: String(r.text ?? r.deny ?? '') } : 'done'
+        await keep($, e.agentId!)
+      }
+    } else if (e.tool === 'StructuredOutput') {
       if (agent?.structured === 'sent') {
         agent.structured = { isError: !!(r.isError || r.deny), text: String(r.text ?? r.deny ?? '') }
         await keep($, e.agentId!)

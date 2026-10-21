@@ -851,3 +851,62 @@ test('a vendor silent on a run woken only by a notification keeps the agent\'s l
   // A silent vendor on any other run is still an error.
   expect((await step($, 'another task')).result.answer).toBe('lord: error: the vendor finished with an empty answer')
 })
+
+// An agent's messages in auto permission mode, where only a SubagentHandback call delivers a report: the API form holds
+// the reminders, the rows leave them out.
+const REMINDER = '<system-reminder>\nYour final report is delivered through SubagentHandback: when your work is complete, call SubagentHandback({message: <your full report>}). The call ends your run, so make it your last step.\n</system-reminder>'
+const ENFORCE = '[handback-send-enforce] Your report has not been delivered. Call SubagentHandback({message: <your full report>}) now; the call ends your run.'
+function transcript(on: On, texts: string[]) {
+  on('session.messages', (_, e: any) => ({ value: e.as === 'api' ? texts.map(text => ({ role: 'user', content: [{ type: 'text', text }] }))
+    : texts.filter(text => !text.startsWith('<system-reminder>') && !text.startsWith('[handback')).map(text => ({ role: 'user', text, toolUses: [] })) }) as any)
+  return texts
+}
+
+test('in auto mode a finished answer is delivered through SubagentHandback, and the step after it ends quietly', async ($, on) => {
+  const w = world(on)
+  transcript(on, ['task', REMINDER])
+  await spawn($)
+  const { result, chunks } = await step($, 'task')
+  expect(result).toMatchObject({ stopReason: 'tool_use', toolUses: [{ name: 'SubagentHandback', input: { message: 'fake answer' } }] })
+  expect(chunks).toContainEqual({ kind: 'text', index: 0, text: 'fake answer' })
+  expect(chunks.find(x => x.kind === 'tool')).toMatchObject({ name: 'SubagentHandback', index: 1 })
+  await $.tool.call({ tool: 'SubagentHandback', tool_use_id: 'lord_handback_t1_0', agentId: 'a1', message: 'fake answer' } as any)
+  const before = w.requests.length
+  const last = await step($, '', 1)
+  expect(last.result).toMatchObject({ stopReason: 'end_turn', answer: '', toolUses: [] })
+  expect(w.requests.slice(before).filter(x => x.path === '/turn' || x.path === '/continue')).toEqual([])
+  expect(w.modelCalls()).toBe(0)
+})
+
+test('a handback reminder delivers the last answer instead of asking the vendor for JSON', async ($, on) => {
+  const w = world(on)
+  const rows = transcript(on, ['task'])
+  await spawn($)
+  expect((await step($, 'task')).result.answer).toBe('fake answer')
+  rows.push(REMINDER, ENFORCE)
+  const before = w.requests.length
+  const { result, chunks } = await step($, '', 1)
+  expect(result.toolUses).toEqual([{ name: 'SubagentHandback', input: { message: 'fake answer' } }])
+  expect(chunks.some(x => x.name === 'StructuredOutput')).toBe(false)
+  expect(w.requests.slice(before).filter(x => x.path === '/turn' || x.path === '/continue')).toEqual([])
+})
+
+test('in auto mode a vendor error is delivered through SubagentHandback', async ($, on) => {
+  world(on, [{ type: 'error', message: 'Individual quota reached. Resets in 104h27m0s.' }])
+  transcript(on, ['task', REMINDER])
+  await spawn($)
+  const { result } = await step($, 'task')
+  expect(result.toolUses).toEqual([{ name: 'SubagentHandback', input: { message: 'lord: error: Individual quota reached. Resets in 104h27m0s.' } }])
+})
+
+test('a delivery the engine refuses falls back to the report as plain text', async ($, on) => {
+  const w = world(on)
+  transcript(on, ['task', REMINDER])
+  await spawn($)
+  await step($, 'task')
+  w.tools.answer = { result: {}, isError: true, text: 'Nothing was sent: SubagentHandback is not active for this agent.' }
+  await $.tool.call({ tool: 'SubagentHandback', tool_use_id: 'lord_handback_t1_0', agentId: 'a1', message: 'fake answer' } as any)
+  const { result, chunks } = await step($, '', 1)
+  expect(result).toMatchObject({ stopReason: 'end_turn', answer: 'fake answer' })
+  expect(chunks).toContainEqual({ kind: 'text', index: 0, text: 'fake answer' })
+})

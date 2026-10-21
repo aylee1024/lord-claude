@@ -139,6 +139,15 @@ async def turn(sid, text, request_id=None):
                     send({'event': 'step_update', 'step_update': {'step_index': index, 'state': state, 'step_type': 'tool', 'tool_name': info['name'],
                           'tool_info': {**info, **({'output': out} if state == 'DONE' else {})}}})
         answer = 'STEPS'
+    elif text.startswith('ROWS ') and FAMILY == 'gpt':
+        # ROWS <count> <size>: that many commands, each printing <size> characters, as codex reports them.
+        count, size = map(int, text.split()[1:3])
+        for i in range(count):
+            item = {'type': 'commandExecution', 'id': f'r{i}', 'command': f'/bin/zsh -lc "step {i}"', 'commandActions': [{'type': 'unknown', 'command': f'step {i}'}]}
+            send({'method': 'item/started', 'params': {'threadId': sid, 'item': item}})
+            send({'method': 'item/completed', 'params': {'threadId': sid, 'item': {**item, 'aggregatedOutput': (f'{i} ' + 'y' * size)[:size], 'exitCode': 0}}})
+            await asyncio.sleep(0)
+        answer = f'ROWS {count}'
     elif text == 'COMMAND':
         # codex ends an interrupted turn but leaves the command it was running alive, in a session of its own.
         child = subprocess.Popen(['sleep', '300'], start_new_session=True)
