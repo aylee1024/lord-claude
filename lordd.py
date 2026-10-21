@@ -940,9 +940,9 @@ class Daemon:
             # Extra writable folders change the sandbox, so the session reattaches with them.
             a.record['dirs'] = sorted(set(a.record.get('dirs', [])) | set(dirs))
             a.generation = 0
-        # A result held for this agent is handed over by /turn without the vendor. While its model's quota is spent a
-        # restarted agy would only fail and strand that result, so the vendor stays closed until a turn can run.
-        if not (a.undelivered() and self.quota_spent(a.family, body.get('model') or a.model)): await self.attach(a)
+        # A result held for this agent is handed over by /turn without the vendor, and a vendor that failed to start here
+        # would strand it; the next turn's start attaches the vendor instead.
+        if not a.undelivered(): await self.attach(a)
         if a.family == 'gemini' and body.get('model'): await self.agy_efforts(body['model'])
         # A model change applies at the next turn; refusing it here keeps the mod from adopting it.
         if body.get('model') and (models := self.known_models(a)) and body['model'] not in models:

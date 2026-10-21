@@ -1823,3 +1823,21 @@ def test_a_recorded_quota_is_merged_with_one_another_daemon_wrote_after_this_one
     (rig.home / 'quota.json').write_text(json.dumps({'grok grok-4.7': [time.time() + 3600, 'grok spent']}))
     rig.turn('QUOTA')
     assert set(json.loads((rig.home / 'quota.json').read_text())) == {'grok grok-4.7', 'gemini gemini-3.8-flash'}
+
+
+def test_a_held_answer_is_delivered_even_when_its_vendor_will_not_start(tmp_path):
+    m = load('lordd_held')
+    async def main():
+        d = object.__new__(m.Daemon)
+        a = m.Agent({'agentId': 'a', 'family': 'gemini', 'cwd': str(tmp_path.resolve()), 'model': 'gemini-3.8-flash', 'effort': 'high'})
+        a.events.put_nowait({'type': 'done', 'text': 'HELD'})
+        d.agents, d.open_locks, d.retire, d.quota = {'a': a}, {}, False, {}
+        d.config = {'gemini': {'model': 'gemini-3.8-flash', 'effort': 'high'}}
+        d.refresh = lambda aid: None
+        d.save = lambda a: None
+        d.known_models = lambda a: []
+        async def attach(agent): raise RuntimeError('vendor will not start')
+        d.attach = attach
+        await d.open({'agentId': 'a', 'family': 'gemini', 'cwd': str(tmp_path.resolve())})
+        return a.undelivered()
+    assert asyncio.run(main()) is True
