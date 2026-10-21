@@ -14,6 +14,7 @@ The vendor program reads and acts on files with its own tools, as it would if yo
 
 - `journal.jsonl` (`sessions.jsonl` before 2.0.18): one line per agent (agent id, vendor session id, model, effort, working folder, options, last token counts). Task text is never stored here. Lines unused for 14 days are removed.
 - `logs/<agentId>.log`: the commands and file actions the vendor reported for that agent, and any turn error, with secret values and common token shapes redacted, at most 4 MB each, with one earlier 4 MB file kept as `<agentId>.log.1`, removed with the agent's line.
+- `logs/<agentId>.answer.md`: the agent's latest final answer, with secrets redacted, removed with the agent's line.
 - `quota.json`: when a vendor said its quota was spent, the model and when the quota resets; delete it to clear the refusal.
 - `lordd.log`: the daemon's own log, at most 1 MB plus one older copy.
 

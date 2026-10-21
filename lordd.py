@@ -1229,7 +1229,7 @@ class Daemon:
                                 event, pending = pending.result(), None
                             if event['type'] in ('done', 'error') and a.followup:
                                 body, a.followup = a.followup, None
-                                a.earlier = event['text'] if event['type'] == 'done' else 'lord: error: ' + event['message']
+                                a.earlier = event['text'] if event['type'] == 'done' else 'It failed: ' + event['message']
                                 a.earlier_done = event['type'] == 'done'
                                 try:
                                     await self.begin_locked(a, body)
@@ -1239,7 +1239,7 @@ class Daemon:
                                 earlier = f'Result of the earlier task, which finished while Claude Code was disconnected:\n{a.earlier}\n\n'
                                 # An earlier answer stays an answer, whole, when only the new message failed.
                                 event = ({**event, 'text': f'{earlier}Reply to the new message:\n{event["text"]}'} if event['type'] == 'done'
-                                         else {'type': 'done', 'text': f'{earlier}The new message failed: {event["message"]}', 'model': a.model} if a.earlier_done
+                                         else {'type': 'done', 'text': f'{earlier}The new message failed: {event["message"]}', 'model': a.model, 'failed': True} if a.earlier_done
                                          else {**event, 'message': f'{earlier}The new message failed: {event["message"]}'})
                                 a.earlier = None
                             if event['type'] == 'row' and not rows: event = {'type': 'activity', 'text': event['text']}

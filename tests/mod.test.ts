@@ -1098,3 +1098,25 @@ test('after one refused delivery the run answers in plain text, never calling Su
   expect((await step($, '', 1)).result).toMatchObject({ answer: 'fake answer', toolUses: [] })
   for (const index of [2, 3]) expect((await step($, '', index)).result.toolUses).toEqual([])
 })
+
+for (const [name, failing] of [['a failed follow-up', { type: 'done', text: 'Result of the earlier task:\n{"word":"old"}\n\nThe new message failed: quota', failed: true }], ['an error', { type: 'error', message: 'quota' }]] as const) {
+  test(`a schema step never takes a stale answer after ${name}`, async ($, on) => {
+    const w = world(on, [{ type: 'done', text: '{"word":"old"}' }])
+    await spawn($)
+    await step($, 'task')
+    w.sequence.push([failing], [{ type: 'done', text: 'no json here' }])
+    await step($, 'again')
+    const { chunks } = await step($, '', 1)
+    expect(chunks.some((x: any) => x.name === 'StructuredOutput')).toBe(false)
+    expect(w.requests.filter(x => x.path === '/turn').at(-1)?.body?.text).toMatch(/^Reply with only a JSON object/)
+  })
+}
+
+test('the plugin keeps the model the daemon ran, not one it refused to switch to', async ($, on) => {
+  const w = world(on, [{ type: 'done', text: 'held answer', model: 'gemini-4-argon', failed: true }])
+  await spawn($, 'lord:gemini')
+  await step($, '@model gemini-3.8-flash\ntask')
+  w.sequence.push([{ type: 'done', text: 'fine' }])
+  await step($, 'next')
+  expect(w.requests.filter(x => x.path === '/turn').at(-1)?.body?.model).toBe('gemini-4-argon')
+})

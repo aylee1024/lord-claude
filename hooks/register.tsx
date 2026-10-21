@@ -2,7 +2,8 @@ import type { EngineInterface, Register, SessionMessage, TurnStepInput, TurnStep
 import type { LordAgent as Agent, LordTask as Task } from '../types'
 
 // shown: the text of the latest text block, which the engine takes as the agent's result unless another follows.
-type Stream = { next: number; live: number; answer: string; shown: string }
+// failed: the turn's new message failed though an earlier answer was delivered; model: the model the daemon ran.
+type Stream = { next: number; live: number; answer: string; shown: string; failed?: boolean; model?: string }
 type Outcome = { tool?: { callId: string; name: string; input: Record<string, unknown> }; row?: { rowId: string; shell: boolean; title: string } }
 // A vendor's tool steps are drawn as rows: a shell command as a Bash row, any other step under the plugin's own tool for
 // that vendor, which Claude Code labels "lord - <family>". Neither runs anything; the plugin answers each with the
@@ -410,6 +411,8 @@ async function* vendorTurn($: EngineInterface, path: string, body: unknown, stre
     } else if (event.type === 'done' && typeof event.text === 'string') {
       // The vendor's final answer alone; narration streamed before it is not the result.
       stream.answer = event.text
+      stream.failed = event.failed === true
+      if (typeof event.model === 'string' && event.model) stream.model = event.model
       return {}
     } else if (event.type === 'error') throw new Error(event.message || 'daemon turn failed')
     else throw new Error('invalid daemon event')
@@ -611,7 +614,10 @@ export const register: Register = on => {
       if (!stream.answer.trim()) throw new Error('the vendor finished with an empty answer')
       // A correction that needed a lord tool ends here; its answer is the next StructuredOutput candidate.
       if (agent.structured && agent.structured !== 'sent') agent.structured = undefined
-      agent.lastAnswer = stream.answer
+      // A turn whose new message failed leaves no answer a Workflow schema step could take for its own.
+      agent.lastAnswer = stream.failed ? undefined : stream.answer
+      // A refused follow-up leaves the daemon on its earlier model; the next turns ask for that one, not the refused one.
+      if (stream.failed && stream.model) agent.model = stream.model
       agent.running = false
       await keep($, agentId)
       // The latest block must read as the final answer: the rest of it is added to the block on screen when that block
@@ -642,6 +648,7 @@ export const register: Register = on => {
       const text = errorLine(error)
       yield { kind: 'text', index: stream.next, text }
       agent.report = text
+      agent.lastAnswer = undefined
       if (await handbackActive($, agentId, agent)) {
         agent.handback = 'sent'
         await keep($, agentId).catch(() => {})
