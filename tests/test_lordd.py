@@ -1658,6 +1658,14 @@ def test_a_spent_gemini_quota_is_an_error_with_its_reset_time_and_refuses_the_ne
     assert status == 400 and 'quota' in body['error'] and 'resets' in body['error']
     launches = [e for e in rig.audit() if e.get('launch')]
     assert len(launches) == 1
+    # A daemon started later still knows the reset.
+    rig.stop(); rig.start()
+    conn, file, status, _ = rig.connect('/turn', {'agentId': 'a', 'text': 'PING'})
+    try:
+        body = json.loads(file.read())
+    finally:
+        file.close(); conn.close()
+    assert status == 400 and 'quota' in body['error']
 
 
 def test_every_turn_error_is_in_the_agents_log(rig):
@@ -1671,4 +1679,4 @@ def test_each_log_record_is_one_line(rig):
     rig.turn('HEREDOC')
     lines = (rig.home / 'logs' / 'a.log').read_text().splitlines()
     record = next(line for line in lines if 'line one' in line)
-    assert 'line two' in record and all(line[:4].isdigit() for line in lines)
+    assert 'line two' in record and 'line three' in record and all(line[:4].isdigit() for line in lines)

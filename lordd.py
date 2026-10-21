@@ -332,7 +332,7 @@ class Agent:
         self.log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if not self.log_path.exists() or self.log_path.stat().st_size < 4 * 1024 * 1024:
             # One line per record, so every line starts with its time: a multi-line command reads as one line.
-            line = REDACT(text)[:2000].replace('\r\n', '\n').replace('\n', ' ⏎ ')
+            line = REDACT(text)[:2000].replace('\r\n', '\n').replace('\r', '\n').replace('\n', ' ⏎ ')
             with self.log_path.open('a') as file: file.write(f'{datetime.now(timezone.utc).isoformat()} {line}\n')
 
     def row(self, rid, kind, title, line=None):
@@ -472,6 +472,7 @@ class Vendor:
         if payload.get('error_code') == 429 and reset and any(reset.groups()) and self.agent:
             hours, minutes, seconds = (int(x or 0) for x in reset.groups())
             self.d.quota[(self.family, self.agent.model)] = (time.time() + hours * 3600 + minutes * 60 + seconds, self.error)
+            self.d.save_quota()
 
     async def read(self, process):
         try:
@@ -628,8 +629,11 @@ class Daemon:
         self.stop_event, self.open_locks, self.prune_lock = asyncio.Event(), {}, asyncio.Lock()
         # agy_models keeps agy's listing order: its first model is the fallback for a default agy does not offer.
         self.agy_registered, self.agy_levels, self.agy_models = False, {}, {}
-        # (family, model) -> (when a spent quota resets, the vendor's error), from the vendor's own report.
+        # (family, model) -> (when a spent quota resets, the vendor's error), from the vendor's own report. Kept in
+        # quota.json, so a daemon started before the reset still refuses.
         self.quota = {}
+        try: self.quota = {tuple(key.split(' ', 1)): tuple(value) for key, value in json.loads((HOME / 'quota.json').read_text()).items() if value[0] > time.time()}
+        except (OSError, ValueError, TypeError, AttributeError, IndexError): pass
         # Daemons of every version from 2.0.18 append to journal.jsonl and merge when they rewrite it. sessions.jsonl
         # belongs to earlier daemons, which rewrite it with only their own agents; it is read, never written.
         self.journal, self.legacy_journal = HOME / 'journal.jsonl', HOME / 'sessions.jsonl'
@@ -703,6 +707,13 @@ class Daemon:
         # on to append agy's run options to its list.
         if code == 0: self.agy_registered = list(program)
         else: self.log(f'agy mcp add failed; gemini agents lack lord tools until it succeeds: {out}')
+
+    def save_quota(self):
+        try:
+            scratch = HOME / 'quota.json.tmp'
+            scratch.write_text(dumps({f'{family} {model}': list(value) for (family, model), value in self.quota.items() if value[0] > time.time()}))
+            scratch.replace(HOME / 'quota.json')
+        except OSError as error: self.log(f'quota.json not written: {error}')
 
     def record_usage(self, a, tokens):
         a.record['usage'] = tokens

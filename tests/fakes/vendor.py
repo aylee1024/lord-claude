@@ -156,7 +156,7 @@ async def turn(sid, text, request_id=None):
             await asyncio.sleep(0)
         answer = f'ROWS {count}'
     elif text == 'HEREDOC' and FAMILY == 'gpt':
-        item = {'type': 'commandExecution', 'id': 'h1', 'command': "/bin/zsh -lc 'cat <<EOF\nline one\nline two\nEOF'", 'commandActions': [{'type': 'unknown', 'command': 'cat <<EOF\nline one\nline two\nEOF'}]}
+        item = {'type': 'commandExecution', 'id': 'h1', 'command': "/bin/zsh -lc 'cat <<EOF\nline one\nline two\rline three\nEOF'", 'commandActions': [{'type': 'unknown', 'command': 'cat <<EOF\nline one\nline two\rline three\nEOF'}]}
         send({'method': 'item/started', 'params': {'threadId': sid, 'item': item}})
         send({'method': 'item/completed', 'params': {'threadId': sid, 'item': {**item, 'aggregatedOutput': 'line one\nline two\n', 'exitCode': 0}}})
         answer = 'HEREDOC'

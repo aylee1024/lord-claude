@@ -951,3 +951,21 @@ test('a description that already leads with a Lord label gets one label, the one
   expect(await launch('work', 'Astra, max · Build fix 16')).toBe('Sol 6.1, high · Build fix 16')
   expect(await launch('work', 'Fix, then test · notes')).toBe('Sol 6.1, high · Fix, then test · notes')
 })
+
+test('one huge newest message is kept as its tail, so compaction still fits however few messages there are', async ($, on) => {
+  world(on)
+  await spawn($)
+  await step($, 'hello')
+  const task = { role: 'user', text: 'task', toolUses: [], handle: 'task' }
+  const pair = (id: string, n: number) => [
+    { role: 'assistant', text: '', toolUses: [{ tool_use_id: id, tool: 'Bash', input: { command: 'x' } }], handle: `a-${id}` },
+    { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: id, text: 'word '.repeat(n) }], handle: `u-${id}` },
+  ]
+  for (const messages of [[task, ...pair('a', 200000)], [task, ...pair('a', 1), ...pair('b', 200000)]]) {
+    const result: any = await $.session.compact({ agentId: 'a1', trigger: 'auto', messages } as any)
+    expect(result.messages).toBeDefined()
+    expect(JSON.stringify(result.messages).length).toBeLessThan(200_000)
+    expect(result.messages.at(-1).toolResults[0].tool_use_id).toBe(messages.at(-1)!.toolResults![0].tool_use_id)
+    expect(result.messages.at(-1).toolResults[0].text).toMatch(/earlier characters dropped/)
+  }
+})

@@ -106,13 +106,28 @@ function size(message: SessionMessage): number {
   return message.text.length + JSON.stringify(message.toolUses).length + JSON.stringify(message.toolResults ?? []).length
 }
 
+// A message past a quarter of KEEP_CHARS (a long final answer, a child agent's result) is kept as a copy holding the end
+// of each text, so one huge message cannot hold the transcript over the window. A copy has no handle: the engine builds
+// it from its role, text and tool blocks.
+function shortened(message: SessionMessage): SessionMessage {
+  if (size(message) <= KEEP_CHARS / 4) return message
+  const room = KEEP_CHARS / 8
+  const cut = (text: string) => text.length > room ? `[${text.length - room} earlier characters dropped; the Lord log keeps the step]\n${text.slice(-room)}` : text
+  const { handle: _, ...copy } = message
+  return { ...copy, text: cut(message.text), toolUses: message.toolUses.map(use => ({ ...use, result: undefined, ...(use.text ? { text: cut(use.text) } : {}) })),
+    ...(message.toolResults ? { toolResults: message.toolResults.map(result => ({ ...result, result: undefined, text: cut(String(result.text ?? '')) })) } : {}) }
+}
+
 function compacted(messages: readonly SessionMessage[]): SessionMessage[] | undefined {
-  let start = messages.length, total = 0
-  while (start > 1 && total + size(messages[start - 1]!) <= KEEP_CHARS) total += size(messages[--start]!)
+  if (messages.length < 2) return undefined
+  const kept = messages.map(shortened)
+  let start = kept.length, total = 0
+  while (start > 1 && total + size(kept[start - 1]!) <= KEEP_CHARS) total += size(kept[--start]!)
   // The step in flight stays, and the kept steps open on an assistant message, so no result loses its call.
-  start = Math.min(start, messages.length - 2)
-  while (start > 1 && messages[start]!.role !== 'assistant') start--
-  return start > 1 ? [messages[0]!, ...messages.slice(start)] : undefined
+  start = Math.max(1, Math.min(start, kept.length - 2))
+  while (start > 1 && kept[start]!.role !== 'assistant') start--
+  const result = [kept[0]!, ...kept.slice(start)]
+  return start > 1 || kept.some((message, i) => message !== messages[i]) ? result : undefined
 }
 
 function* deliver(e: TurnStepInput, index: number, message: string): Generator<any, TurnStepResult> {
