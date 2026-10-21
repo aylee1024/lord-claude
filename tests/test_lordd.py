@@ -1756,3 +1756,29 @@ def test_a_held_answer_is_still_delivered_while_its_models_quota_is_spent(rig):
     assert rig.open('gemini')['vendorSession']
     events = rig.turn('PING')
     assert events[-1]['message'].startswith('Result of the earlier task') and 'quota reached' in events[-1]['message']
+
+
+def test_a_held_answer_survives_a_closed_vendor_and_a_spent_quota(rig):
+    rig.open('gemini')
+    conn, file, status, _ = rig.connect('/turn', {'agentId': 'a', 'text': 'WAIT1'})
+    file.close(); conn.close()
+    deadline = time.monotonic() + 10
+    while rig.request('/agents')[0]['state'] != 'idle' and time.monotonic() < deadline: time.sleep(.1)
+    rig.open('gemini', agent='b')
+    rig.turn('QUOTA', agent='b')
+    # The idle vendor goes away, and any agy started now would fail on the quota.
+    os.kill(next(e['pid'] for e in rig.audit() if e.get('launch')), signal.SIGKILL)
+    (rig.data / 'start-quota').touch()
+    time.sleep(.5)
+    launches = len([e for e in rig.audit() if e.get('launch')])
+    assert rig.open('gemini')['vendorSession']
+    assert len([e for e in rig.audit() if e.get('launch')]) == launches
+    assert rig.turn('PING')[-1]['message'].startswith('Result of the earlier task')
+
+
+def test_a_malformed_quota_file_does_not_stop_the_daemon(rig):
+    rig.stop()
+    (rig.home / 'quota.json').write_text(json.dumps({'gemini gemini-3.8-flash': ['soon', 'reason'], 'nospace': [1, 'x'], 'gemini x': 'text'}))
+    rig.start()
+    rig.open('gemini')
+    assert rig.turn('PING')[-1]['text'] == 'PONG'

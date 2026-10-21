@@ -113,20 +113,25 @@ function size(message: SessionMessage): number {
   return message.text.length + JSON.stringify(message.toolUses).length + JSON.stringify(message.toolResults ?? []).length
 }
 
-// A message past a quarter of KEEP_CHARS (a long final answer, a child agent's result) is kept as a copy holding the end
-// of each text, so one huge message cannot hold the transcript over the window. A copy has no handle: the engine builds
-// it from its role, text and tool blocks.
+// A message past a quarter of KEEP_CHARS (a long final answer, a child agent's result, a large tool input) is kept as a
+// copy holding the end of each text, at a size halved until the copy fits; a message whose texts are too many to fit
+// even then keeps none of them. A copy has no handle: the engine builds it from its role, text and tool blocks.
 function shortened(message: SessionMessage): SessionMessage {
   if (size(message) <= KEEP_CHARS / 4) return message
-  const room = KEEP_CHARS / 8
-  const cut = (text: string) => text.length > room ? `[${text.length - room} earlier characters dropped; the Lord log keeps the step]\n${text.slice(-room)}` : text
   const { handle: _, ...copy } = message
-  // Every string, at any depth: a tool's input may nest its long text inside objects and lists.
-  const deep = (value: unknown): unknown => typeof value === 'string' ? cut(value) : Array.isArray(value) ? value.map(deep)
-    : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([key, field]) => [key, deep(field)])) : value
-  const input = (value: Record<string, unknown>) => deep(value) as Record<string, unknown>
-  return { ...copy, text: cut(message.text), toolUses: message.toolUses.map(use => ({ ...use, input: input(use.input), result: undefined, ...(use.text ? { text: cut(use.text) } : {}) })),
-    ...(message.toolResults ? { toolResults: message.toolResults.map(result => ({ ...result, result: undefined, text: cut(String(result.text ?? '')) })) } : {}) }
+  const dropped = (what: string, length: number) => `[${what} of ${length} characters dropped; the Lord log keeps the step]`
+  for (let room = KEEP_CHARS / 8; room >= 64; room = Math.floor(room / 2)) {
+    const cut = (text: string) => text.length > room ? `[${text.length - room} earlier characters dropped; the Lord log keeps the step]\n${text.slice(-room)}` : text
+    // Every string, at any depth: a tool's input may nest its long text inside objects and lists.
+    const deep = (value: unknown): unknown => typeof value === 'string' ? cut(value) : Array.isArray(value) ? value.map(deep)
+      : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([key, field]) => [key, deep(field)])) : value
+    const result: SessionMessage = { ...copy, text: cut(message.text), toolUses: message.toolUses.map(use => ({ ...use, input: deep(use.input) as Record<string, unknown>, result: undefined, ...(use.text ? { text: cut(use.text) } : {}) })),
+      ...(message.toolResults ? { toolResults: message.toolResults.map(result => ({ ...result, result: undefined, text: cut(String(result.text ?? '')) })) } : {}) }
+    if (size(result) <= KEEP_CHARS / 4) return result
+  }
+  return { ...copy, text: message.text.length > 64 ? dropped('text', message.text.length) : message.text,
+    toolUses: message.toolUses.map(use => ({ ...use, input: { dropped: dropped('input', JSON.stringify(use.input).length) }, result: undefined, text: undefined })),
+    ...(message.toolResults ? { toolResults: message.toolResults.map(result => ({ ...result, result: undefined, text: dropped('result', String(result.text ?? '').length) })) } : {}) }
 }
 
 function compacted(messages: readonly SessionMessage[]): SessionMessage[] | undefined {

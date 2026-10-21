@@ -712,7 +712,9 @@ class Daemon:
         try: found = {tuple(key.split(' ', 1)): tuple(value) for key, value in json.loads((HOME / 'quota.json').read_text(encoding='utf-8')).items()}
         except (OSError, ValueError, TypeError, AttributeError, IndexError): found = {}
         for key, value in found.items():
-            if len(key) == 2 and len(value) == 2 and value[0] > max(time.time(), self.quota.get(key, (0,))[0]): self.quota[key] = value
+            # A malformed entry is ignored, never a reason for the daemon not to start.
+            if len(key) == 2 and len(value) == 2 and isinstance(value[0], (int, float)) and isinstance(value[1], str) \
+                    and value[0] > max(time.time(), self.quota.get(key, (0,))[0]): self.quota[key] = value
 
     def save_quota(self):
         try:
@@ -931,7 +933,9 @@ class Daemon:
             # Extra writable folders change the sandbox, so the session reattaches with them.
             a.record['dirs'] = sorted(set(a.record.get('dirs', [])) | set(dirs))
             a.generation = 0
-        await self.attach(a)
+        # A result held for this agent is handed over by /turn without the vendor. While its model's quota is spent a
+        # restarted agy would only fail and strand that result, so the vendor stays closed until a turn can run.
+        if not (a.undelivered() and self.quota_spent(a.family, body.get('model') or a.model)): await self.attach(a)
         if a.family == 'gemini' and body.get('model'): await self.agy_efforts(body['model'])
         # A model change applies at the next turn; refusing it here keeps the mod from adopting it.
         if body.get('model') and (models := self.known_models(a)) and body['model'] not in models:
@@ -957,11 +961,15 @@ class Daemon:
         try: await self.begin_starting(a, body)
         finally: a.starting = False
 
-    def quota_refusal(self, family, model, a=None, agent_id=None):
-        # Refused at /open, before a vendor process starts, and again at a turn's start; the refusal is in the agent's log.
+    def quota_spent(self, family, model):
         self.load_quota()
         quota = self.quota.get((family, model))
-        if not quota or quota[0] <= time.time(): return
+        return quota if quota and quota[0] > time.time() else None
+
+    def quota_refusal(self, family, model, a=None, agent_id=None):
+        # Refused at /open, before a vendor process starts, and again at a turn's start; the refusal is in the agent's log.
+        quota = self.quota_spent(family, model)
+        if not quota: return
         until = datetime.fromtimestamp(quota[0]).astimezone().strftime('%Y-%m-%d %H:%M %Z')
         message = f'{family} quota reached ({quota[1]}); Lord refuses new {model} turns until it resets, about {until}'
         # A new agent refused at its first /open has no record yet; its log is written all the same.

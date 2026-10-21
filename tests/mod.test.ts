@@ -1027,11 +1027,23 @@ test('kept steps open on an assistant message, and the step in flight stays even
   ]
   const even: any = await $.session.compact({ agentId: 'a1', trigger: 'auto', messages: [task, ...Array.from({ length: 8 }, (_, i) => pair(`p${i}`, 30000, 10)).flat()] } as any)
   expect(even.messages[1].role).toBe('assistant')
-  // Twenty parallel results stay over the limit even when each is cut to its end; the step in flight is still kept.
+  // Twenty parallel results, and a structured answer of a hundred short fields: each still fits once shortened, and the
+  // step in flight is the last thing kept.
   const wide = [{ role: 'assistant', text: '', toolUses: Array.from({ length: 20 }, (_, i) => ({ tool_use_id: `w${i}`, tool: 'Bash', input: { command: 'x' } })), handle: 'a-wide' },
     { role: 'user', text: '', toolUses: [], toolResults: Array.from({ length: 20 }, (_, i) => ({ tool_use_id: `w${i}`, text: 'o'.repeat(50000) })), handle: 'u-wide' }]
-  const huge: any = await $.session.compact({ agentId: 'a1', trigger: 'auto', messages: [task, ...pair('old', 10, 10), ...wide] } as any)
-  expect(huge.messages.map((m: any) => m.toolUses[0]?.tool_use_id ?? m.toolResults?.[0]?.tool_use_id ?? m.handle)).toEqual(['task', 'w0', 'w0'])
+  const fields = [{ role: 'assistant', text: '', toolUses: [{ tool_use_id: 'f', tool: 'StructuredOutput', input: Object.fromEntries(Array.from({ length: 100 }, (_, i) => [`f${i}`, 'x'.repeat(10000)])) }], handle: 'a-f' },
+    { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'f', text: 'ok' }], handle: 'u-f' }]
+  for (const last of [wide, fields]) {
+    const huge: any = await $.session.compact({ agentId: 'a1', trigger: 'auto', messages: [task, ...pair('old', 10, 10), ...last] } as any)
+    expect(huge.messages.slice(-2).map((m: any) => m.toolUses[0]?.tool_use_id ?? m.toolResults?.[0]?.tool_use_id)).toEqual([last[0].toolUses[0].tool_use_id, last[0].toolUses[0].tool_use_id])
+    expect(JSON.stringify(huge.messages).length).toBeLessThan(150_000)
+  }
+  // So many texts that none fits even at the smallest size: each is replaced by a note of what was dropped.
+  const countless = [{ role: 'assistant', text: '', toolUses: [{ tool_use_id: 'c', tool: 'StructuredOutput', input: Object.fromEntries(Array.from({ length: 5000 }, (_, i) => [`f${i}`, 'x'.repeat(60)])) }], handle: 'a-c' },
+    { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'c', text: 'ok' }], handle: 'u-c' }]
+  const none: any = await $.session.compact({ agentId: 'a1', trigger: 'auto', messages: [task, ...countless] } as any)
+  expect(none.messages.at(-2).toolUses[0].input.dropped).toMatch(/^\[input of \d+ characters dropped/)
+  expect(JSON.stringify(none.messages).length).toBeLessThan(150_000)
   // A long text nested inside a tool's input is cut too.
   const nested = [{ role: 'assistant', text: '', toolUses: [{ tool_use_id: 'n', tool: 'Agent', input: { payload: { nested: ['word '.repeat(200000)] } } }], handle: 'a-n' },
     { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'n', text: 'ok' }], handle: 'u-n' }]
