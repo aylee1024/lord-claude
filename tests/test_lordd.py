@@ -1038,7 +1038,8 @@ def test_a_refused_followup_ends_the_stream_with_the_earlier_result_and_the_reas
     time.sleep(.3)
     assert rig.request('/steer', {'agentId': 'a', 'text': 'detached-result'})['steered']
     last = rig.turn('PING', model='no-such-model')[-1]
-    assert last['type'] == 'error' and 'detached-result' in last['message'] and 'no-such-model' in last['message']
+    # The earlier answer stays an answer; the refused follow-up's reason follows it.
+    assert last['type'] == 'done' and 'detached-result' in last['text'] and 'The new message failed' in last['text'] and 'no-such-model' in last['text']
     assert rig.turn('PING')[-1]['text'] == 'PONG'
 
 
