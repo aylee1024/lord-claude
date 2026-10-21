@@ -1,4 +1,4 @@
-import type { EngineInterface, Register, TurnStepInput, TurnStepResult } from 'claude-code'
+import type { EngineInterface, Register, SessionMessage, TurnStepInput, TurnStepResult } from 'claude-code'
 import type { LordAgent as Agent, LordTask as Task } from '../types'
 
 // shown: the text of the latest text block, which the engine takes as the agent's result unless another follows.
@@ -86,11 +86,33 @@ const HANDBACK = 'SubagentHandback'
 // In auto permission mode Claude Code delivers a subagent's report only through its SubagentHandback tool: a reminder
 // at the start of the agent's transcript says so, plain text at the end is withheld, and each turn end without the call
 // adds a "[handback-send-enforce]" reminder. Reminders are left out of the transcript's rows; the API form holds them.
-async function handbackActive($: EngineInterface, agentId: string): Promise<boolean> {
+// Once seen it is kept in the agent's record, since a compaction may drop the reminder.
+async function handbackActive($: EngineInterface, agentId: string, agent: Agent): Promise<boolean> {
+  if (agent.auto) return true
   const messages = await $.session.messages({ agentId, as: 'api' }).catch(() => undefined)
   if (!Array.isArray(messages)) return false
-  return messages.some(message => message.role === 'user' && (typeof message.content === 'string' ? [{ type: 'text', text: message.content }] : message.content)
-    .some((block: any) => block?.type === 'text' && String(block.text).includes(`delivered through ${HANDBACK}`)))
+  agent.auto = messages.some(message => message.role === 'user' && (typeof message.content === 'string' ? [{ type: 'text', text: message.content }] : message.content)
+    .some((block: any) => block?.type === 'text' && String(block.text).includes(`delivered through ${HANDBACK}`))) || undefined
+  return !!agent.auto
+}
+
+// Claude Code compacts an agent's transcript as it nears the window it assumes for the agent's model, 180,000 tokens
+// for a vendor model it does not know, and fails the agent ("Prompt is too long") when compaction is refused. A Lord
+// agent's vendor keeps its own context and Lord answers every step, so the compaction is answered here, without a
+// model: the task and the newest steps up to KEEP_CHARS stay, older steps go (the Lord log keeps every step).
+const KEEP_CHARS = 150_000
+
+function size(message: SessionMessage): number {
+  return message.text.length + JSON.stringify(message.toolUses).length + JSON.stringify(message.toolResults ?? []).length
+}
+
+function compacted(messages: readonly SessionMessage[]): SessionMessage[] | undefined {
+  let start = messages.length, total = 0
+  while (start > 1 && total + size(messages[start - 1]!) <= KEEP_CHARS) total += size(messages[--start]!)
+  // The step in flight stays, and the kept steps open on an assistant message, so no result loses its call.
+  start = Math.min(start, messages.length - 2)
+  while (start > 1 && messages[start]!.role !== 'assistant') start--
+  return start > 1 ? [messages[0]!, ...messages.slice(start)] : undefined
 }
 
 function* deliver(e: TurnStepInput, index: number, message: string): Generator<any, TurnStepResult> {
@@ -478,7 +500,7 @@ export const register: Register = on => {
         yield { kind: 'text', index: 0, text: report }
         yield { kind: 'stop', stopReason: 'end_turn', usage: null }
         return result(e, report)
-      } else if (await handbackActive($, agentId)) {
+      } else if (await handbackActive($, agentId, agent)) {
         // A reminder that the report was never delivered; never a Workflow schema step, which handback excludes.
         const report = agent.report ?? agent.lastAnswer ?? 'lord: error: the agent recorded no answer'
         agent.handback = 'sent'
@@ -558,7 +580,7 @@ export const register: Register = on => {
         else yield { kind: 'text', index: stream.next++, text: stream.answer }
       }
       agent.report = stream.answer
-      if (await handbackActive($, agentId)) {
+      if (await handbackActive($, agentId, agent)) {
         agent.handback = 'sent'
         await keep($, agentId)
         return yield* deliver(e, stream.next, stream.answer)
@@ -579,7 +601,7 @@ export const register: Register = on => {
       const text = errorLine(error)
       yield { kind: 'text', index: stream.next, text }
       agent.report = text
-      if (await handbackActive($, agentId)) {
+      if (await handbackActive($, agentId, agent)) {
         agent.handback = 'sent'
         await keep($, agentId).catch(() => {})
         return yield* deliver(e, stream.next + 1, text)
@@ -656,9 +678,10 @@ export const register: Register = on => {
 
   on('session.compact', async ($, e, next) => {
     // A Lord agent's transcript is never sent to a model: its vendor keeps its own context, and Lord answers every
-    // step, so summarizing it would spend Claude tokens on nothing.
-    if (e.agentId && (agents.has(e.agentId) || await lordAgent($, e.agentId))) return { skip: "a Lord agent's vendor keeps its own context" }
-    return next(e)
+    // step, so summarizing it would spend Claude tokens on nothing. It is shortened in place instead (compacted).
+    if (!e.agentId || !(agents.has(e.agentId) || await lordAgent($, e.agentId))) return next(e)
+    const messages = e.trigger === 'precompute' ? undefined : compacted(e.messages)
+    return messages ? { messages } : { skip: "a Lord agent's vendor keeps its own context" }
   })
 
   on('session.send', async ($, e, next) => {
@@ -684,10 +707,15 @@ export const register: Register = on => {
     }
     const agent = e.agentId ? await lordAgent($, e.agentId) : undefined
     if (agent) {
-      // Aborting a dispatch also aborts its HTTP calls; completion has a fresh dispatch.
-      if ((e.isAborted || agent.running) && !ending) {
+      // Aborting a dispatch also aborts its HTTP calls; completion has a fresh dispatch. A run Claude Code ended on its
+      // own error leaves the vendor to finish its turn (never cut mid-edit); the daemon keeps that result.
+      if ((e.isAborted || (agent.running && e.reason !== 'error')) && !ending) {
         try { await request($, '/interrupt', { agentId: e.agentId }, await daemonOf($, agent)) } catch {}
         agent.running = false
+        await keep($, e.agentId)
+      } else if (agent.running) {
+        agent.running = false
+        agent.continuing = false
         await keep($, e.agentId)
       }
     }

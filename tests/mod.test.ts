@@ -910,3 +910,31 @@ test('a delivery the engine refuses falls back to the report as plain text', asy
   expect(result).toMatchObject({ stopReason: 'end_turn', answer: 'fake answer' })
   expect(chunks).toContainEqual({ kind: 'text', index: 0, text: 'fake answer' })
 })
+
+test('a long Lord transcript is shortened in place to the task and its newest steps, with no model call', async ($, on) => {
+  world(on)
+  let summarized = false
+  on('session.compact', () => { summarized = true; return { messages: [] } as any })
+  await spawn($)
+  await step($, 'hello')
+  const pair = (i: number) => [
+    { role: 'assistant', text: '', toolUses: [{ tool_use_id: `r${i}`, tool: 'Bash', input: { command: `step ${i}` } }], handle: `a${i}` },
+    { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: `r${i}`, text: 'y'.repeat(2000) }], handle: `u${i}` },
+  ]
+  const messages = [{ role: 'user', text: 'the task', toolUses: [], handle: 'task' }, ...Array.from({ length: 300 }, (_, i) => pair(i)).flat()]
+  const result: any = await $.session.compact({ agentId: 'a1', trigger: 'auto', messages } as any)
+  expect(summarized).toBe(false)
+  expect(result.messages[0].handle).toBe('task')
+  expect(result.messages[1].role).toBe('assistant')
+  expect(result.messages.at(-1).handle).toBe('u299')
+  expect(result.messages.length).toBeLessThan(messages.length)
+  expect(JSON.stringify(result.messages).length).toBeLessThan(200_000)
+})
+
+test('a run Claude Code ended on its own error leaves the vendor to finish its turn', async ($, on) => {
+  const w = world(on, [{ type: 'row', rowId: 'r1', shell: true, title: 'edit' }])
+  await spawn($)
+  await step($, 'work')
+  await $.turn.complete({ agentId: 'a1', turnId: 't1', answer: '', durationMs: 1, isAborted: false, reason: 'error' } as any)
+  expect(w.requests.filter(x => x.path === '/interrupt')).toEqual([])
+})
