@@ -1082,3 +1082,14 @@ test('a withdrawal clears the kept answer, so it stands after a compaction drops
   w.sequence.push([{ type: 'done', text: 'third' }])
   expect((await step($, 'once more')).result).toMatchObject({ answer: 'third', toolUses: [] })
 })
+
+test('after one refused delivery the run answers in plain text, never calling SubagentHandback again', async ($, on) => {
+  const w = world(on)
+  transcript(on, ['task', REMINDER, ENFORCE])
+  await spawn($)
+  await step($, 'task')
+  w.tools.answer = { result: {}, isError: true, text: 'Nothing was sent: SubagentHandback is not active for this agent.' }
+  await $.tool.call({ tool: 'SubagentHandback', tool_use_id: 'lord_handback_t1_0', agentId: 'a1', message: 'fake answer' } as any)
+  expect((await step($, '', 1)).result).toMatchObject({ answer: 'fake answer', toolUses: [] })
+  for (const index of [2, 3]) expect((await step($, '', index)).result.toolUses).toEqual([])
+})

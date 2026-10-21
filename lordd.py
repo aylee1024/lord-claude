@@ -320,6 +320,7 @@ class Agent:
         self.turn_id, self.answer, self.tokens = None, '', usage({})
         self.cancel_requested, self.turn_task = False, None
         self.followup, self.earlier, self.carry, self.call_data, self.ended_turns = None, None, [], {}, set()
+        self.earlier_done = False
         self.final_text, self.restart, self.token = '', False, uuid.uuid4().hex
         self.default_model, self.agy_step = False, None
         # Each vendor tool step's result, by step id, for the plugin's row of it (/row).
@@ -330,10 +331,11 @@ class Agent:
     def note(self, text):
         # The agent's activity log: what the vendor ran and read, for review provenance.
         self.log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        if not self.log_path.exists() or self.log_path.stat().st_size < 4 * 1024 * 1024:
-            # One line per record, so every line starts with its time: a multi-line command reads as one line.
-            line = re.sub(r'\r\n|[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]', ' ⏎ ', REDACT(text)[:2000])
-            with self.log_path.open('a', encoding='utf-8') as file: file.write(f'{datetime.now(timezone.utc).isoformat()} {line}\n')
+        # At 4 MB the log moves to <agentId>.log.1 (one earlier generation), so its newest records are always written.
+        if self.log_path.exists() and self.log_path.stat().st_size >= 4 * 1024 * 1024: self.log_path.replace(self.log_path.with_suffix('.log.1'))
+        # One line per record, so every line starts with its time: a multi-line command reads as one line.
+        line = re.sub(r'\r\n|[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]', ' ⏎ ', REDACT(text)[:2000])
+        with self.log_path.open('a', encoding='utf-8') as file: file.write(f'{datetime.now(timezone.utc).isoformat()} {line}\n')
 
     def row(self, rid, kind, title, line=None):
         # A vendor tool step starting: a row in Claude Code's view of the agent. kind 'command' is a shell command
@@ -471,8 +473,7 @@ class Vendor:
         reset = re.search(r'Resets in (?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?', short)
         if payload.get('error_code') == 429 and reset and any(reset.groups()) and self.agent:
             hours, minutes, seconds = (int(x or 0) for x in reset.groups())
-            self.d.quota[(self.family, self.agent.model)] = (time.time() + hours * 3600 + minutes * 60 + seconds, self.error)
-            self.d.save_quota()
+            self.d.save_quota((self.family, self.agent.model), (time.time() + hours * 3600 + minutes * 60 + seconds, self.error))
 
     async def read(self, process):
         try:
@@ -708,20 +709,26 @@ class Daemon:
         else: self.log(f'agy mcp add failed; gemini agents lack lord tools until it succeeds: {out}')
 
     def load_quota(self):
-        # Daemons of every version share quota.json: each reads it before deciding and merges into it when it writes.
-        try: found = {tuple(key.split(' ', 1)): tuple(value) for key, value in json.loads((HOME / 'quota.json').read_text(encoding='utf-8')).items()}
-        except (OSError, ValueError, TypeError, AttributeError, IndexError): found = {}
-        for key, value in found.items():
-            # A malformed entry is ignored, never a reason for the daemon not to start.
-            if len(key) == 2 and len(value) == 2 and isinstance(value[0], (int, float)) and isinstance(value[1], str) \
-                    and value[0] > max(time.time(), self.quota.get(key, (0,))[0]): self.quota[key] = value
+        # quota.json is the one record for daemons of every version: what it holds is what is refused, so deleting the
+        # file, or an entry, clears a refusal at once. A malformed entry is ignored, never a reason not to start.
+        try: found = json.loads((HOME / 'quota.json').read_text(encoding='utf-8'))
+        except (OSError, ValueError): found = {}
+        quota = {}
+        for key, value in (found.items() if isinstance(found, dict) else []):
+            parts = key.split(' ', 1)
+            if len(parts) == 2 and isinstance(value, list) and len(value) == 2 and isinstance(value[0], (int, float)) \
+                    and not isinstance(value[0], bool) and value[0] == value[0] and value[0] > time.time() and isinstance(value[1], str):
+                quota[(parts[0], parts[1])] = (float(value[0]), value[1])
+        self.quota = quota
 
-    def save_quota(self):
+    def save_quota(self, key, value):
+        # Under the journal lock, so a reset another daemon wrote meanwhile is kept.
         try:
             with self.journal_lock():
                 self.load_quota()
+                self.quota[key] = value
                 scratch = HOME / f'quota.json.{os.getpid()}'
-                scratch.write_text(dumps({f'{family} {model}': list(value) for (family, model), value in self.quota.items() if value[0] > time.time()}), encoding='utf-8')
+                scratch.write_text(dumps({f'{family} {model}': list(entry) for (family, model), entry in self.quota.items()}), encoding='utf-8')
                 scratch.replace(HOME / 'quota.json')
         except OSError as error: self.log(f'quota.json not written: {error}')
 
@@ -972,8 +979,9 @@ class Daemon:
         if not quota: return
         until = datetime.fromtimestamp(quota[0]).astimezone().strftime('%Y-%m-%d %H:%M %Z')
         message = f'{family} quota reached ({quota[1]}); Lord refuses new {model} turns until it resets, about {until}'
-        # A new agent refused at its first /open has no record yet; its log is written all the same.
-        if a or agent_id: (a or Agent({'agentId': agent_id, 'family': family, 'cwd': str(HOME)})).note('refused: ' + message)
+        # A new agent refused at its first /open has no record, and so no log that pruning would remove: lordd.log has it.
+        if a: a.note('refused: ' + message)
+        elif agent_id: self.log(f'{agent_id}: refused: {message}')
         raise ValueError(message)
 
     async def begin_starting(self, a, body):
@@ -1221,13 +1229,16 @@ class Daemon:
                             if event['type'] in ('done', 'error') and a.followup:
                                 body, a.followup = a.followup, None
                                 a.earlier = event['text'] if event['type'] == 'done' else 'lord: error: ' + event['message']
+                                a.earlier_done = event['type'] == 'done'
                                 try:
                                     await self.begin_locked(a, body)
                                     continue
                                 except Exception as error: event = {'type': 'error', 'message': self.redact(error), 'retryable': False}
                             if event['type'] in ('done', 'error') and a.earlier:
                                 earlier = f'Result of the earlier task, which finished while Claude Code was disconnected:\n{a.earlier}\n\n'
+                                # An earlier answer stays an answer, whole, when only the new message failed.
                                 event = ({**event, 'text': f'{earlier}Reply to the new message:\n{event["text"]}'} if event['type'] == 'done'
+                                         else {'type': 'done', 'text': f'{earlier}The new message failed: {event["message"]}', 'model': a.model} if a.earlier_done
                                          else {**event, 'message': f'{earlier}The new message failed: {event["message"]}'})
                                 a.earlier = None
                             if event['type'] == 'row' and not rows: event = {'type': 'activity', 'text': event['text']}
@@ -1348,6 +1359,7 @@ class Daemon:
                     raise
                 removed.append(aid)
                 a.log_path.unlink(missing_ok=True)
+                a.log_path.with_suffix('.log.1').unlink(missing_ok=True)
                 a.answer_path.unlink(missing_ok=True)
                 del self.agents[aid]
                 self.open_locks.pop(aid, None)

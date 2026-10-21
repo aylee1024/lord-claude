@@ -89,6 +89,8 @@ const HANDBACK = 'SubagentHandback'
 // decides. Reminders are left out of the transcript's rows (the API form holds them) and a compaction may drop them, so
 // the last answer found is kept in the agent's record and stands when none is left.
 async function handbackActive($: EngineInterface, agentId: string, agent: Agent): Promise<boolean> {
+  // A run whose delivery the engine refused once gets plain text from then on, never the call again.
+  if (agent.refused) return false
   const messages = await $.session.messages({ agentId, as: 'api' }).catch(() => undefined)
   for (const message of Array.isArray(messages) ? [...messages].reverse() : []) {
     if (message.role !== 'user') continue
@@ -106,7 +108,8 @@ async function handbackActive($: EngineInterface, agentId: string, agent: Agent)
 // Claude Code compacts an agent's transcript as it nears the window it assumes for the agent's model, 180,000 tokens
 // for a vendor model it does not know, and fails the agent ("Prompt is too long") when compaction is refused. A Lord
 // agent's vendor keeps its own context and Lord answers every step, so the compaction is answered here, without a
-// model: the task and the newest steps up to KEEP_CHARS stay, older steps go (the Lord log keeps every step).
+// model: the task and the newest steps up to KEEP_CHARS stay, older steps go (the activity log names every step, and the
+// vendor's own session keeps each step whole).
 const KEEP_CHARS = 150_000
 
 function size(message: SessionMessage): number {
@@ -119,9 +122,9 @@ function size(message: SessionMessage): number {
 function shortened(message: SessionMessage): SessionMessage {
   if (size(message) <= KEEP_CHARS / 4) return message
   const { handle: _, ...copy } = message
-  const dropped = (what: string, length: number) => `[${what} of ${length} characters dropped; the Lord log keeps the step]`
+  const dropped = (what: string, length: number) => `[${what} of ${length} characters dropped from this transcript; the vendor's own session keeps it]`
   for (let room = KEEP_CHARS / 8; room >= 64; room = Math.floor(room / 2)) {
-    const cut = (text: string) => text.length > room ? `[${text.length - room} earlier characters dropped; the Lord log keeps the step]\n${text.slice(-room)}` : text
+    const cut = (text: string) => text.length > room ? `[${text.length - room} earlier characters dropped from this transcript; the vendor's own session keeps them]\n${text.slice(-room)}` : text
     // Every string, at any depth: a tool's input may nest its long text inside objects and lists.
     const deep = (value: unknown): unknown => typeof value === 'string' ? cut(value) : Array.isArray(value) ? value.map(deep)
       : value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([key, field]) => [key, deep(field)])) : value
@@ -494,6 +497,7 @@ export const register: Register = on => {
         delete agent.pending
         agent.notice = started.notice
         // Seen now, before a long turn's compaction can drop the reminder.
+        agent.refused = undefined
         await handbackActive($, agentId, agent)
         agent.structured = undefined
         agent.corrected = false
@@ -526,6 +530,7 @@ export const register: Register = on => {
         // back to the report as plain text, which is then what reaches the caller.
         const verdict = agent.handback, report = agent.report ?? ''
         delete agent.handback
+        if (typeof verdict === 'object' && verdict.isError) agent.refused = true
         agent.running = false
         await keep($, agentId)
         // 'sent': the call's outcome never came back, so the report may not have reached the caller.

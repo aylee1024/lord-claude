@@ -32,7 +32,7 @@ own saves, less the agents that daemon pruned. An agent the daemon does not know
 runs nothing for it, is read from the journal at `/open`; `/agents` adds unknown ones. `sessions.jsonl`, the journal of
 daemons before 2.0.18, is read and never written (the first `journal.jsonl` starts from it). A vendor's Lord tool server
 gets the starting daemon's socket as `LORD_DAEMON_SOCKET`; one without it (started by an older daemon) uses `lordd.sock`.
-`logs/<agentId>.log` (the agent's activity: vendor commands and file actions, redacted, 4 MB cap, removed with the
+`logs/<agentId>.log` (the agent's activity: vendor commands and file actions, redacted, moved to `.log.1` at 4 MB, removed with the
 record; agy tool steps are logged once each, as the tool's name and parameters), `logs/<agentId>.answer.md` (the
 agent's latest non-empty final answer, redacted, removed with the record), `lordd.log` (1 MB, one rotation). Two global side effects: an agy MCP entry `lord` while a daemon runs (added
 or updated at each gemini agent start, removed when a daemon exits with no daemon of another version running; agy has
@@ -111,8 +111,10 @@ line break inside it, of any kind, is shown as `⏎`), and a turn that fails add
 stderr (`AGY_ERROR: {...}`) before it exits: its `short_error` is the turn's error, and a 429 that names its reset
 (`Resets in 104h27m0s`) makes the daemon refuse that gemini model's `/open` and turns until then, saying when, before
 any agy process starts (a failed start is not retried), except an `/open` of an agent with a turn running or a result
-not yet handed over, which still delivers that result first; the reset is kept in `quota.json`, which daemons of every
-version merge, and each refusal is a `refused:` line in the agent's log. A process idle for `process_idle_s`
+not yet handed over, which still delivers that result first, as an answer, with the refused message noted after it.
+The reset is kept in `quota.json`, the one record daemons of every version read before deciding and merge into: delete
+the file (or its entry) to clear a refusal at once, for example after an upgrade. Each refusal is a `refused:` line in
+the agent's log, or in `lordd.log` for a new agent. A process idle for `process_idle_s`
 (default 60 s) is closed, the codex process that archives pruned threads included, and its session resumed on the next turn.
 
 ## Lord tools given to every vendor session (MCP, `lordd.py --mcp [agentId]`)

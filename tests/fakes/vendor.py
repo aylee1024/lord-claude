@@ -325,6 +325,13 @@ async def main():
     global AGY_SESSION
     audit(launch=True, argv=sys.argv[3:], path=os.environ.get('PATH', ''), grok_env={k: v for k, v in os.environ.items() if k.startswith('GROK_')}, env={k: v for k, v in os.environ.items() if 'must-not-reach' in v})
     print('fixture Bearer fake-bearer-value', file=sys.stderr, flush=True)
+    if FAMILY == 'gemini' and (DATA / 'start-quota-late').exists():
+        # The same, with agy's stdout closed before its stderr line arrives.
+        os.close(1)
+        await asyncio.sleep(.3)
+        print('AGY_ERROR: ' + json.dumps({'short_error': 'RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 1h0m0s.', 'error_code': 429}), file=sys.stderr, flush=True)
+        await asyncio.sleep(.1)
+        os._exit(1)
     if FAMILY == 'gemini' and (DATA / 'start-quota').exists():
         # agy failing at start-up, before its init event, on a spent quota.
         print('AGY_ERROR: ' + json.dumps({'short_error': 'RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 1h0m0s.', 'error_code': 429}), file=sys.stderr, flush=True)

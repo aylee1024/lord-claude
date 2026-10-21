@@ -3,7 +3,7 @@ export type LordLimits = { memory_gb?: number; hang_s?: number; wall_s?: number;
 export type LordTask = { text: string; error?: string; model?: string; effort?: string; readonly?: boolean; net?: boolean; nosandbox?: boolean; dirs?: string[]; cwd?: string; limits?: LordLimits; notice?: boolean }
 export type LordAgent = { family: string; cwd?: string; running?: boolean; model?: string; effort?: string; readonly?: boolean; net?: boolean; nosandbox?: boolean; dirs?: string[]; limits?: LordLimits; opened?: boolean; error?: string
   continuing?: boolean; call?: string; lastAnswer?: string; structured?: LordVerdict; corrected?: boolean; worktree?: boolean; pending?: LordTask; notice?: boolean; daemon?: string; row?: string
-  handback?: LordVerdict | 'done'; report?: string; auto?: boolean }
+  handback?: LordVerdict | 'done'; report?: string; auto?: boolean; refused?: boolean }
 
 declare module 'claude-code' {
   interface PluginState {

@@ -13,7 +13,8 @@ The vendor program reads and acts on files with its own tools, as it would if yo
 **What stays on your computer**, under `~/.claude/lord/`:
 
 - `journal.jsonl` (`sessions.jsonl` before 2.0.18): one line per agent (agent id, vendor session id, model, effort, working folder, options, last token counts). Task text is never stored here. Lines unused for 14 days are removed.
-- `logs/<agentId>.log`: the commands and file actions the vendor reported for that agent, and any turn error, with secret values and common token shapes redacted, at most 4 MB each, removed with the agent's line.
+- `logs/<agentId>.log`: the commands and file actions the vendor reported for that agent, and any turn error, with secret values and common token shapes redacted, at most 4 MB each, with one earlier 4 MB file kept as `<agentId>.log.1`, removed with the agent's line.
+- `quota.json`: when a vendor said its quota was spent, the model and when the quota resets; delete it to clear the refusal.
 - `lordd.log`: the daemon's own log, at most 1 MB plus one older copy.
 
 Claude Code keeps its own transcript of each Lord agent under `~/.claude/projects/`, as it does for a Claude subagent: since 2.1.0 that transcript holds what the vendor wrote and each step it took, with the step's output redacted and cut to its last 2,000 characters.

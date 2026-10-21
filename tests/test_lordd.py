@@ -1718,7 +1718,17 @@ def test_daemons_sharing_quota_json_keep_each_others_resets_and_a_new_agents_ref
     finally:
         file.close(); conn.close()
     assert status == 400 and 'written by another daemon' in body['error']
-    assert 'refused: gemini quota reached' in (rig.home / 'logs' / 'b.log').read_text()
+    # A new agent has no log of its own yet: its refusal is in lordd.log, and no log nothing would remove is left behind.
+    assert 'b: refused: gemini quota reached' in (rig.home / 'lordd.log').read_text() and not (rig.home / 'logs' / 'b.log').exists()
+    # Another daemon's reset written after this one started is honoured, and kept when this one records its own.
+    saved['grok grok-4.7'] = [time.time() + 3600, 'grok spent']
+    (rig.home / 'quota.json').write_text(json.dumps(saved))
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'c', 'family': 'grok', 'cwd': str(rig.home)})
+    file.close(); conn.close()
+    assert status == 400
+    # Deleting the file clears every refusal at once.
+    (rig.home / 'quota.json').unlink()
+    assert rig.open('grok', agent='c')['vendorSession']
 
 
 def test_a_latin1_locale_does_not_break_the_logs(rig):
@@ -1755,7 +1765,8 @@ def test_a_held_answer_is_still_delivered_while_its_models_quota_is_spent(rig):
     rig.turn('QUOTA', agent='b')
     assert rig.open('gemini')['vendorSession']
     events = rig.turn('PING')
-    assert events[-1]['message'].startswith('Result of the earlier task') and 'quota reached' in events[-1]['message']
+    # The held answer arrives as an answer, whole, with the refused message noted after it.
+    assert events[-1]['type'] == 'done' and events[-1]['text'].startswith('Result of the earlier task') and 'The new message failed: gemini quota reached' in events[-1]['text']
 
 
 def test_a_held_answer_survives_a_closed_vendor_and_a_spent_quota(rig):
@@ -1773,7 +1784,7 @@ def test_a_held_answer_survives_a_closed_vendor_and_a_spent_quota(rig):
     launches = len([e for e in rig.audit() if e.get('launch')])
     assert rig.open('gemini')['vendorSession']
     assert len([e for e in rig.audit() if e.get('launch')]) == launches
-    assert rig.turn('PING')[-1]['message'].startswith('Result of the earlier task')
+    assert rig.turn('PING')[-1]['text'].startswith('Result of the earlier task')
 
 
 def test_a_malformed_quota_file_does_not_stop_the_daemon(rig):
@@ -1782,3 +1793,32 @@ def test_a_malformed_quota_file_does_not_stop_the_daemon(rig):
     rig.start()
     rig.open('gemini')
     assert rig.turn('PING')[-1]['text'] == 'PONG'
+
+
+def test_a_quota_named_after_agy_closes_its_output_at_start_up_is_still_named(rig):
+    rig.data.mkdir(parents=True, exist_ok=True)
+    (rig.data / 'start-quota-late').touch()
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'a', 'family': 'gemini', 'cwd': str(rig.home)})
+    try:
+        body = json.loads(file.read())
+    finally:
+        file.close(); conn.close()
+    assert status != 200 and 'RESOURCE_EXHAUSTED' in body['error']
+
+
+def test_a_full_log_moves_aside_and_the_newest_records_are_still_written(rig):
+    rig.open('gpt')
+    log = rig.home / 'logs' / 'a.log'
+    log.parent.mkdir(exist_ok=True)
+    log.write_text('x' * (4 * 1024 * 1024 + 10) + '\n')
+    rig.turn('FAIL')
+    assert (rig.home / 'logs' / 'a.log.1').stat().st_size > 4 * 1024 * 1024
+    text = log.read_text()
+    assert 'turn: gpt' in text and 'error: ' in text
+
+
+def test_a_recorded_quota_is_merged_with_one_another_daemon_wrote_after_this_one_started(rig):
+    rig.open('gemini')
+    (rig.home / 'quota.json').write_text(json.dumps({'grok grok-4.7': [time.time() + 3600, 'grok spent']}))
+    rig.turn('QUOTA')
+    assert set(json.loads((rig.home / 'quota.json').read_text())) == {'grok grok-4.7', 'gemini gemini-3.8-flash'}
