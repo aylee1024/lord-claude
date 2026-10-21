@@ -1658,6 +1658,15 @@ def test_a_spent_gemini_quota_is_an_error_with_its_reset_time_and_refuses_the_ne
     assert status == 400 and 'quota' in body['error'] and 'resets' in body['error']
     launches = [e for e in rig.audit() if e.get('launch')]
     assert len(launches) == 1
+    # The plugin opens before each turn: a spent quota is refused there too, before agy starts, and logged.
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'a', 'family': 'gemini', 'cwd': str(rig.home)})
+    try:
+        body = json.loads(file.read())
+    finally:
+        file.close(); conn.close()
+    assert status == 400 and 'quota' in body['error']
+    assert len([e for e in rig.audit() if e.get('launch')]) == 1
+    assert 'refused: gemini quota reached' in (rig.home / 'logs' / 'a.log').read_text()
     # A daemon started later still knows the reset.
     rig.stop(); rig.start()
     conn, file, status, _ = rig.connect('/turn', {'agentId': 'a', 'text': 'PING'})
@@ -1680,3 +1689,17 @@ def test_each_log_record_is_one_line(rig):
     lines = (rig.home / 'logs' / 'a.log').read_text().splitlines()
     record = next(line for line in lines if 'line one' in line)
     assert 'line two' in record and 'line three' in record and all(line[:4].isdigit() for line in lines)
+
+
+def test_agys_error_line_counts_when_it_arrives_after_its_output_closes(rig):
+    rig.open('gemini')
+    failed = rig.turn('QUOTA_LATE')[-1]
+    assert failed['type'] == 'error' and 'RESOURCE_EXHAUSTED' in failed['message']
+
+
+def test_an_earlier_agy_error_does_not_name_a_later_crash(rig):
+    rig.open('gemini')
+    first = rig.turn('AGYFAIL')[-1]
+    assert first['type'] == 'error' and 'boom' in first['message'] and first['retryable'] is False
+    later = rig.turn('CRASH')[-1]
+    assert later['type'] == 'error' and 'boom' not in later['message']

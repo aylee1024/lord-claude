@@ -84,15 +84,22 @@ function errorLine(error: unknown): string {
 const HANDBACK = 'SubagentHandback'
 
 // In auto permission mode Claude Code delivers a subagent's report only through its SubagentHandback tool: a reminder
-// at the start of the agent's transcript says so, plain text at the end is withheld, and each turn end without the call
-// adds a "[handback-send-enforce]" reminder. Reminders are left out of the transcript's rows; the API form holds them.
-// Once seen it is kept in the agent's record, since a compaction may drop the reminder.
+// says so, plain text at the end is withheld, and each turn end without the call adds a "[handback-send-enforce]"
+// reminder. A run that loses the tool gets a reminder withdrawing it. As in the engine's own check, the newest of these
+// decides. Reminders are left out of the transcript's rows (the API form holds them) and a compaction may drop them, so
+// the last answer found is kept in the agent's record and stands when none is left.
 async function handbackActive($: EngineInterface, agentId: string, agent: Agent): Promise<boolean> {
-  if (agent.auto) return true
   const messages = await $.session.messages({ agentId, as: 'api' }).catch(() => undefined)
-  if (!Array.isArray(messages)) return false
-  agent.auto = messages.some(message => message.role === 'user' && (typeof message.content === 'string' ? [{ type: 'text', text: message.content }] : message.content)
-    .some((block: any) => block?.type === 'text' && String(block.text).includes(`delivered through ${HANDBACK}`))) || undefined
+  for (const message of Array.isArray(messages) ? [...messages].reverse() : []) {
+    if (message.role !== 'user') continue
+    const texts = (typeof message.content === 'string' ? [{ type: 'text', text: message.content }] : message.content)
+      .filter((block: any) => block?.type === 'text').map((block: any) => String(block.text).trimStart())
+    if (texts.some(text => text.startsWith(`<system-reminder>\n${HANDBACK} is not available in this run`))) { agent.auto = undefined; return false }
+    if (texts.some(text => text.startsWith(`<system-reminder>\nYour final report is delivered through ${HANDBACK}`) || text.startsWith('[handback-send-enforce]'))) {
+      agent.auto = true
+      return true
+    }
+  }
   return !!agent.auto
 }
 
@@ -114,7 +121,8 @@ function shortened(message: SessionMessage): SessionMessage {
   const room = KEEP_CHARS / 8
   const cut = (text: string) => text.length > room ? `[${text.length - room} earlier characters dropped; the Lord log keeps the step]\n${text.slice(-room)}` : text
   const { handle: _, ...copy } = message
-  return { ...copy, text: cut(message.text), toolUses: message.toolUses.map(use => ({ ...use, result: undefined, ...(use.text ? { text: cut(use.text) } : {}) })),
+  const input = (value: Record<string, unknown>) => Object.fromEntries(Object.entries(value).map(([key, field]) => [key, typeof field === 'string' ? cut(field) : field]))
+  return { ...copy, text: cut(message.text), toolUses: message.toolUses.map(use => ({ ...use, input: input(use.input), result: undefined, ...(use.text ? { text: cut(use.text) } : {}) })),
     ...(message.toolResults ? { toolResults: message.toolResults.map(result => ({ ...result, result: undefined, text: cut(String(result.text ?? '')) })) } : {}) }
 }
 
@@ -422,7 +430,7 @@ export const register: Register = on => {
       const effort = callEfforts.get(e.tool_use_id) ?? capped(family, options.effort ?? 'high')
       const label = model ? `${shortName(model)}, ${effort}` : effort
       // A caller that copied a Lord label into its description gets this one in its place, not a second one.
-      const description = (e.description ?? '').replace(new RegExp(`^[^·,]+, (${RANKS.join('|')}) · `), '')
+      const description = (e.description ?? '').replace(new RegExp(`^(?:(?:[^·,]+, )?(?:${RANKS.join('|')}) · )+`), '')
       input = { ...e, description: description ? `${label} · ${description}` : label, ...(model ? { model } : {}) }
     }
     callEfforts.delete(e.tool_use_id)
@@ -477,6 +485,8 @@ export const register: Register = on => {
         input.text = started.text
         delete agent.pending
         agent.notice = started.notice
+        // Seen now, before a long turn's compaction can drop the reminder.
+        await handbackActive($, agentId, agent)
         agent.structured = undefined
         agent.corrected = false
         await connect($, next.signal)
@@ -510,7 +520,8 @@ export const register: Register = on => {
         delete agent.handback
         agent.running = false
         await keep($, agentId)
-        if (verdict === 'done' || verdict === 'sent' || !report) {
+        // 'sent': the call's outcome never came back, so the report may not have reached the caller.
+        if (verdict === 'done' || !report) {
           yield { kind: 'stop', stopReason: 'end_turn', usage: null }
           return result(e, '')
         }
@@ -734,6 +745,8 @@ export const register: Register = on => {
         agent.running = false
         agent.continuing = false
         await keep($, e.agentId)
+        const r = await next(e)
+        return { ...r, text: [r.text, `lord: ${agent.family} is still working on this turn; send this agent a message to get its result once it finishes (TaskStop then stops that run and the vendor).`].filter(Boolean).join('\n\n') }
       }
     }
     return next(e)

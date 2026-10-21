@@ -969,3 +969,78 @@ test('one huge newest message is kept as its tail, so compaction still fits howe
     expect(result.messages.at(-1).toolResults[0].text).toMatch(/earlier characters dropped/)
   }
 })
+
+const WITHDRAWN = '<system-reminder>\nSubagentHandback is not available in this run: an earlier instruction to report through it no longer applies. Write your final report as plain text; it will be delivered.\n</system-reminder>'
+
+test('a newer reminder withdrawing SubagentHandback makes the answer plain text again', async ($, on) => {
+  world(on)
+  transcript(on, ['task', REMINDER, 'follow-up', WITHDRAWN])
+  await spawn($)
+  const { result } = await step($, 'task')
+  expect(result).toMatchObject({ stopReason: 'end_turn', answer: 'fake answer', toolUses: [] })
+})
+
+test('a task quoting the reminder\'s words is not taken for the reminder', async ($, on) => {
+  world(on)
+  transcript(on, ['Explain: "Your final report is delivered through SubagentHandback"'])
+  await spawn($)
+  expect((await step($, 'task')).result.toolUses).toEqual([])
+})
+
+test('the reminder seen at a turn\'s start still counts after a compaction drops it', async ($, on) => {
+  const w = world(on)
+  // Present until the vendor's turn starts, as when a compaction during a long turn drops it.
+  on('session.messages', (_, e: any) => ({ value: e.as === 'api' && !w.requests.some(x => x.path === '/turn') ? [{ role: 'user', content: [{ type: 'text', text: REMINDER }] }] : [] }) as any)
+  await spawn($)
+  expect((await step($, 'task')).result.toolUses).toEqual([{ name: 'SubagentHandback', input: { message: 'fake answer' } }])
+})
+
+test('a delivery whose outcome never came back shows the report as text at the next step', async ($, on) => {
+  world(on)
+  transcript(on, ['task', REMINDER])
+  await spawn($)
+  await step($, 'task')
+  const { result } = await step($, '', 1)
+  expect(result).toMatchObject({ stopReason: 'end_turn', answer: 'fake answer' })
+})
+
+test('every copied Lord label is removed, an effort-only one included', async ($, on) => {
+  const w = world(on)
+  on('fs.read', (_, e) => CONFIGS(e.path))
+  const launch = async (description: string) => {
+    await $.tool.call({ tool: 'Agent', tool_use_id: 'L', subagent_type: 'lord:gpt', prompt: 'work', description } as any)
+    await $.agent.spawn({ tool_use_id: 'L', prompt: 'work', description, subagentType: 'lord:gpt', provider: { plugin: 'lord', tier: 'user' }, parentModel: 'haiku', background: true, fork: false } as any)
+    return w.spawnInputs.at(-1).description
+  }
+  expect(await launch('Sol 6.1, xhigh · Sol 6.1, xhigh · Build fix 16')).toBe('Sol 6.1, high · Build fix 16')
+  expect(await launch('high · Build fix 16')).toBe('Sol 6.1, high · Build fix 16')
+})
+
+test('kept steps open on an assistant message, and the step in flight stays even when it alone is over the limit', async ($, on) => {
+  world(on)
+  await spawn($)
+  await step($, 'hello')
+  const task = { role: 'user', text: 'task', toolUses: [], handle: 'task' }
+  const pair = (id: string, input: number, output: number) => [
+    { role: 'assistant', text: '', toolUses: [{ tool_use_id: id, tool: 'Bash', input: { command: 'c'.repeat(input) } }], handle: `a-${id}` },
+    { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: id, text: 'o'.repeat(output) }], handle: `u-${id}` },
+  ]
+  const even: any = await $.session.compact({ agentId: 'a1', trigger: 'auto', messages: [task, ...Array.from({ length: 8 }, (_, i) => pair(`p${i}`, 30000, 10)).flat()] } as any)
+  expect(even.messages[1].role).toBe('assistant')
+  // Twenty parallel results stay over the limit even when each is cut to its end; the step in flight is still kept.
+  const wide = [{ role: 'assistant', text: '', toolUses: Array.from({ length: 20 }, (_, i) => ({ tool_use_id: `w${i}`, tool: 'Bash', input: { command: 'x' } })), handle: 'a-wide' },
+    { role: 'user', text: '', toolUses: [], toolResults: Array.from({ length: 20 }, (_, i) => ({ tool_use_id: `w${i}`, text: 'o'.repeat(50000) })), handle: 'u-wide' }]
+  const huge: any = await $.session.compact({ agentId: 'a1', trigger: 'auto', messages: [task, ...pair('old', 10, 10), ...wide] } as any)
+  expect(huge.messages.map((m: any) => m.toolUses[0]?.tool_use_id ?? m.toolResults?.[0]?.tool_use_id ?? m.handle)).toEqual(['task', 'w0', 'w0'])
+})
+
+test('after a run Claude Code ended on its own error, a message goes to the engine and the caller is told the vendor works on', async ($, on) => {
+  const w = world(on, [{ type: 'row', rowId: 'r1', shell: true, title: 'edit' }])
+  await spawn($)
+  await step($, 'work')
+  const done: any = await $.turn.complete({ agentId: 'a1', turnId: 't1', answer: '', durationMs: 1, isAborted: false, reason: 'error' } as any)
+  expect(done.text).toMatch(/still working on this turn; send this agent a message/)
+  await $.session.send({ to: 'a1', text: 'status?', origin: { kind: 'model' } })
+  expect(w.requests.filter(x => x.path === '/steer')).toEqual([])
+  expect(w.deliveries).toEqual(['status?'])
+})

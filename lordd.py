@@ -333,7 +333,7 @@ class Agent:
         if not self.log_path.exists() or self.log_path.stat().st_size < 4 * 1024 * 1024:
             # One line per record, so every line starts with its time: a multi-line command reads as one line.
             line = REDACT(text)[:2000].replace('\r\n', '\n').replace('\r', '\n').replace('\n', ' ⏎ ')
-            with self.log_path.open('a') as file: file.write(f'{datetime.now(timezone.utc).isoformat()} {line}\n')
+            with self.log_path.open('a', encoding='utf-8') as file: file.write(f'{datetime.now(timezone.utc).isoformat()} {line}\n')
 
     def row(self, rid, kind, title, line=None):
         # A vendor tool step starting: a row in Claude Code's view of the agent. kind 'command' is a shell command
@@ -374,7 +374,7 @@ class Agent:
             # The latest turn's final answer, kept beside the activity log, so a read-only agent's findings
             # still land in a file.
             self.answer_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            self.answer_path.write_text(REDACT(value['text']))
+            self.answer_path.write_text(REDACT(value['text']), encoding='utf-8')
 
 class Vendor:
     def __init__(self, daemon, family, agent=None):
@@ -858,6 +858,7 @@ class Daemon:
             # grok's read-only base profile leaves the temp folders and grok's own folder writable.
             if body.get('readonly') and family == 'grok' and inside(canon(a.cwd if a else cwd), (*TEMP_ROOTS, canon(str(grok_home())))):
                 raise ValueError("grok's read-only profile leaves temp folders and ~/.grok writable; pin a read-only grok outside /tmp, /var/tmp, /var/folders and ~/.grok")
+            self.quota_refusal(family, body.get('model') or (a.model if a else self.config[family]['model']), a)
             new = a is None
             saved = None if new else (json.loads(dumps(a.record)), a.restart)
             try: return await self.open_agent(aid, family, cwd, body, a)
@@ -943,11 +944,17 @@ class Daemon:
         try: await self.begin_starting(a, body)
         finally: a.starting = False
 
+    def quota_refusal(self, family, model, a=None):
+        # Refused at /open, before a vendor process starts, and again at a turn's start; the refusal is in the agent's log.
+        quota = self.quota.get((family, model))
+        if not quota or quota[0] <= time.time(): return
+        until = datetime.fromtimestamp(quota[0]).astimezone().strftime('%Y-%m-%d %H:%M %Z')
+        message = f'{family} quota reached ({quota[1]}); Lord refuses new {model} turns until it resets, about {until}'
+        if a: a.note('refused: ' + message)
+        raise ValueError(message)
+
     async def begin_starting(self, a, body):
-        quota = self.quota.get((a.family, body.get('model') or a.model))
-        if quota and quota[0] > time.time():
-            until = datetime.fromtimestamp(quota[0]).astimezone().strftime('%Y-%m-%d %H:%M %Z')
-            raise ValueError(f'{a.family} quota reached ({quota[1]}); Lord refuses new {a.model} turns until it resets, about {until}')
+        self.quota_refusal(a.family, body.get('model') or a.model, a)
         if a.turn_task: await asyncio.gather(a.turn_task, return_exceptions=True)
         previous = (a.model, a.effort)
         a.model = body.get('model') or a.model

@@ -116,6 +116,16 @@ async def turn(sid, text, request_id=None):
         print('AGY_ERROR: ' + json.dumps({'short_error': short, 'status': 'RESOURCE_EXHAUSTED', 'error_code': 429, 'retryable': True}), file=sys.stderr, flush=True)
         await asyncio.sleep(.1)
         os._exit(1)
+    if text in ('QUOTA_LATE', 'AGYFAIL') and FAMILY == 'gemini':
+        # QUOTA_LATE: agy's stdout closes before its stderr line arrives. AGYFAIL: a failure that is not a quota.
+        short = ('RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 1h0m0s.' if text == 'QUOTA_LATE'
+                 else 'INTERNAL (code 500): boom')
+        if text == 'QUOTA_LATE':
+            os.close(1)
+            await asyncio.sleep(.3)
+        print('AGY_ERROR: ' + json.dumps({'short_error': short, 'error_code': 429 if text == 'QUOTA_LATE' else 500}), file=sys.stderr, flush=True)
+        await asyncio.sleep(.1)
+        os._exit(1)
     if text == 'CRASH' and not session.get('crashed'):
         session['crashed'] = True
         save(sid)
