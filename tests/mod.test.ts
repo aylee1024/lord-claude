@@ -938,3 +938,16 @@ test('a run Claude Code ended on its own error leaves the vendor to finish its t
   await $.turn.complete({ agentId: 'a1', turnId: 't1', answer: '', durationMs: 1, isAborted: false, reason: 'error' } as any)
   expect(w.requests.filter(x => x.path === '/interrupt')).toEqual([])
 })
+
+test('a description that already leads with a Lord label gets one label, the one Lord will run', async ($, on) => {
+  const w = world(on)
+  on('fs.read', (_, e) => CONFIGS(e.path))
+  const launch = async (prompt: string, description: string, effort?: string) => {
+    await $.tool.call({ tool: 'Agent', tool_use_id: 'L', subagent_type: 'lord:gpt', prompt, description, ...(effort ? { effort } : {}) } as any)
+    await $.agent.spawn({ tool_use_id: 'L', prompt, description, subagentType: 'lord:gpt', provider: { plugin: 'lord', tier: 'user' }, parentModel: 'haiku', background: true, fork: false } as any)
+    return w.spawnInputs.at(-1).description
+  }
+  expect(await launch('work', 'Sol 6.1, xhigh · Build fix 16', 'xhigh')).toBe('Sol 6.1, xhigh · Build fix 16')
+  expect(await launch('work', 'Astra, max · Build fix 16')).toBe('Sol 6.1, high · Build fix 16')
+  expect(await launch('work', 'Fix, then test · notes')).toBe('Sol 6.1, high · Fix, then test · notes')
+})

@@ -1196,7 +1196,7 @@ def test_an_earlier_codex_turn_completing_before_the_new_turn_id_is_ignored():
     async def main():
         a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6.1-sol', 'vendorSession': 's'})
         a.turn_id = 'old'
-        d = object.__new__(m.Daemon); d.agents = {'a': a}; d.redact = str; d.save = lambda a: None
+        d = object.__new__(m.Daemon); d.quota = {}; d.agents = {'a': a}; d.redact = str; d.save = lambda a: None
         d.effort, d.attach = AsyncMock(), AsyncMock()
         d.task = lambda coroutine: coroutine.close()
         await d.begin_locked(a, {'text': 'new'})
@@ -1320,7 +1320,7 @@ def test_an_interrupt_while_a_turn_is_starting_stops_it_and_leaves_nothing():
     from unittest.mock import AsyncMock
     async def main():
         a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6.1-sol', 'vendorSession': 's'})
-        d = object.__new__(m.Daemon); d.agents = {'a': a}; d.redact = str; d.save = lambda a: None
+        d = object.__new__(m.Daemon); d.quota = {}; d.agents = {'a': a}; d.redact = str; d.save = lambda a: None
         async def slow_attach(a): await asyncio.sleep(.1)
         d.effort, d.attach = AsyncMock(), slow_attach
         d.backend = lambda a: None
@@ -1642,3 +1642,33 @@ def test_a_turn_finished_while_disconnected_replays_no_steps_or_narration(rig):
     # Only the new turn's narration is shown: the earlier answer's pieces ('PO', 'NG') are not replayed.
     assert [e['text'] for e in events if e['type'] == 'text'] == ['PO', 'NG-AGAIN']
     assert events[-1]['text'].startswith('Result of the earlier task') and events[-1]['text'].endswith('PONG-AGAIN')
+
+
+def test_a_spent_gemini_quota_is_an_error_with_its_reset_time_and_refuses_the_next_turn(rig):
+    rig.open('gemini')
+    failed = rig.turn('QUOTA')[-1]
+    assert failed['type'] == 'error' and 'RESOURCE_EXHAUSTED (code 429)' in failed['message'] and 'Resets in 104h27m0s' in failed['message']
+    log = (rig.home / 'logs' / 'a.log').read_text()
+    assert 'error: RESOURCE_EXHAUSTED (code 429)' in log
+    conn, file, status, _ = rig.connect('/turn', {'agentId': 'a', 'text': 'PING'})
+    try:
+        body = json.loads(file.read())
+    finally:
+        file.close(); conn.close()
+    assert status == 400 and 'quota' in body['error'] and 'resets' in body['error']
+    launches = [e for e in rig.audit() if e.get('launch')]
+    assert len(launches) == 1
+
+
+def test_every_turn_error_is_in_the_agents_log(rig):
+    rig.open('gpt')
+    rig.turn('FAIL')
+    assert 'error: failed to load workspace requirements' in (rig.home / 'logs' / 'a.log').read_text()
+
+
+def test_each_log_record_is_one_line(rig):
+    rig.open('gpt')
+    rig.turn('HEREDOC')
+    lines = (rig.home / 'logs' / 'a.log').read_text().splitlines()
+    record = next(line for line in lines if 'line one' in line)
+    assert 'line two' in record and all(line[:4].isdigit() for line in lines)

@@ -109,6 +109,13 @@ async def turn(sid, text, request_id=None):
     if text == 'NARRATE' and FAMILY == 'grok':
         update(sid, 'agent_message_chunk', content={'type': 'text', 'text': 'Let me look first. '})
         update(sid, 'tool_call', toolCallId='native2', title='read notes', status='in_progress')
+    if text == 'QUOTA' and FAMILY == 'gemini':
+        # agy reports a spent quota on stderr, as one line of text and one AGY_ERROR line, then exits.
+        short = 'RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 104h27m0s.'
+        print('error: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 104h27m0s.', file=sys.stderr, flush=True)
+        print('AGY_ERROR: ' + json.dumps({'short_error': short, 'status': 'RESOURCE_EXHAUSTED', 'error_code': 429, 'retryable': True}), file=sys.stderr, flush=True)
+        await asyncio.sleep(.1)
+        os._exit(1)
     if text == 'CRASH' and not session.get('crashed'):
         session['crashed'] = True
         save(sid)
@@ -148,6 +155,11 @@ async def turn(sid, text, request_id=None):
             send({'method': 'item/completed', 'params': {'threadId': sid, 'item': {**item, 'aggregatedOutput': (f'{i} ' + 'y' * size)[:size], 'exitCode': 0}}})
             await asyncio.sleep(0)
         answer = f'ROWS {count}'
+    elif text == 'HEREDOC' and FAMILY == 'gpt':
+        item = {'type': 'commandExecution', 'id': 'h1', 'command': "/bin/zsh -lc 'cat <<EOF\nline one\nline two\nEOF'", 'commandActions': [{'type': 'unknown', 'command': 'cat <<EOF\nline one\nline two\nEOF'}]}
+        send({'method': 'item/started', 'params': {'threadId': sid, 'item': item}})
+        send({'method': 'item/completed', 'params': {'threadId': sid, 'item': {**item, 'aggregatedOutput': 'line one\nline two\n', 'exitCode': 0}}})
+        answer = 'HEREDOC'
     elif text == 'COMMAND':
         # codex ends an interrupted turn but leaves the command it was running alive, in a session of its own.
         child = subprocess.Popen(['sleep', '300'], start_new_session=True)

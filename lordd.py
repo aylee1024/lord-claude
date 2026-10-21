@@ -222,6 +222,10 @@ def agy_title(step):
     values = ' '.join(str(v) for v in (info.get('parameters') or {}).values())
     return f"{info.get('name') or step.get('tool_name')} {values}".strip()[:2000]
 
+def said(value):
+    # A vendor's error as its message, not as the object that carries it.
+    return value['message'] if isinstance(value, dict) and isinstance(value.get('message'), str) and value['message'] else value
+
 def dumps(value):
     return json.dumps(value, separators=(',', ':'), ensure_ascii=True)
 
@@ -327,7 +331,9 @@ class Agent:
         # The agent's activity log: what the vendor ran and read, for review provenance.
         self.log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         if not self.log_path.exists() or self.log_path.stat().st_size < 4 * 1024 * 1024:
-            with self.log_path.open('a') as file: file.write(f'{datetime.now(timezone.utc).isoformat()} {REDACT(text)[:2000]}\n')
+            # One line per record, so every line starts with its time: a multi-line command reads as one line.
+            line = REDACT(text)[:2000].replace('\r\n', '\n').replace('\n', ' ⏎ ')
+            with self.log_path.open('a') as file: file.write(f'{datetime.now(timezone.utc).isoformat()} {line}\n')
 
     def row(self, rid, kind, title, line=None):
         # A vendor tool step starting: a row in Claude Code's view of the agent. kind 'command' is a shell command
@@ -352,7 +358,9 @@ class Agent:
         if kind in ('activity', 'row'):
             self.activity = value['text'][:300]
             self.note(value['text'])
-        if kind == 'error': value['message'] = sign_in_hint(self.family, value['message'])
+        if kind == 'error':
+            value['message'] = sign_in_hint(self.family, value['message'])
+            self.note('error: ' + str(value['message']))
         if kind in ('done', 'error'):
             self.state, self.activity = 'idle', ''
             self.finished.set()
@@ -376,6 +384,8 @@ class Vendor:
         self.pending, self.models = {}, []
         self.lock, self.write_lock = asyncio.Lock(), asyncio.Lock()
         self.stopping, self.ready = False, False
+        # The vendor's own account of a failure, from its stderr (agy's AGY_ERROR line), and the task reading stderr.
+        self.error, self.stderr_task = None, None
         self.reaped = asyncio.Event()
         self.reaped.set()
 
@@ -404,7 +414,7 @@ class Vendor:
                             '--output-format', 'stream-json', '--dangerously-skip-permissions']
                 if a.vendorSession: command += ['--conversation', a.vendorSession]
                 self.initialized = asyncio.get_running_loop().create_future()
-            self.last, self.reason = time.monotonic(), None
+            self.last, self.reason, self.error = time.monotonic(), None, None
             if self.family == 'grok': grok_profiles()
             try:
                 self.process = await asyncio.create_subprocess_exec(*command,
@@ -415,7 +425,7 @@ class Vendor:
             except FileNotFoundError: raise RuntimeError(f'{command[0]} was not found; {INSTALL[self.family]}') from None
             self.generation += 1
             self.d.task(self.read(self.process))
-            self.d.task(self.stderr(self.process))
+            self.stderr_task = self.d.task(self.stderr(self.process))
             try:
                 if self.family == 'gpt':
                     await self.rpc('initialize', {'clientInfo': {'name': 'lord', 'version': VERSION},
@@ -446,7 +456,22 @@ class Vendor:
 
     async def stderr(self, process):
         while line := await process.stderr.readline():
-            self.d.log(line.decode('utf8', 'replace'))
+            text = line.decode('utf8', 'replace')
+            self.d.log(text)
+            if self.family == 'gemini' and text.startswith('AGY_ERROR: '): self.agy_error(text[len('AGY_ERROR: '):])
+
+    def agy_error(self, text):
+        # agy states a failure only on stderr, then exits: the short error replaces "closed stdout" as the turn's error.
+        # A spent quota (429) names when it resets; until then the daemon refuses that model's turns (begin_starting).
+        try: payload = json.loads(text)
+        except ValueError: return
+        short = payload.get('short_error') if isinstance(payload, dict) else None
+        if not isinstance(short, str) or not short: return
+        self.error = self.d.redact(short)
+        reset = re.search(r'Resets in (?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?', short)
+        if payload.get('error_code') == 429 and reset and any(reset.groups()) and self.agent:
+            hours, minutes, seconds = (int(x or 0) for x in reset.groups())
+            self.d.quota[(self.family, self.agent.model)] = (time.time() + hours * 3600 + minutes * 60 + seconds, self.error)
 
     async def read(self, process):
         try:
@@ -471,10 +496,12 @@ class Vendor:
                 if not future.done(): future.set_exception(RuntimeError(str(error)))
             if self.family == 'gemini' and not self.initialized.done(): self.initialized.set_exception(RuntimeError(str(error)))
             reason, self.reason = self.reason, None
+            # agy writes its reason to stderr just before it exits; let that reader finish first.
+            if self.stderr_task and not self.stderr_task.done(): await asyncio.wait([self.stderr_task], timeout=1)
             for a in self.d.agents.values():
                 if self.d.backend(a) is self:
                     a.generation = 0
-                    a.emit('error', message=self.d.redact(reason or error), retryable=not reason)
+                    a.emit('error', message=self.d.redact(reason or self.error or error), retryable=not (reason or self.error))
             self.d.log(error)
             try: await kill_tree(process, self.descendants)
             finally: self.reaped.set()
@@ -577,8 +604,8 @@ class Vendor:
                 # A codex process can fail every later turn (a settings reload that failed), so the next turn
                 # gets a new process that resumes the thread.
                 if not a.cancel_requested and turn['status'] != 'interrupted': a.restart = True
-                a.emit('error', message=self.d.redact('interrupted' if a.cancel_requested else turn.get('error') or turn['status']), retryable=not a.cancel_requested and turn['status'] != 'interrupted')
-        elif method == 'error' and not p.get('willRetry', False): a.emit('error', message=self.d.redact(p.get('error', p)), retryable=True)
+                a.emit('error', message=self.d.redact('interrupted' if a.cancel_requested else said(turn.get('error')) or turn['status']), retryable=not a.cancel_requested and turn['status'] != 'interrupted')
+        elif method == 'error' and not p.get('willRetry', False): a.emit('error', message=self.d.redact(said(p.get('error', p))), retryable=True)
         elif method == 'model/rerouted': a.model = p['toModel']
 
     async def close(self):
@@ -601,6 +628,8 @@ class Daemon:
         self.stop_event, self.open_locks, self.prune_lock = asyncio.Event(), {}, asyncio.Lock()
         # agy_models keeps agy's listing order: its first model is the fallback for a default agy does not offer.
         self.agy_registered, self.agy_levels, self.agy_models = False, {}, {}
+        # (family, model) -> (when a spent quota resets, the vendor's error), from the vendor's own report.
+        self.quota = {}
         # Daemons of every version from 2.0.18 append to journal.jsonl and merge when they rewrite it. sessions.jsonl
         # belongs to earlier daemons, which rewrite it with only their own agents; it is read, never written.
         self.journal, self.legacy_journal = HOME / 'journal.jsonl', HOME / 'sessions.jsonl'
@@ -904,6 +933,10 @@ class Daemon:
         finally: a.starting = False
 
     async def begin_starting(self, a, body):
+        quota = self.quota.get((a.family, body.get('model') or a.model))
+        if quota and quota[0] > time.time():
+            until = datetime.fromtimestamp(quota[0]).astimezone().strftime('%Y-%m-%d %H:%M %Z')
+            raise ValueError(f'{a.family} quota reached ({quota[1]}); Lord refuses new {a.model} turns until it resets, about {until}')
         if a.turn_task: await asyncio.gather(a.turn_task, return_exceptions=True)
         previous = (a.model, a.effort)
         a.model = body.get('model') or a.model

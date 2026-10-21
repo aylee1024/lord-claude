@@ -406,7 +406,9 @@ export const register: Register = on => {
       const model = options.model ?? await defaultModel($, family)
       const effort = callEfforts.get(e.tool_use_id) ?? capped(family, options.effort ?? 'high')
       const label = model ? `${shortName(model)}, ${effort}` : effort
-      input = { ...e, description: e.description ? `${label} · ${e.description}` : label, ...(model ? { model } : {}) }
+      // A caller that copied a Lord label into its description gets this one in its place, not a second one.
+      const description = (e.description ?? '').replace(new RegExp(`^[^·,]+, (${RANKS.join('|')}) · `), '')
+      input = { ...e, description: description ? `${label} · ${description}` : label, ...(model ? { model } : {}) }
     }
     callEfforts.delete(e.tool_use_id)
     const r = await next(input)
