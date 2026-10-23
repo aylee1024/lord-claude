@@ -70,14 +70,34 @@ def codex_config(folder):
 # What Lord's codex folder shares with the user's, as links: codex writes its login file in place and its settings
 # writer follows links, so both stay the user's own files. Threads and their database stay in Lord's folder, which
 # the Codex app, reading only the user's folder, does not list.
-CODEX_SHARED = ('auth.json', 'config.toml', 'AGENTS.md', 'skills', 'plugins', 'rules')
+CODEX_SHARED = ('auth.json', 'config.toml', 'AGENTS.md', 'AGENTS.override.md', '.env', 'agents', 'skills', 'plugins', 'rules')
+# Tool servers' sign-ins kept in a file: codex refuses to write it through a symbolic link, so it is a hard link.
+CODEX_HARD_LINKED = ('.credentials.json',)
 
-def codex_home_ready(home, source):
+def codex_home_ready(home, source, log):
     home.mkdir(mode=0o700, parents=True, exist_ok=True)
-    for name in CODEX_SHARED:
+    for name in CODEX_SHARED + CODEX_HARD_LINKED:
+        # codex makes skills/.system at start, so a start before the user had skills leaves a folder of codex's own.
+        if name == 'skills' and (source / name).is_dir() and not (home / name).is_symlink() and (home / name).is_dir() \
+                and {p.name for p in (home / name).iterdir()} <= {'.system'}:
+            shutil.rmtree(home / name)
         if os.path.lexists(source / name) and not os.path.lexists(home / name):
-            try: (home / name).symlink_to(source / name)
+            try:
+                if name in CODEX_HARD_LINKED: os.link(source / name, home / name)
+                else: (home / name).symlink_to(source / name)
             except FileExistsError: pass
+            except OSError as error: log(f'{home / name} not linked to {source / name}: {error}')
+
+def codex_home_shareable(source):
+    # Lord's folder runs the user's codex as before only when nothing the user set is tied to the folder's path:
+    # codex names a keyring login after its folder and trusts a hook by the path it read it from, and a sqlite_home or
+    # log_dir in the settings would put the threads back where the user's codex lists them. hooks.state holds trust
+    # for project hooks, which are found by the project's path.
+    config = codex_config(source)
+    hooks = config.get('hooks', {})
+    return ((source / 'auth.json').exists() and config.get('cli_auth_credentials_store', 'file') in ('file', 'auto')
+            and not (source / 'hooks.json').exists() and isinstance(hooks, dict) and set(hooks) <= {'state'}
+            and 'sqlite_home' not in config and 'log_dir' not in config)
 
 def load_config():
     # The bundled defaults, with ~/.claude/lord/config.json merged over them one family at a time.
@@ -436,7 +456,7 @@ class Vendor:
                                     **({'LORD_AGENT_ID': self.agent.agentId, 'LORD_HOME': str(HOME), 'LORD_DAEMON_SOCKET': str(SOCKET), 'LORD_MCP_TOKEN': self.agent.token} if self.agent else {})})
             home = self.agent.record.get('codexHome') if self.agent else self.codex_home
             if self.family == 'gpt' and home:
-                codex_home_ready(Path(home), self.d.user_codex_home)
+                codex_home_ready(Path(home), self.d.user_codex_home, self.d.log)
                 env['CODEX_HOME'] = home
                 # codex would keep its thread database in this folder instead, which may be the user's.
                 env.pop('CODEX_SQLITE_HOME', None)
@@ -925,9 +945,11 @@ class Daemon:
             if not Path(cwd).is_dir(): raise ValueError('cwd must be a directory')
             config = self.config[family]
             # A gpt agent's codex keeps its threads in Lord's own codex folder; an agent saved without one (by an
-            # older daemon, or with own_home off) resumes in the user's folder, where its thread is.
+            # older daemon, with own_home off, or for a codex setup the folder cannot share) resumes in the user's
+            # folder, where its thread is.
+            own = family == 'gpt' and config.get('own_home', True) and codex_home_shareable(self.user_codex_home)
             a = Agent({**{k: body[k] for k in ('readonly', 'net', 'nosandbox') if k in body}, 'agentId': aid,
-                **({'codexHome': str(HOME / 'codex')} if family == 'gpt' and config.get('own_home', True) else {}),
+                **({'codexHome': str(HOME / 'codex')} if own else {}),
                 'family': family, 'cwd': cwd, 'model': body.get('model') or config['model'],
                 'effort': body.get('effort') or config['effort'], 'created': datetime.now(timezone.utc).isoformat()})
             # Until this first /open succeeds, a model nobody named may give way to the vendor's own default.

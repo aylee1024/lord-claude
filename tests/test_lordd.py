@@ -29,6 +29,8 @@ def grok_home(tmp_path, monkeypatch):
     # the user's ~/.grok or ~/.claude/lord.
     monkeypatch.setenv('GROK_HOME', str(tmp_path / 'grok-home'))
     monkeypatch.setenv('LORD_HOME', str(tmp_path / 'lord-home'))
+    # The user's codex folder in tests is the vendor data folder's .codex.
+    monkeypatch.delenv('CODEX_HOME', raising=False); monkeypatch.delenv('CODEX_SQLITE_HOME', raising=False)
 
 
 def test_daemon_exists():
@@ -336,18 +338,64 @@ def test_prune_only_owned_sessions(rig):
 def test_gpt_codex_keeps_threads_in_lords_folder_linked_to_the_users(rig):
     source, own = rig.data / '.codex', rig.home / 'codex'
     (source / 'skills').mkdir(parents=True); (source / 'rules').mkdir()
-    (source / 'auth.json').write_text('{}'); (source / 'config.toml').write_text('')
+    (source / 'auth.json').write_text('{}'); (source / '.credentials.json').write_text('{}')
+    # Trust for a project's hooks is keyed by the project's path, so it does not stop the sharing.
+    (source / 'config.toml').write_text('[hooks.state]\n')
     (own / 'rules').mkdir(parents=True)
+    # A start before the user had skills left codex's own skills/.system, which gives way to the user's skills.
+    (own / 'skills/.system').mkdir(parents=True)
+    rig.stop(); rig.env['CODEX_SQLITE_HOME'] = str(rig.data / 'elsewhere'); rig.start()
     rig.open('gpt')
     assert rig.turn('PING')[-1]['type'] == 'done'
-    assert {e['codex_home'] for e in rig.audit() if e.get('launch') and e['family'] == 'gpt'} == {str(own)}
+    launches = [e for e in rig.audit() if e.get('launch') and e['family'] == 'gpt']
+    assert {e['codex_home'] for e in launches} == {str(own)} and {e['sqlite_home'] for e in launches} == {None}
     for name in ('auth.json', 'config.toml', 'skills'):
         assert (own / name).is_symlink() and os.readlink(own / name) == str(source / name)
+    # codex writes tool sign-ins only to a regular file, so that one is a hard link.
+    assert not (own / '.credentials.json').is_symlink() and (own / '.credentials.json').stat().st_ino == (source / '.credentials.json').stat().st_ino
     # What is already in Lord's folder stays; what the user's folder lacks is not linked.
     assert not (own / 'rules').is_symlink() and not os.path.lexists(own / 'plugins')
 
 
+def test_login_lords_folder_cannot_share_keeps_the_users_folder(rig):
+    source = rig.data / '.codex'; source.mkdir(parents=True)
+    rig.open('gpt', agent='no-login')
+    # codex names a keyring login after its folder, so another folder would be signed out.
+    (source / 'auth.json').write_text('{}'); (source / 'config.toml').write_text('cli_auth_credentials_store = "keyring"\n')
+    rig.open('gpt', agent='keyring')
+    # codex trusts a hook by the path it read it from, so the user's hooks would not run from Lord's folder.
+    (source / 'config.toml').write_text('[[hooks.pre_tool_use]]\n')
+    rig.open('gpt', agent='toml-hook')
+    (source / 'config.toml').write_text(''); (source / 'hooks.json').write_text('{}')
+    rig.open('gpt', agent='json-hook')
+    # A database folder in the settings would put the threads back in the user's.
+    (source / 'hooks.json').unlink(); (source / 'config.toml').write_text('sqlite_home = "/elsewhere"\n')
+    rig.open('gpt', agent='sqlite-home')
+    (source / 'config.toml').write_text('')
+    rig.stop()
+    config = json.loads(rig.config.read_text()); config['gpt']['own_home'] = False; rig.config.write_text(json.dumps(config))
+    rig.start()
+    rig.open('gpt', agent='off')
+    assert [e['codex_home'] for e in rig.audit() if e.get('launch') and e['family'] == 'gpt'] == [None] * 6
+    assert not (rig.home / 'codex').exists()
+
+
+def test_idle_codex_of_any_folder_is_closed(rig, monkeypatch):
+    async def scenario():
+        d = local_daemon(rig, monkeypatch)
+        try:
+            services = [d.service(), d.service(str(rig.home / 'codex'))]
+            for v in services:
+                await v.ensure(); v.last = 0
+            await d.guard(time.monotonic())
+            assert all(v.process is None or v.process.returncode is not None for v in services)
+        finally:
+            await d.close()
+    asyncio.run(scenario())
+
+
 def test_agent_saved_without_codex_home_keeps_the_users_folder_and_prunes_in_its_own(rig):
+    source = rig.data / '.codex'; source.mkdir(parents=True); (source / 'auth.json').write_text('{}')
     sessions = {agent: rig.open('gpt', agent=agent)['vendorSession'] for agent in ('old', 'new')}
     rig.stop()
     path = rig.home / 'journal.jsonl'
