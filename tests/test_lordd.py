@@ -379,6 +379,8 @@ def test_login_lords_folder_cannot_share_keeps_the_users_folder(rig):
     # codex resolves a relative path in the settings against the folder it runs in.
     (source / 'base.md').write_text(''); (source / 'config.toml').write_text('model_instructions_file = "base.md"\n')
     rig.open('gpt', agent='relative')
+    (source / 'config.toml').write_text('[features]\nsecret_auth_storage = true\n')
+    rig.open('gpt', agent='secret-store')
     # codex writes tool sign-ins kept in a file only as a regular file, so a link could not share them.
     (source / 'config.toml').write_text(''); (source / '.credentials.json').write_text('{}')
     rig.open('gpt', agent='mcp-file')
@@ -387,7 +389,7 @@ def test_login_lords_folder_cannot_share_keeps_the_users_folder(rig):
     config = json.loads(rig.config.read_text()); config['gpt']['own_home'] = False; rig.config.write_text(json.dumps(config))
     rig.start()
     rig.open('gpt', agent='off')
-    assert [e['codex_home'] for e in rig.audit() if e.get('launch') and e['family'] == 'gpt'] == [None] * 10
+    assert [e['codex_home'] for e in rig.audit() if e.get('launch') and e['family'] == 'gpt'] == [None] * 11
     assert not (rig.home / 'codex').exists()
 
 
@@ -400,6 +402,14 @@ def test_setup_that_stops_being_shareable_refuses_the_agent_with_the_reason(rig)
     with pytest.raises(AssertionError, match="can no longer share your codex setup: you have codex hooks"):
         rig.turn('PING', agent='early')
     assert [e['codex_home'] for e in rig.audit() if e.get('launch') and e['family'] == 'gpt'] == [str(rig.home / 'codex')]
+    # Pruning still archives its thread: archiving needs none of the user's setup.
+    rig.stop()
+    records = [json.loads(line) for line in (rig.home / 'journal.jsonl').read_text().splitlines()]
+    for row in records: row['created'] = row['used'] = '2000-01-01T00:00:00+00:00'
+    (rig.home / 'journal.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in records))
+    result = subprocess.run([PYTHON, str(DAEMON), '--prune', '--days', '14'], env=rig.env, capture_output=True, text=True, timeout=12)
+    assert result.returncode == 0, result.stderr
+    assert [e['archived'] for e in rig.audit() if 'archived' in e] == [records[-1]['vendorSession']]
 
 
 def test_idle_codex_of_any_folder_is_closed(rig, monkeypatch):

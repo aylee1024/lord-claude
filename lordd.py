@@ -114,6 +114,9 @@ def codex_home_unshareable(source):
     if config.get('cli_auth_credentials_store', 'file') != 'file': return 'cli_auth_credentials_store is not file'
     if (source / 'hooks.json').exists() or not isinstance(hooks, dict) or set(hooks) - {'state'}: return 'you have codex hooks of your own'
     if (source / '.credentials.json').exists(): return 'tool sign-ins are kept in .credentials.json'
+    # This store encrypts sign-ins under a key named after the codex folder.
+    features = config.get('features', {})
+    if isinstance(features, dict) and features.get('secret_auth_storage'): return 'features.secret_auth_storage is on'
     if found := [k for k in ('sqlite_home', 'log_dir') if k in config]: return f'{found[0]} is set'
     if found := list(codex_relative_paths(config, source)): return f'{found[0]} names a file relative to {source}'
     return None
@@ -476,8 +479,8 @@ class Vendor:
             home = self.agent.record.get('codexHome') if self.agent else self.codex_home
             if self.family == 'gpt' and home:
                 # The thread lives in Lord's folder and cannot move, so a setup that can no longer be shared stops
-                # the start, saying why.
-                if reason := codex_home_unshareable(self.d.user_codex_home):
+                # an agent's start, saying why. A codex that only archives pruned threads needs none of that setup.
+                if self.agent and (reason := codex_home_unshareable(self.d.user_codex_home)):
                     raise RuntimeError(f"Lord's codex folder can no longer share your codex setup: {reason}. This agent's conversation is in {home}; start a new agent")
                 codex_home_ready(Path(home), self.d.user_codex_home)
                 env['CODEX_HOME'] = home

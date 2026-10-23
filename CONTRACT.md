@@ -37,14 +37,15 @@ mode moves the login there at every save), a
 `hooks.json` or hook definitions in `config.toml` (codex trusts a hook by the path it read it from; `hooks.state`, the
 trust of project hooks, is allowed), `sqlite_home` or `log_dir` in `config.toml`, a string in `config.toml` outside
 `mcp_servers` naming an existing file or folder relative to the user's codex folder (codex resolves it against the
-folder it runs in), or a `.credentials.json` (tool
+folder it runs in), `features.secret_auth_storage` (sign-ins encrypted under a key named after the folder), or a `.credentials.json` (tool
 sign-ins kept in a file, which codex writes only as a regular file and removes with the last sign-in). Its codex runs
 with `CODEX_HOME` set there and `CODEX_SQLITE_HOME` removed, and the folder links `auth.json`, `config.toml`,
 `AGENTS.md`, `AGENTS.override.md`, `.env`, `agents`, `skills`, `plugins`, `rules` and `mcp-oauth-locks` from the user's
 codex folder where they exist and the folder lacks them. `mcp-oauth-locks`, where codex locks updates and refreshes of
 tool sign-ins kept in the keychain, is made in the user's folder first, so both folders take the same locks. A
 `skills` folder holding only codex's own `.system` gives way to the user's, and a link that cannot be made stops the
-codex start. The same check runs at each codex start of an agent with `codexHome`; when it fails the start is refused
+codex start. The same check runs at each codex start of an agent with `codexHome` (not for a codex that only archives pruned
+threads); when it fails the start is refused
 with the reason, since the thread cannot move folders. A record without it resumes in the user's folder; pruning archives
 each thread through a codex in the agent's folder. A vendor's Lord tool server
 gets the starting daemon's socket as `LORD_DAEMON_SOCKET`; one without it (started by an older daemon) uses `lordd.sock`.
