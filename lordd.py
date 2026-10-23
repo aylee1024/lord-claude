@@ -479,9 +479,10 @@ class Vendor:
             home = self.agent.record.get('codexHome') if self.agent else self.codex_home
             if self.family == 'gpt' and home:
                 # The thread lives in Lord's folder and cannot move, so a setup that can no longer be shared stops
-                # an agent's start, saying why. A codex that only archives pruned threads needs none of that setup.
-                if self.agent and (reason := codex_home_unshareable(self.d.user_codex_home)):
-                    raise RuntimeError(f"Lord's codex folder can no longer share your codex setup: {reason}. This agent's conversation is in {home}; start a new agent")
+                # the start, saying why; the agent resumes once that is undone.
+                if reason := codex_home_unshareable(self.d.user_codex_home):
+                    fix = 'run `codex login`' if reason.endswith('cannot be shared)') else 'undo that'
+                    raise RuntimeError(f"Lord's codex folder can no longer share your codex setup: {reason}. This agent's conversation is in {home}; {fix} and it resumes, or start a new agent to keep the change")
                 codex_home_ready(Path(home), self.d.user_codex_home)
                 env['CODEX_HOME'] = home
                 # codex would keep its thread database in this folder instead, which may be the user's.
@@ -1419,6 +1420,8 @@ class Daemon:
                 if a.stream_lock.locked() or a.state in ('running', 'waiting_tool') or datetime.fromisoformat(a.record.get('used', a.created)) >= cutoff: continue
                 sid = a.vendorSession
                 if not sid or not re.fullmatch(r'[A-Za-z0-9_-]+', sid): continue
+                # Its codex cannot start to archive the thread, so the record stays for a later prune.
+                if a.record.get('codexHome') and codex_home_unshareable(self.user_codex_home): continue
                 previous, a.state = a.state, 'closed'
                 try:
                     backend = self.vendors.pop(aid, None)

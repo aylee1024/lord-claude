@@ -44,8 +44,8 @@ with `CODEX_HOME` set there and `CODEX_SQLITE_HOME` removed, and the folder link
 codex folder where they exist and the folder lacks them. `mcp-oauth-locks`, where codex locks updates and refreshes of
 tool sign-ins kept in the keychain, is made in the user's folder first, so both folders take the same locks. A
 `skills` folder holding only codex's own `.system` gives way to the user's, and a link that cannot be made stops the
-codex start. The same check runs at each codex start of an agent with `codexHome` (not for a codex that only archives pruned
-threads); when it fails the start is refused
+codex start. The same check runs at each codex start of an agent with `codexHome` ; pruning skips such an agent, keeping its record
+until its codex can start to archive the thread; when it fails the start is refused
 with the reason, since the thread cannot move folders. A record without it resumes in the user's folder; pruning archives
 each thread through a codex in the agent's folder. A vendor's Lord tool server
 gets the starting daemon's socket as `LORD_DAEMON_SOCKET`; one without it (started by an older daemon) uses `lordd.sock`.

@@ -339,8 +339,10 @@ def test_gpt_codex_keeps_threads_in_lords_folder_linked_to_the_users(rig):
     source, own = rig.data / '.codex', rig.home / 'codex'
     (source / 'skills').mkdir(parents=True); (source / 'rules').mkdir()
     (source / 'auth.json').write_text('{}')
-    # Trust for a project's hooks is keyed by the project's path, so it does not stop the sharing.
-    (source / 'config.toml').write_text('[hooks.state]\n')
+    # Trust for a project's hooks is keyed by the project's path, a tool server's cwd is not resolved when the
+    # settings load, and a path under a linked name resolves the same in both folders: none stops the sharing.
+    (source / 'agents').mkdir(); (source / 'agents/x.toml').write_text('')
+    (source / 'config.toml').write_text('role_file = "agents/x.toml"\n[hooks.state]\n[mcp_servers.tool]\ncwd = "."\n')
     (own / 'rules').mkdir(parents=True)
     # A start before the user had skills left codex's own skills/.system, which gives way to the user's skills.
     (own / 'skills/.system').mkdir(parents=True)
@@ -399,17 +401,30 @@ def test_setup_that_stops_being_shareable_refuses_the_agent_with_the_reason(rig)
     rig.stop()
     (source / 'hooks.json').write_text('{}')
     rig.start()
-    with pytest.raises(AssertionError, match="can no longer share your codex setup: you have codex hooks"):
+    with pytest.raises(AssertionError, match="can no longer share your codex setup: you have codex hooks.*undo that and it resumes"):
         rig.turn('PING', agent='early')
     assert [e['codex_home'] for e in rig.audit() if e.get('launch') and e['family'] == 'gpt'] == [str(rig.home / 'codex')]
-    # Pruning still archives its thread: archiving needs none of the user's setup.
+    # Pruning cannot archive its thread meanwhile, so it keeps the record and archives once the hook is gone.
     rig.stop()
     records = [json.loads(line) for line in (rig.home / 'journal.jsonl').read_text().splitlines()]
     for row in records: row['created'] = row['used'] = '2000-01-01T00:00:00+00:00'
     (rig.home / 'journal.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in records))
-    result = subprocess.run([PYTHON, str(DAEMON), '--prune', '--days', '14'], env=rig.env, capture_output=True, text=True, timeout=12)
-    assert result.returncode == 0, result.stderr
+    prune = [PYTHON, str(DAEMON), '--prune', '--days', '14']
+    assert subprocess.run(prune, env=rig.env, capture_output=True, text=True, timeout=12).returncode == 0
+    assert 'early' in (rig.home / 'journal.jsonl').read_text() and not [e for e in rig.audit() if 'archived' in e]
+    (source / 'hooks.json').unlink()
+    assert subprocess.run(prune, env=rig.env, capture_output=True, text=True, timeout=12).returncode == 0
     assert [e['archived'] for e in rig.audit() if 'archived' in e] == [records[-1]['vendorSession']]
+
+
+def test_signed_out_user_is_told_to_sign_in(rig):
+    source = rig.data / '.codex'; source.mkdir(parents=True); (source / 'auth.json').write_text('{}')
+    rig.open('gpt', agent='early')
+    rig.stop(); (source / 'auth.json').unlink(); rig.start()
+    with pytest.raises(AssertionError, match="run `codex login` and it resumes"):
+        rig.turn('PING', agent='early')
+    (source / 'auth.json').write_text('{}')
+    assert rig.turn('PING', agent='early')[-1]['type'] == 'done'
 
 
 def test_idle_codex_of_any_folder_is_closed(rig, monkeypatch):
