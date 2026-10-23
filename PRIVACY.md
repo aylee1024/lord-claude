@@ -15,6 +15,7 @@ The vendor program reads and acts on files with its own tools, as it would if yo
 - `journal.jsonl` (`sessions.jsonl` before 2.0.18): one line per agent (agent id, vendor session id, model, effort, working folder, options, last token counts). Task text is never stored here. Lines unused for 14 days are removed.
 - `logs/<agentId>.log`: the commands and file actions the vendor reported for that agent, and any turn error, with secret values and common token shapes redacted, at most 4 MB each, with one earlier 4 MB file kept as `<agentId>.log.1`, removed with the agent's line.
 - `logs/<agentId>.answer.md`: the agent's latest final answer, with secrets redacted, removed with the agent's line.
+- `codex/` (since 2.1.2): the codex folder of gpt agents, holding codex's own record of their conversations, so the Codex app does not list them. Your codex login, settings, instructions, skills, plugins and rules appear in it only as links to `~/.codex` (or `CODEX_HOME`); Lord creates the links and never opens the files.
 - `quota.json`: when a vendor said its quota was spent, the model and when the quota resets; delete it to clear the refusal.
 - `lordd.log`: the daemon's own log, at most 1 MB plus one older copy.
 

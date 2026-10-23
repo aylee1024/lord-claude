@@ -30,7 +30,11 @@ effort, cwd, options, last usage, created, used; never task text), shared by eve
 rewrites hold `journal.lock`, and a rewrite keeps the newest record of each agent, from the file or the rewriting daemon's
 own saves, less the agents that daemon pruned. An agent the daemon does not know, or knows by an older record while it
 runs nothing for it, is read from the journal at `/open`; `/agents` adds unknown ones. `sessions.jsonl`, the journal of
-daemons before 2.0.18, is read and never written (the first `journal.jsonl` starts from it). A vendor's Lord tool server
+daemons before 2.0.18, is read and never written (the first `journal.jsonl` starts from it). A gpt agent opened from 2.1.2 records
+`codexHome` (`codex/`, unless `gpt.own_home` is false): its codex runs with `CODEX_HOME` set there and `CODEX_SQLITE_HOME`
+removed, and the folder links `auth.json`, `config.toml`, `AGENTS.md`, `skills`, `plugins` and `rules` from the user's codex
+folder where they exist and the folder lacks them. A record without it resumes in the user's folder; pruning archives
+each thread through a codex in the agent's folder. A vendor's Lord tool server
 gets the starting daemon's socket as `LORD_DAEMON_SOCKET`; one without it (started by an older daemon) uses `lordd.sock`.
 `logs/<agentId>.log` (the agent's activity: vendor commands and file actions, redacted, moved to `.log.1` at 4 MB, removed with the
 record; agy tool steps are logged once each, as the tool's name and parameters), `logs/<agentId>.answer.md` (the

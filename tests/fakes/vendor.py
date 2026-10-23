@@ -323,7 +323,7 @@ async def handle(value):
 
 async def main():
     global AGY_SESSION
-    audit(launch=True, argv=sys.argv[3:], path=os.environ.get('PATH', ''), grok_env={k: v for k, v in os.environ.items() if k.startswith('GROK_')}, env={k: v for k, v in os.environ.items() if 'must-not-reach' in v})
+    audit(launch=True, argv=sys.argv[3:], path=os.environ.get('PATH', ''), grok_env={k: v for k, v in os.environ.items() if k.startswith('GROK_')}, env={k: v for k, v in os.environ.items() if 'must-not-reach' in v}, codex_home=os.environ.get('CODEX_HOME'))
     print('fixture Bearer fake-bearer-value', file=sys.stderr, flush=True)
     if FAMILY == 'gemini' and (DATA / 'start-quota-late').exists():
         # The same, with agy's stdout closed before its stderr line arrives.

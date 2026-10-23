@@ -67,6 +67,18 @@ def codex_config(folder):
         return tomllib.loads((folder / 'config.toml').read_text())
     except (OSError, ValueError): return {}
 
+# What Lord's codex folder shares with the user's, as links: codex writes its login file in place and its settings
+# writer follows links, so both stay the user's own files. Threads and their database stay in Lord's folder, which
+# the Codex app, reading only the user's folder, does not list.
+CODEX_SHARED = ('auth.json', 'config.toml', 'AGENTS.md', 'skills', 'plugins', 'rules')
+
+def codex_home_ready(home, source):
+    home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    for name in CODEX_SHARED:
+        if os.path.lexists(source / name) and not os.path.lexists(home / name):
+            try: (home / name).symlink_to(source / name)
+            except FileExistsError: pass
+
 def load_config():
     # The bundled defaults, with ~/.claude/lord/config.json merged over them one family at a time.
     config = json.loads(Path(os.environ.get('LORD_CONFIG', HERE.with_name('config.json'))).read_text())
@@ -379,8 +391,10 @@ class Agent:
             self.answer_path.write_text(REDACT(value['text']), encoding='utf-8')
 
 class Vendor:
-    def __init__(self, daemon, family, agent=None):
+    def __init__(self, daemon, family, agent=None, codex_home=None):
         self.d, self.family, self.agent = daemon, family, agent
+        # An agent-less codex's folder; an agent's codex uses the folder in its record. None is the user's own.
+        self.codex_home = codex_home
         self.process, self.serial, self.generation = None, 0, 0
         self.last, self.reason, self.efforts, self.descendants = time.monotonic(), None, [], set()
         self.pending, self.models = {}, []
@@ -418,11 +432,17 @@ class Vendor:
                 self.initialized = asyncio.get_running_loop().create_future()
             self.last, self.reason, self.error = time.monotonic(), None, None
             if self.family == 'grok': grok_profiles()
+            env = subscription_env({**({} if self.agent and self.agent.record.get('tools') else GROK_NO_CLAUDE_IMPORTS),
+                                    **({'LORD_AGENT_ID': self.agent.agentId, 'LORD_HOME': str(HOME), 'LORD_DAEMON_SOCKET': str(SOCKET), 'LORD_MCP_TOKEN': self.agent.token} if self.agent else {})})
+            home = self.agent.record.get('codexHome') if self.agent else self.codex_home
+            if self.family == 'gpt' and home:
+                codex_home_ready(Path(home), self.d.user_codex_home)
+                env['CODEX_HOME'] = home
+                # codex would keep its thread database in this folder instead, which may be the user's.
+                env.pop('CODEX_SQLITE_HOME', None)
             try:
                 self.process = await asyncio.create_subprocess_exec(*command,
-                    cwd=self.agent.cwd if self.agent else HOME, start_new_session=True,
-                    env=subscription_env({**({} if self.agent and self.agent.record.get('tools') else GROK_NO_CLAUDE_IMPORTS),
-                                          **({'LORD_AGENT_ID': self.agent.agentId, 'LORD_HOME': str(HOME), 'LORD_DAEMON_SOCKET': str(SOCKET), 'LORD_MCP_TOKEN': self.agent.token} if self.agent else {})}),
+                    cwd=self.agent.cwd if self.agent else HOME, start_new_session=True, env=env,
                     stdin=-1, stdout=-1, stderr=-1, limit=LIMIT)
             except FileNotFoundError: raise RuntimeError(f'{command[0]} was not found; {INSTALL[self.family]}') from None
             self.generation += 1
@@ -694,9 +714,9 @@ class Daemon:
         if a.agentId not in self.vendors: self.vendors[a.agentId] = Vendor(self, a.family, a)
         return self.vendors[a.agentId]
 
-    def service(self):
-        # A codex process owned by no agent, for archiving pruned threads.
-        return self.vendors.setdefault(None, Vendor(self, 'gpt'))
+    def service(self, home=None):
+        # A codex process owned by no agent, for archiving pruned threads: one per codex folder.
+        return self.vendors.setdefault(None if home is None else ('service', home), Vendor(self, 'gpt', codex_home=home))
 
     async def agy_mcp(self, program):
         # agy has no per-run MCP option. One user-level entry serves every agy process; the server reads its
@@ -764,7 +784,7 @@ class Daemon:
                 server.update(default_tools_approval_mode='approve', required=True, tool_timeout_sec=86400)
                 # The user's codex tool servers would start in every agent's process (about 0.5 GB each);
                 # agents get codex's own tools plus lord's, as the watchdog's --ignore-user-config runs did.
-                user = {} if a.record.get('tools') else codex_config(Path(os.environ['CODEX_HOME']) if os.environ.get('CODEX_HOME') else self.vendor_home / '.codex')
+                user = {} if a.record.get('tools') else codex_config(Path(a.record['codexHome']) if a.record.get('codexHome') else self.user_codex_home)
                 lean = {'mcp_servers': {name: {'enabled': False} for name in user.get('mcp_servers', {}) if name != 'lord'},
                         'plugins': {name: {'enabled': False} for name in user.get('plugins', {})}}
                 if user.get('notify'): lean['notify'] = []
@@ -904,7 +924,10 @@ class Daemon:
         if a is None:
             if not Path(cwd).is_dir(): raise ValueError('cwd must be a directory')
             config = self.config[family]
+            # A gpt agent's codex keeps its threads in Lord's own codex folder; an agent saved without one (by an
+            # older daemon, or with own_home off) resumes in the user's folder, where its thread is.
             a = Agent({**{k: body[k] for k in ('readonly', 'net', 'nosandbox') if k in body}, 'agentId': aid,
+                **({'codexHome': str(HOME / 'codex')} if family == 'gpt' and config.get('own_home', True) else {}),
                 'family': family, 'cwd': cwd, 'model': body.get('model') or config['model'],
                 'effort': body.get('effort') or config['effort'], 'created': datetime.now(timezone.utc).isoformat()})
             # Until this first /open succeeds, a model nobody named may give way to the vendor's own default.
@@ -1058,6 +1081,10 @@ class Daemon:
     @property
     def vendor_home(self):
         return Path(self.config.get('vendor_home', Path.home()))
+
+    @property
+    def user_codex_home(self):
+        return Path(os.environ['CODEX_HOME']) if os.environ.get('CODEX_HOME') else self.vendor_home / '.codex'
 
     async def interrupt(self, a):
         a.followup = a.earlier = None
@@ -1301,8 +1328,8 @@ class Daemon:
 
     async def guard(self, now):
         idle_s = self.config.get('process_idle_s', self.config['idle_exit_s'])
-        service = self.vendors.get(None)
-        if service and service.process and not service.pending and now - service.last >= idle_s: await service.close()
+        for service in [v for v in self.vendors.values() if v.agent is None]:
+            if service.process and not service.pending and now - service.last >= idle_s: await service.close()
         live = [v for v in self.vendors.values() if v.agent and v.process and v.process.returncode is None]
         for v in live:
             a = v.agent
@@ -1351,7 +1378,7 @@ class Daemon:
                     if backend: await backend.close()
                     # Vendor history is kept (it is review and build evidence); codex's archive only moves it aside.
                     if a.family == 'gpt':
-                        v = self.service()
+                        v = self.service(a.record.get('codexHome'))
                         try:
                             await v.ensure()
                             await v.rpc('thread/archive', {'threadId': sid})

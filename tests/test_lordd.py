@@ -333,6 +333,43 @@ def test_prune_only_owned_sessions(rig):
     assert [json.loads(line)['agentId'] for line in path.read_text().splitlines()] == ['recent']
 
 
+def test_gpt_codex_keeps_threads_in_lords_folder_linked_to_the_users(rig):
+    source, own = rig.data / '.codex', rig.home / 'codex'
+    (source / 'skills').mkdir(parents=True); (source / 'rules').mkdir()
+    (source / 'auth.json').write_text('{}'); (source / 'config.toml').write_text('')
+    (own / 'rules').mkdir(parents=True)
+    rig.open('gpt')
+    assert rig.turn('PING')[-1]['type'] == 'done'
+    assert {e['codex_home'] for e in rig.audit() if e.get('launch') and e['family'] == 'gpt'} == {str(own)}
+    for name in ('auth.json', 'config.toml', 'skills'):
+        assert (own / name).is_symlink() and os.readlink(own / name) == str(source / name)
+    # What is already in Lord's folder stays; what the user's folder lacks is not linked.
+    assert not (own / 'rules').is_symlink() and not os.path.lexists(own / 'plugins')
+
+
+def test_agent_saved_without_codex_home_keeps_the_users_folder_and_prunes_in_its_own(rig):
+    sessions = {agent: rig.open('gpt', agent=agent)['vendorSession'] for agent in ('old', 'new')}
+    rig.stop()
+    path = rig.home / 'journal.jsonl'
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    for row in records:
+        # As a daemon before 2.1.2 saved it.
+        if row['agentId'] == 'old': row.pop('codexHome')
+    path.write_text(''.join(json.dumps(row) + '\n' for row in records))
+    rig.start()
+    assert rig.turn('PING', agent='old')[-1]['type'] == 'done'
+    assert [e for e in rig.audit() if e.get('launch')][-1]['codex_home'] is None
+    rig.stop()
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    for row in records: row['created'] = row['used'] = '2000-01-01T00:00:00+00:00'
+    path.write_text(''.join(json.dumps(row) + '\n' for row in records))
+    result = subprocess.run([PYTHON, str(DAEMON), '--prune', '--days', '14'], env=rig.env, capture_output=True, text=True, timeout=12)
+    assert result.returncode == 0, result.stderr
+    homes = {e['pid']: e['codex_home'] for e in rig.audit() if e.get('launch')}
+    archived = {e['archived']: homes[e['pid']] for e in rig.audit() if 'archived' in e}
+    assert archived == {sessions['old']: None, sessions['new']: str(rig.home / 'codex')}
+
+
 def test_daemon_fork_returns_silently_and_singleton(rig):
     first = rig.request('/health')['pid']
     result = subprocess.run([PYTHON, str(DAEMON), '--daemon'], env=rig.env, capture_output=True, timeout=2)
@@ -448,7 +485,7 @@ def test_prune_reserves_agent_before_awaiting_archive(rig, monkeypatch):
         prune = None
         try:
             await d.open({'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home)})
-            a = d.agents['a']; v = d.service(); original = v.rpc
+            a = d.agents['a']; v = d.service(a.record.get('codexHome')); original = v.rpc
             async def gated(method, params, **options):
                 if method == 'thread/archive':
                     entered.set(); await release.wait()
