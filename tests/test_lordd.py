@@ -338,7 +338,7 @@ def test_prune_only_owned_sessions(rig):
 def test_gpt_codex_keeps_threads_in_lords_folder_linked_to_the_users(rig):
     source, own = rig.data / '.codex', rig.home / 'codex'
     (source / 'skills').mkdir(parents=True); (source / 'rules').mkdir()
-    (source / 'auth.json').write_text('{}'); (source / '.credentials.json').write_text('{}')
+    (source / 'auth.json').write_text('{}')
     # Trust for a project's hooks is keyed by the project's path, so it does not stop the sharing.
     (source / 'config.toml').write_text('[hooks.state]\n')
     (own / 'rules').mkdir(parents=True)
@@ -349,10 +349,10 @@ def test_gpt_codex_keeps_threads_in_lords_folder_linked_to_the_users(rig):
     assert rig.turn('PING')[-1]['type'] == 'done'
     launches = [e for e in rig.audit() if e.get('launch') and e['family'] == 'gpt']
     assert {e['codex_home'] for e in launches} == {str(own)} and {e['sqlite_home'] for e in launches} == {None}
-    for name in ('auth.json', 'config.toml', 'skills'):
+    # The sign-in locks folder is made in the user's folder, so both folders lock the same files.
+    for name in ('auth.json', 'config.toml', 'skills', 'mcp-oauth-locks'):
         assert (own / name).is_symlink() and os.readlink(own / name) == str(source / name)
-    # codex writes tool sign-ins only to a regular file, so that one is a hard link.
-    assert not (own / '.credentials.json').is_symlink() and (own / '.credentials.json').stat().st_ino == (source / '.credentials.json').stat().st_ino
+    assert (source / 'mcp-oauth-locks').is_dir()
     # What is already in Lord's folder stays; what the user's folder lacks is not linked.
     assert not (own / 'rules').is_symlink() and not os.path.lexists(own / 'plugins')
 
@@ -363,6 +363,9 @@ def test_login_lords_folder_cannot_share_keeps_the_users_folder(rig):
     # codex names a keyring login after its folder, so another folder would be signed out.
     (source / 'auth.json').write_text('{}'); (source / 'config.toml').write_text('cli_auth_credentials_store = "keyring"\n')
     rig.open('gpt', agent='keyring')
+    # In auto mode codex moves the login into the keychain, under its own folder's name, at every save.
+    (source / 'config.toml').write_text('cli_auth_credentials_store = "auto"\n')
+    rig.open('gpt', agent='auto')
     # codex trusts a hook by the path it read it from, so the user's hooks would not run from Lord's folder.
     (source / 'config.toml').write_text('[[hooks.pre_tool_use]]\n')
     rig.open('gpt', agent='toml-hook')
@@ -371,18 +374,38 @@ def test_login_lords_folder_cannot_share_keeps_the_users_folder(rig):
     # A database folder in the settings would put the threads back in the user's.
     (source / 'hooks.json').unlink(); (source / 'config.toml').write_text('sqlite_home = "/elsewhere"\n')
     rig.open('gpt', agent='sqlite-home')
-    (source / 'config.toml').write_text('')
+    (source / 'config.toml').write_text('log_dir = "/elsewhere"\n')
+    rig.open('gpt', agent='log-dir')
+    # codex resolves a relative path in the settings against the folder it runs in.
+    (source / 'base.md').write_text(''); (source / 'config.toml').write_text('model_instructions_file = "base.md"\n')
+    rig.open('gpt', agent='relative')
+    # codex writes tool sign-ins kept in a file only as a regular file, so a link could not share them.
+    (source / 'config.toml').write_text(''); (source / '.credentials.json').write_text('{}')
+    rig.open('gpt', agent='mcp-file')
+    (source / '.credentials.json').unlink()
     rig.stop()
     config = json.loads(rig.config.read_text()); config['gpt']['own_home'] = False; rig.config.write_text(json.dumps(config))
     rig.start()
     rig.open('gpt', agent='off')
-    assert [e['codex_home'] for e in rig.audit() if e.get('launch') and e['family'] == 'gpt'] == [None] * 6
+    assert [e['codex_home'] for e in rig.audit() if e.get('launch') and e['family'] == 'gpt'] == [None] * 10
     assert not (rig.home / 'codex').exists()
+
+
+def test_setup_that_stops_being_shareable_refuses_the_agent_with_the_reason(rig):
+    source = rig.data / '.codex'; source.mkdir(parents=True); (source / 'auth.json').write_text('{}')
+    rig.open('gpt', agent='early')
+    rig.stop()
+    (source / 'hooks.json').write_text('{}')
+    rig.start()
+    with pytest.raises(AssertionError, match="can no longer share your codex setup: you have codex hooks"):
+        rig.turn('PING', agent='early')
+    assert [e['codex_home'] for e in rig.audit() if e.get('launch') and e['family'] == 'gpt'] == [str(rig.home / 'codex')]
 
 
 def test_idle_codex_of_any_folder_is_closed(rig, monkeypatch):
     async def scenario():
         d = local_daemon(rig, monkeypatch)
+        (rig.data / '.codex').mkdir(parents=True); (rig.data / '.codex/auth.json').write_text('{}')
         try:
             services = [d.service(), d.service(str(rig.home / 'codex'))]
             for v in services:

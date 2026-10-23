@@ -70,34 +70,53 @@ def codex_config(folder):
 # What Lord's codex folder shares with the user's, as links: codex writes its login file in place and its settings
 # writer follows links, so both stay the user's own files. Threads and their database stay in Lord's folder, which
 # the Codex app, reading only the user's folder, does not list.
-CODEX_SHARED = ('auth.json', 'config.toml', 'AGENTS.md', 'AGENTS.override.md', '.env', 'agents', 'skills', 'plugins', 'rules')
-# Tool servers' sign-ins kept in a file: codex refuses to write it through a symbolic link, so it is a hard link.
-CODEX_HARD_LINKED = ('.credentials.json',)
+# mcp-oauth-locks holds the locks codex takes to update or refresh tool servers' sign-ins, which are shared through
+# the keychain; it is made in the user's folder first, so both folders take the same locks.
+CODEX_SHARED = ('auth.json', 'config.toml', 'AGENTS.md', 'AGENTS.override.md', '.env', 'agents', 'skills', 'plugins', 'rules',
+                'mcp-oauth-locks')
 
-def codex_home_ready(home, source, log):
+def codex_home_ready(home, source):
     home.mkdir(mode=0o700, parents=True, exist_ok=True)
-    for name in CODEX_SHARED + CODEX_HARD_LINKED:
+    (source / 'mcp-oauth-locks').mkdir(exist_ok=True)
+    for name in CODEX_SHARED:
         # codex makes skills/.system at start, so a start before the user had skills leaves a folder of codex's own.
         if name == 'skills' and (source / name).is_dir() and not (home / name).is_symlink() and (home / name).is_dir() \
                 and {p.name for p in (home / name).iterdir()} <= {'.system'}:
             shutil.rmtree(home / name)
         if os.path.lexists(source / name) and not os.path.lexists(home / name):
-            try:
-                if name in CODEX_HARD_LINKED: os.link(source / name, home / name)
-                else: (home / name).symlink_to(source / name)
+            # A link that cannot be made stops the start: codex without it would run without the user's setup.
+            try: (home / name).symlink_to(source / name)
             except FileExistsError: pass
-            except OSError as error: log(f'{home / name} not linked to {source / name}: {error}')
 
-def codex_home_shareable(source):
-    # Lord's folder runs the user's codex as before only when nothing the user set is tied to the folder's path:
-    # codex names a keyring login after its folder and trusts a hook by the path it read it from, and a sqlite_home or
-    # log_dir in the settings would put the threads back where the user's codex lists them. hooks.state holds trust
-    # for project hooks, which are found by the project's path.
+def codex_relative_paths(value, source, key=()):
+    # Settings naming a file relative to the codex folder, which codex resolves against the folder it runs in. Tool
+    # server entries are not resolved when the settings load.
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if key or k != 'mcp_servers': yield from codex_relative_paths(v, source, key + (k,))
+    elif isinstance(value, list):
+        for v in value: yield from codex_relative_paths(v, source, key)
+    elif isinstance(value, str) and value and '\n' not in value and len(value) < 1024 and not value.startswith(('/', '~')):
+        try:
+            if (source / value).exists() and (Path(value).parts or ('.',))[0] not in CODEX_SHARED: yield '.'.join(key)
+        except (OSError, ValueError): pass
+
+def codex_home_unshareable(source):
+    # Why Lord's folder cannot run the user's codex as before, or None. Each reason is something tied to the folder's
+    # path: codex names a keychain login after its folder (in auto mode too, at every save of the login), trusts a
+    # hook by the path it read it from, resolves relative paths in the settings against its folder, writes tool
+    # sign-ins in .credentials.json only as a regular file and removes it with the last sign-in, and a sqlite_home or
+    # log_dir would put the threads back where the user's codex lists them. hooks.state holds trust for project hooks,
+    # which are found by the project's path.
     config = codex_config(source)
     hooks = config.get('hooks', {})
-    return ((source / 'auth.json').exists() and config.get('cli_auth_credentials_store', 'file') in ('file', 'auto')
-            and not (source / 'hooks.json').exists() and isinstance(hooks, dict) and set(hooks) <= {'state'}
-            and 'sqlite_home' not in config and 'log_dir' not in config)
+    if not (source / 'auth.json').exists(): return f'{source / "auth.json"} is missing (a keychain login cannot be shared)'
+    if config.get('cli_auth_credentials_store', 'file') != 'file': return 'cli_auth_credentials_store is not file'
+    if (source / 'hooks.json').exists() or not isinstance(hooks, dict) or set(hooks) - {'state'}: return 'you have codex hooks of your own'
+    if (source / '.credentials.json').exists(): return 'tool sign-ins are kept in .credentials.json'
+    if found := [k for k in ('sqlite_home', 'log_dir') if k in config]: return f'{found[0]} is set'
+    if found := list(codex_relative_paths(config, source)): return f'{found[0]} names a file relative to {source}'
+    return None
 
 def load_config():
     # The bundled defaults, with ~/.claude/lord/config.json merged over them one family at a time.
@@ -456,7 +475,11 @@ class Vendor:
                                     **({'LORD_AGENT_ID': self.agent.agentId, 'LORD_HOME': str(HOME), 'LORD_DAEMON_SOCKET': str(SOCKET), 'LORD_MCP_TOKEN': self.agent.token} if self.agent else {})})
             home = self.agent.record.get('codexHome') if self.agent else self.codex_home
             if self.family == 'gpt' and home:
-                codex_home_ready(Path(home), self.d.user_codex_home, self.d.log)
+                # The thread lives in Lord's folder and cannot move, so a setup that can no longer be shared stops
+                # the start, saying why.
+                if reason := codex_home_unshareable(self.d.user_codex_home):
+                    raise RuntimeError(f"Lord's codex folder can no longer share your codex setup: {reason}. This agent's conversation is in {home}; start a new agent")
+                codex_home_ready(Path(home), self.d.user_codex_home)
                 env['CODEX_HOME'] = home
                 # codex would keep its thread database in this folder instead, which may be the user's.
                 env.pop('CODEX_SQLITE_HOME', None)
@@ -947,7 +970,7 @@ class Daemon:
             # A gpt agent's codex keeps its threads in Lord's own codex folder; an agent saved without one (by an
             # older daemon, with own_home off, or for a codex setup the folder cannot share) resumes in the user's
             # folder, where its thread is.
-            own = family == 'gpt' and config.get('own_home', True) and codex_home_shareable(self.user_codex_home)
+            own = family == 'gpt' and config.get('own_home', True) and not codex_home_unshareable(self.user_codex_home)
             a = Agent({**{k: body[k] for k in ('readonly', 'net', 'nosandbox') if k in body}, 'agentId': aid,
                 **({'codexHome': str(HOME / 'codex')} if own else {}),
                 'family': family, 'cwd': cwd, 'model': body.get('model') or config['model'],

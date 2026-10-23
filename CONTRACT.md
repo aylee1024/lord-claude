@@ -32,13 +32,20 @@ own saves, less the agents that daemon pruned. An agent the daemon does not know
 runs nothing for it, is read from the journal at `/open`; `/agents` adds unknown ones. `sessions.jsonl`, the journal of
 daemons before 2.0.18, is read and never written (the first `journal.jsonl` starts from it). A gpt agent opened from 2.1.2 records
 `codexHome` (`codex/`), unless `gpt.own_home` is false or something in the user's codex folder is tied to its path: no
-`auth.json`, `cli_auth_credentials_store` other than file or auto (codex names a keyring login after its folder), a
+`auth.json`, `cli_auth_credentials_store` other than file (codex names a keychain login after its folder, and in auto
+mode moves the login there at every save), a
 `hooks.json` or hook definitions in `config.toml` (codex trusts a hook by the path it read it from; `hooks.state`, the
-trust of project hooks, is allowed), or `sqlite_home` or `log_dir` in `config.toml`. Its codex runs with `CODEX_HOME`
-set there and `CODEX_SQLITE_HOME` removed, and the folder links `auth.json`, `config.toml`, `AGENTS.md`,
-`AGENTS.override.md`, `.env`, `agents`, `skills`, `plugins` and `rules` (symbolic links) and `.credentials.json` (a
-hard link: codex writes it only as a regular file) from the user's codex folder where they exist and the folder lacks
-them; a `skills` folder holding only codex's own `.system` gives way to the user's. A record without it resumes in the user's folder; pruning archives
+trust of project hooks, is allowed), `sqlite_home` or `log_dir` in `config.toml`, a string in `config.toml` outside
+`mcp_servers` naming an existing file or folder relative to the user's codex folder (codex resolves it against the
+folder it runs in), or a `.credentials.json` (tool
+sign-ins kept in a file, which codex writes only as a regular file and removes with the last sign-in). Its codex runs
+with `CODEX_HOME` set there and `CODEX_SQLITE_HOME` removed, and the folder links `auth.json`, `config.toml`,
+`AGENTS.md`, `AGENTS.override.md`, `.env`, `agents`, `skills`, `plugins`, `rules` and `mcp-oauth-locks` from the user's
+codex folder where they exist and the folder lacks them. `mcp-oauth-locks`, where codex locks updates and refreshes of
+tool sign-ins kept in the keychain, is made in the user's folder first, so both folders take the same locks. A
+`skills` folder holding only codex's own `.system` gives way to the user's, and a link that cannot be made stops the
+codex start. The same check runs at each codex start of an agent with `codexHome`; when it fails the start is refused
+with the reason, since the thread cannot move folders. A record without it resumes in the user's folder; pruning archives
 each thread through a codex in the agent's folder. A vendor's Lord tool server
 gets the starting daemon's socket as `LORD_DAEMON_SOCKET`; one without it (started by an older daemon) uses `lordd.sock`.
 `logs/<agentId>.log` (the agent's activity: vendor commands and file actions, redacted, moved to `.log.1` at 4 MB, removed with the
