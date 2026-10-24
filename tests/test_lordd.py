@@ -28,7 +28,7 @@ DAEMON = ROOT / 'lordd.py'
 
 @pytest.fixture(autouse=True)
 def grok_home(tmp_path, monkeypatch):
-    # The daemon writes grok sandbox profiles under GROK_HOME and its own files under LORD_HOME; tests never touch
+    # Sandbox profile cleanup and Lord's own files stay in decoy homes; tests never touch
     # the user's ~/.grok or ~/.claude/lord.
     monkeypatch.setenv('GROK_HOME', str(tmp_path / 'grok-home'))
     monkeypatch.setenv('LORD_HOME', str(tmp_path / 'lord-home'))
@@ -100,7 +100,6 @@ class Rig(Client):
                         S3_ACCESS_KEY='must-not-reach-vendor', GROK_API_KEY='must-not-reach-vendor', LORD_SECRET='must-not-reach-vendor', DB_PASSWORD='must-not-reach-vendor', CLOUD_CREDENTIAL='must-not-reach-vendor')
         config = {family: {'model': model, 'effort': 'high', 'program': [PYTHON, str(ROOT / 'tests/fakes/vendor.py'), family, str(self.data)]}
                   for family, model in [('gpt', 'gpt-6.1-sol'), ('grok', 'grok-4.7'), ('gemini', 'gemini-3.8-flash')]}
-        config['grok'].update(write_sandbox='lord-workspace', readonly_sandbox='test-readonly')
         config.update(retry_delay_s=.05, guard_interval_s=.2)
         config.update(idle_exit_s=idle, prune_days=14, vendor_home=str(self.data))
         self.config = home / 'config.json'
@@ -111,7 +110,7 @@ class Rig(Client):
 
     def start(self):
         self.log = (self.home / 'test-process.log').open('ab')
-        self.proc = subprocess.Popen([PYTHON, str(DAEMON)], env=self.env, stdout=self.log, stderr=self.log)
+        self.proc = subprocess.Popen([PYTHON, str(ROOT / 'tests/fakes/daemon.py'), str(DAEMON)], env=self.env, stdout=self.log, stderr=self.log)
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             assert self.proc.poll() is None, (self.home / 'test-process.log').read_text()
@@ -140,6 +139,9 @@ class Rig(Client):
 
     def audit(self):
         return [json.loads(line) for line in (self.data / 'audit.jsonl').read_text().splitlines()]
+
+    def sandbox_audit(self):
+        return [json.loads(line) for line in (self.home / 'sandbox.jsonl').read_text().splitlines()]
 
 
 @pytest.fixture
@@ -762,8 +764,10 @@ def test_grok_readonly_agents_run_under_the_sandbox_profile(rig):
     rig.open('grok', agent='r1', readonly=True)
     rig.open('grok', agent='r2', readonly=True)
     launches = [a['argv'] for a in rig.audit() if a.get('launch')]
-    assert launches.count(['--sandbox', 'lord-workspace', 'agent', '--always-approve', 'stdio']) == 1
-    assert launches.count(['--sandbox', 'test-readonly', 'agent', '--always-approve', 'stdio']) == 2
+    assert launches.count(['--sandbox', 'off', 'agent', '--always-approve', 'stdio']) == 3
+    profiles = [e['profile'] for e in rig.sandbox_audit()]
+    assert sum('(allow file-write* (subpath (param "AGENT")))' in p for p in profiles) == 1
+    assert len(profiles) == 3
 
 
 def test_gemini_registers_the_env_keyed_lord_server_at_each_agy_start(rig):
@@ -1032,85 +1036,6 @@ def test_a_turn_past_its_wall_clock_limit_is_stopped(rig):
     assert 'wall-clock limit' in events[-1]['message'] and time.monotonic() - started < 5
 
 
-def test_grok_runs_only_under_lord_custom_profiles_that_fail_closed(rig):
-    sandbox = rig.grok_home / 'sandbox.toml'
-    sandbox.parent.mkdir()
-    sandbox.write_text('# user profile\n[profiles.mine]\nextends = "strict"\n')
-    rig.open('grok', agent='w')
-    import tomllib
-    profiles = tomllib.loads(sandbox.read_text())['profiles']
-    assert profiles['mine'] == {'extends': 'strict'}
-    key = str((rig.home / 'control.header').resolve())
-    assert profiles['lord-workspace'] == {'extends': 'strict', 'read_only': ['/'], 'restrict_network': False, 'deny': profiles['lord-readonly']['deny']}
-    assert profiles['lord-readonly']['extends'] == 'strict' and profiles['lord-readonly']['restrict_network'] is False
-    assert profiles['lord-readonly']['read_only'] == ['/'] and 'read_write' not in profiles['lord-readonly']
-    assert '/var/run/docker.sock' in profiles['lord-readonly']['deny'] and key in profiles['lord-readonly']['deny']
-    first = sandbox.read_text()
-    rig.open('grok', agent='x')
-    assert sandbox.read_text() == first
-    # An end marker that lost its newline is still recognised: the block is replaced, never duplicated.
-    sandbox.write_text(first.rstrip('\n'))
-    rig.open('grok', agent='y')
-    assert sandbox.read_text() == first
-
-
-@pytest.mark.parametrize('linked_home', [False, True])
-def test_grok_profiles_confine_grok_state(tmp_path, linked_home, monkeypatch):
-    import tomllib
-    home = tmp_path / 'grok-home'
-    if linked_home:
-        real = tmp_path / 'real-grok-home'; real.mkdir()
-        home.symlink_to(real, target_is_directory=True)
-    m = load('lordd_grok_state')
-    endpoint = tmp_path / 'container.sock'; endpoint.touch()
-    hop = tmp_path / 'socket-hop'; hop.symlink_to(endpoint.name)
-    link = tmp_path / 'socket-link'; link.symlink_to(hop.name)
-    monkeypatch.setattr(m, 'SOCKETS', (*m.SOCKETS, str(link)))
-    m.grok_profiles()
-    profiles = tomllib.loads((home / 'sandbox.toml').read_text())['profiles']
-    key = str((m.HOME / 'control.header').resolve())
-    assert profiles['lord-workspace'] == profiles['lord-readonly']
-    for profile in profiles.values():
-        assert {k: v for k, v in profile.items() if k != 'deny'} == {'extends': 'strict', 'read_only': ['/'], 'restrict_network': False}
-        assert key in profile['deny']
-        for socket_path in m.SOCKETS:
-            assert socket_path in profile['deny'] and os.path.realpath(socket_path) in profile['deny']
-        assert str(hop) in profile['deny']
-
-
-def test_grok_strict_profiles_preserve_user_profiles(rig):
-    import tomllib
-    sandbox = rig.grok_home / 'sandbox.toml'
-    sandbox.parent.mkdir()
-    before = '# user profile\n[profiles.mine]\nextends = "strict"\n\n'
-    after = '\n# another user profile\n[profiles.other]\nextends = "workspace"\nread_only = ["/data"]\n'
-    sandbox.write_text(before + '# lord: begin\n[profiles.lord-workspace]\nextends = "workspace"\n# lord: end\n' + after)
-    rig.open('grok')
-    text = sandbox.read_text()
-    assert text[:text.index('# lord: begin')] == before + after + '\n'
-    profiles = tomllib.loads(text)['profiles']
-    assert profiles['mine'] == {'extends': 'strict'}
-    assert profiles['other'] == {'extends': 'workspace', 'read_only': ['/data']}
-    for name in ('lord-workspace', 'lord-readonly'):
-        assert profiles[name]['extends'] == 'strict' and profiles[name]['read_only'] == ['/']
-        assert 'read_write' not in profiles[name]
-
-
-@pytest.mark.parametrize('readonly_first', [False, True])
-def test_readonly_grok_confines_starting_folder_to_sessions(rig, readonly_first):
-    if not readonly_first: rig.open('grok')
-    opened = rig.open('grok', readonly=True)
-    assert opened['cwd'] == str(rig.home.resolve())
-    assert rig.turn('remember-this')[-1]['type'] == 'done'
-    rig.request('/close', {'agentId': 'a'})
-    assert rig.open('grok')['vendorSession'] == opened['vendorSession']
-    assert rig.turn('REMEMBER')[-1]['text'] == 'remember-this'
-    launches = [e for e in rig.audit() if e.get('launch') and 'test-readonly' in e['argv']]
-    assert len(launches) == 2 and all(e['cwd'] == str((rig.grok_home / 'sessions').resolve()) for e in launches)
-    sessions = [e['params'] for e in rig.audit() if e.get('method') in ('session/new', 'session/load')]
-    assert all(e['cwd'] == str(rig.home.resolve()) for e in sessions)
-
-
 def test_writable_grok_starts_in_its_working_folder(rig):
     project = rig.home / 'project'; project.mkdir()
     opened = rig.open('grok', cwd=str(project))
@@ -1118,18 +1043,8 @@ def test_writable_grok_starts_in_its_working_folder(rig):
     rig.request('/close', {'agentId': 'a'})
     assert rig.open('grok')['vendorSession'] == opened['vendorSession']
     assert rig.turn('REMEMBER')[-1]['text'] == 'remember-this'
-    launches = [e for e in rig.audit() if e.get('launch') and 'lord-workspace' in e['argv']]
+    launches = [e for e in rig.audit() if e.get('launch') and e['argv'][-5:] == ['--sandbox', 'off', 'agent', '--always-approve', 'stdio']]
     assert len(launches) == 2 and all(e['cwd'] == str(project.resolve()) for e in launches)
-
-
-def test_a_sandbox_file_that_cannot_take_the_profiles_is_refused_unchanged(rig):
-    sandbox = rig.grok_home / 'sandbox.toml'
-    sandbox.parent.mkdir()
-    sandbox.write_text('profiles = {mine = {extends = "strict"}}\n')
-    conn, file, status, _ = rig.connect('/open', {'agentId': 'k', 'family': 'grok', 'cwd': str(rig.home)})
-    body = json.loads(file.read()); file.close(); conn.close()
-    assert status != 200 and "cannot take Lord's grok profiles" in body['error']
-    assert sandbox.read_text() == 'profiles = {mine = {extends = "strict"}}\n'
 
 
 def test_requests_without_the_control_key_are_refused_except_health_and_mcp(rig):
@@ -1266,12 +1181,11 @@ def test_grok_key_deny_uses_kernel_spelling(tmp_path):
     spelled = str(home).replace('/storage', '/ſtorage')
     assert os.path.samefile(spelled, home)
     m.HOME = Path(spelled)
-    m.grok_profiles()
-    import tomllib
-    profiles = tomllib.loads((Path(os.environ['GROK_HOME']) / 'sandbox.toml').read_text())['profiles']
-    for profile in profiles.values():
-        assert str(key) in profile['deny']
-        assert str(m.HOME / 'control.header') not in profile['deny']
+    profile, args = m.grok_profile(str(tmp_path), False, {})
+    params = dict(p[2:].split('=', 1) for p in args)
+    assert params['KEY'] == str(key)
+    assert params['KEY'] != str(m.HOME / 'control.header')
+    assert '(deny file-read* (literal (param "KEY"))' in profile
 
 
 @pytest.mark.parametrize('readonly', [False, True])
@@ -1906,7 +1820,7 @@ def start_version(rig, version):
     (root / '.claude-plugin/plugin.json').write_text(json.dumps({'version': version}))
     shutil.copy(DAEMON, root / 'lordd.py')
     env = {k: v for k, v in rig.env.items() if k != 'LORD_DAEMON_SOCKET'}
-    proc = subprocess.Popen([PYTHON, str(root / 'lordd.py')], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc = subprocess.Popen([PYTHON, str(ROOT / 'tests/fakes/daemon.py'), str(root / 'lordd.py')], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     client = Client(rig.home)
     client.sock = rig.home / f'lordd-{version}.sock'
     deadline = time.monotonic() + 10
@@ -3689,6 +3603,337 @@ def test_nosandbox_reports_network_on_in_open_and_turn_log(rig):
     rig.turn('PING')
     assert 'sandbox none · network on' in (rig.home / 'logs/a.log').read_text()
     assert rig.open('gpt', net=False)['network'] is True
+
+
+@pytest.mark.parametrize('readonly', [False, True])
+def test_grok_outer_launch_and_resume(tests_backend, rig, readonly):
+    d, m, launched = tests_backend
+    async def scenario():
+        try:
+            opened = await d.open({'agentId': 'g', 'family': 'grok', 'cwd': str(rig.home / 'work'), 'readonly': readonly, 'nice': 12})
+            a = d.agents['g']; v = d.backend(a)
+            await d.begin(a, {'text': 'remember-this'})
+            await asyncio.wait_for(a.finished.wait(), 3)
+            while not a.events.empty(): a.events.get_nowait()
+            await v.close(); a.generation = 0
+            await d.attach(a)
+            assert a.vendorSession == opened['vendorSession']
+            await d.begin(a, {'text': 'REMEMBER'})
+            await asyncio.wait_for(a.finished.wait(), 3)
+            assert a.answer == 'remember-this'
+            commands = [(argv, kw) for argv, kw in launched if argv[-4:] == ('off', 'agent', '--always-approve', 'stdio')]
+            assert len(commands) == 2
+            for argv, kw in commands:
+                step = 12 - os.getpriority(os.PRIO_PROCESS, 0)
+                at = 3 if step > 0 else 0
+                assert argv[:at] == ('/usr/bin/nice', '-n', str(step))[:at]
+                assert argv[at:at + 2] == ('/usr/bin/sandbox-exec', '-p')
+                profile = argv[at + 2]
+                params = dict(p[2:].split('=', 1) for p in argv[at + 3:] if p.startswith('-D'))
+                assert params['AGENT'] == str((rig.home / 'work').resolve())
+                assert params['SESSIONS'] == str((rig.grok_home / 'sessions').resolve())
+                assert params['KEY'] == str((rig.home / 'unit/control.header').resolve())
+                assert params['LORD_HOME'] == str((rig.home / 'unit').resolve())
+                assert kw['cwd'] == a.cwd
+                assert ('(allow file-write* (subpath (param "AGENT")))' in profile) is not readonly
+                assert all(kw['env'][k] == 'false' for k in m['GROK_NO_CLAUDE_IMPORTS'])
+                assert not any('must-not-reach' in value for value in kw['env'].values())
+            assert not list(rig.home.rglob('*.sbpl'))
+        finally: await d.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('readonly', [False, True])
+@pytest.mark.parametrize('spelling', ['ordinary', 'unicode', 'case', 'symlink', 'data-volume'])
+def test_grok_outer_profile_paths(tmp_path, monkeypatch, readonly, spelling):
+    m = load('lordd_grok_outer_paths')
+    storage = tmp_path / 'storage-café'; storage.mkdir()
+    work = storage / 'work'; work.mkdir()
+    lord = storage / 'lord'; lord.mkdir()
+    (lord / 'control.header').write_text('decoy')
+    home = storage / 'grok'; home.mkdir()
+    temp = storage / 'temp'; temp.mkdir()
+    spelled = str(storage)
+    if spelling == 'unicode': spelled = unicodedata.normalize('NFD', spelled.replace('/storage', '/ſtorage'))
+    elif spelling == 'case': spelled = spelled.upper()
+    elif spelling == 'symlink':
+        link = tmp_path / 'link'; link.symlink_to(storage, target_is_directory=True); spelled = str(link)
+    elif spelling == 'data-volume': spelled = '/System/Volumes/Data' + spelled
+    if sys.platform != 'darwin' and spelling in ('unicode', 'case', 'data-volume'): pytest.skip('macOS filesystem spellings')
+    m.HOME = Path(spelled) / 'lord'
+    monkeypatch.setenv('GROK_HOME', str(Path(spelled) / 'grok'))
+    profile, args = m.grok_profile(str(Path(spelled) / 'work'), readonly, {'TMPDIR': str(Path(spelled) / 'temp')})
+    params = dict(p[2:].split('=', 1) for p in args)
+    for name, path in {'AGENT': work, 'TMP': temp, 'PRIVATE_TMP': Path('/private/tmp'), 'SESSIONS': home / 'sessions',
+                       'KEY': lord / 'control.header', 'LORD_HOME': lord}.items():
+        assert params[name] == m.canon(path)
+    assert all(path == m.canon(path) for path in params.values())
+    assert str(storage) not in profile
+    for name in ('seatbelt_base_policy.sbpl', 'seatbelt_preferences_policy.sbpl', 'grok.sbpl'):
+        assert (ROOT / 'sandbox' / name).read_text() in profile
+    assert '(allow file-read*)' in profile
+    assert '(remote ip "*:*")' in profile
+    assert '(path "/private/var/run/mDNSResponder")' in profile
+    assert '(global-name "com.apple.trustd.agent")' in profile
+    assert '(deny system-fcntl (fcntl-command 80 110))' in profile
+    assert '(deny mach-lookup (xpc-service-name-prefix ""))' in profile
+    for name in ('KEY', 'REAL_KEY', 'LORD_HOME', 'REAL_LORD_HOME', 'TMP', 'PRIVATE_TMP', 'SESSIONS'):
+        assert f'(param "{name}")' in profile
+    assert ('(allow file-write* (subpath (param "AGENT")))' in profile) is not readonly
+
+
+def test_grok_outer_nested_hook_paths(tmp_path, monkeypatch):
+    m = load('lordd_grok_hook_paths')
+    root = tmp_path / 'repo'; launch = root / 'src/deep'; launch.mkdir(parents=True)
+    (root / '.git').mkdir()
+    target = launch / 'targets'; target.mkdir()
+    settings = target / 'settings.json'; settings.write_text('{}')
+    (root / '.claude').mkdir(); (root / '.claude/settings.json').symlink_to(settings)
+    hooks = root / 'src/.grok/hooks'; hooks.mkdir(parents=True)
+    (hooks / 'a.json').write_text('{}')
+    metadata = target / 'metadata'; metadata.mkdir()
+    (root / '.agents').symlink_to(metadata, target_is_directory=True)
+    below = launch / 'child/.cursor'; below.mkdir(parents=True); (below / 'hooks.json').write_text('{}')
+    profile, args = m.grok_profile(str(launch), False, {'TMPDIR': str(tmp_path)})
+    params = dict(p[2:].split('=', 1) for p in args)
+    protected = {params[name] for name in params if name.startswith('PROTECTED_')}
+    for directory in (root, root / 'src', launch):
+        for name in ('.claude/settings.json', '.claude/settings.local.json', '.cursor/hooks.json', '.grok/hooks'):
+            if directory == root and name == '.claude/settings.json':
+                assert '"/settings.json"' in profile
+            else: assert str(directory / name) in protected
+    assert {str(root / name) for name in ('.git', '.codex')} <= protected
+    assert '(string-append' in profile and '"/.agents"' in profile
+    assert {str(settings), str(metadata), str(hooks / 'a.json')} <= protected
+    assert str(below / 'hooks.json') not in protected
+    pinned = {params[name] for name in params if name.startswith('ANCESTOR_')}
+    assert {str(root), str(root / '.claude'), str(root / 'src'), str(hooks.parent), str(hooks), str(target)} <= pinned
+    for name in params:
+        if name.startswith('PROTECTED_') and not name.endswith('_PARENT'): assert f'(lord-protect-path (param "{name}"))' in profile
+        if name.startswith('ANCESTOR_') and not name.endswith('_PARENT'): assert f'(lord-pin-directory (param "{name}"))' in profile
+
+
+@pytest.mark.parametrize('kind', ['hardlink', 'directory', 'fifo', 'broken-symlink'])
+@pytest.mark.parametrize('location', ['.claude/settings.json', '.claude/settings.local.json', '.cursor/hooks.json', '.grok/hooks/a.json'])
+def test_grok_outer_refuses_unsafe_hook_configs(tests_backend, rig, kind, location):
+    d, _, launched = tests_backend
+    root = rig.home / 'work'; (root / '.git').mkdir()
+    path = root / location; path.parent.mkdir(parents=True, exist_ok=True)
+    if kind == 'hardlink':
+        path.write_text('{}'); os.link(path, root / 'alias')
+    elif kind == 'directory': path.mkdir()
+    elif kind == 'fifo': os.mkfifo(path)
+    else: path.symlink_to(root / 'missing')
+    async def scenario():
+        try:
+            with pytest.raises(ValueError, match='hook config') as error:
+                await d.open({'agentId': 'g', 'family': 'grok', 'cwd': str(root)})
+            assert str(path) in str(error.value)
+            assert not launched
+        finally: await d.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('another', [False, True])
+@pytest.mark.parametrize('linked', [False, True])
+def test_grok_outer_retires_only_lords_old_block(tests_backend, rig, monkeypatch, another, linked):
+    d, m, _ = tests_backend
+    home = rig.grok_home; home.mkdir()
+    real = home / 'user.toml'
+    path = home / 'sandbox.toml'
+    if linked: path.symlink_to(real)
+    before, after = '# user before\n[profiles.mine]\nextends = "strict"\n\n', '\n# user after\n'
+    block = '# lord: begin\n[profiles.lord-workspace]\nextends = "strict"\n# lord: end'
+    path.write_text(before + block + '\n' + after)
+    original = path.read_text(); path.chmod(0o640)
+    async def others(): return another
+    monkeypatch.setitem(m, 'others_answering', others)
+    asyncio.run(d.close())
+    assert path.read_text() == (original if another else before + after)
+    assert path.stat().st_mode & 0o777 == 0o640
+    assert path.is_symlink() is linked
+    if another:
+        async def alone(): return False
+        monkeypatch.setitem(m, 'others_answering', alone)
+        asyncio.run(d.close())
+        assert path.read_text() == before + after
+
+
+def test_grok_outer_retires_old_block_at_daemon_start(rig):
+    rig.stop()
+    rig.grok_home.mkdir()
+    path = rig.grok_home / 'sandbox.toml'
+    path.write_text('# mine\n# lord: begin\n[profiles.lord-workspace]\nextends = "strict"\n# lord: end\n')
+    rig.start()
+    assert path.read_text() == '# mine\n'
+
+
+@pytest.mark.parametrize('kind', ['hardlink', 'directory'])
+def test_grok_outer_rechecks_hooks_at_each_start(tests_backend, rig, kind):
+    d, _, launched = tests_backend
+    root = rig.home / 'work'
+    async def scenario():
+        try:
+            await d.open({'agentId': 'g', 'family': 'grok', 'cwd': str(root)})
+            v = d.backend(d.agents['g']); await v.close()
+            folder = root / '.claude'; folder.mkdir()
+            config = folder / 'settings.json'
+            if kind == 'hardlink': config.write_text('{}'); os.link(config, root / 'alias')
+            else: config.mkdir()
+            before = len(launched)
+            with pytest.raises(ValueError, match='hook config') as error: await v.ensure()
+            assert str(config) in str(error.value) and len(launched) == before
+        finally: await d.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('readonly', [False, True])
+@pytest.mark.parametrize('linked', [False, True])
+def test_grok_outer_real_seatbelt(tmp_path, monkeypatch, readonly, linked):
+    m = load('lordd_grok_kernel')
+    work = tmp_path / 'work'; work.mkdir()
+    temp = tmp_path / 'temp'; temp.mkdir()
+    home = tmp_path / 'grok'; (home / 'sessions').mkdir(parents=True)
+    outside = tmp_path / 'outside'; outside.mkdir()
+    lord = temp / 'lord'; lord.mkdir(); (lord / 'control.header').write_text('decoy')
+    m.HOME = lord
+    if linked:
+        m.HOME = work / 'lord-link'; m.HOME.symlink_to(lord, target_is_directory=True)
+    monkeypatch.setenv('GROK_HOME', str(home))
+    (work / '.git').mkdir(); (work / '.codex').mkdir(); (work / '.agents').mkdir()
+    (work / '.claude').mkdir(); (work / '.claude/settings.json').write_text('{}')
+    cursor = work / 'cursor-target'; cursor.mkdir(); (cursor / 'hooks.json').write_text('{}')
+    (work / '.cursor').symlink_to(cursor, target_is_directory=True)
+    hooks = work / '.grok/hooks'; hooks.mkdir(parents=True); (hooks / 'a.json').write_text('{}')
+    code = '''
+import errno, json, os, pathlib, socket, sys
+work, temp, home, lord, outside, endpoint = map(pathlib.Path, sys.argv[1:])
+results = {}
+def probe(name, op):
+    try: op(); results[name] = 'allowed'
+    except OSError as error:
+        assert error.errno in (errno.EPERM, errno.EACCES), (name, error)
+        results[name] = 'denied'
+def write(path): path.write_text('probe')
+probe('work', lambda: write(work / 'new'))
+probe('temp', lambda: write(temp / 'new'))
+probe('sessions', lambda: write(home / 'sessions/new'))
+probe('outside', lambda: write(outside / 'new'))
+probe('home', lambda: write(home / 'new'))
+probe('lord', lambda: write(lord / 'new'))
+probe('key', lambda: (lord / 'control.header').read_text())
+for name in ('.claude/settings.json', '.claude/settings.local.json', '.cursor/hooks.json', 'cursor-target/hooks.json', '.grok/hooks/a.json', '.grok/hooks/new.json', '.grok/hooks/other', '.git/new', '.codex/new', '.agents/new'):
+    probe(name, lambda name=name: write(work / name))
+probe('unlink-config', lambda: (work / '.claude/settings.json').unlink())
+probe('rename-parent', lambda: (work / '.claude').rename(work / 'renamed'))
+probe('unlink-symlink-parent', lambda: (work / '.cursor').unlink())
+probe('rename-target-parent', lambda: (work / 'cursor-target').rename(work / 'moved-target'))
+probe('hardlink', lambda: os.link(work / '.claude/settings.json', work / 'alias'))
+probe('lord-link', lambda: (work / 'lord-link').unlink()) if (work / 'lord-link').is_symlink() else None
+probe('socket', lambda: socket.socket(socket.AF_UNIX).connect(str(endpoint)))
+probe('work-anchor', lambda: work.rename(work.with_name('moved')))
+probe('temp-anchor', lambda: temp.rename(temp.with_name('moved-temp')))
+probe('sessions-anchor', lambda: (home / 'sessions').rename(home / 'moved-sessions'))
+print(json.dumps(results))
+'''
+    endpoint = str(temp / 'decoy.sock'); listener = socket.socket(socket.AF_UNIX); listener.bind(endpoint); listener.listen()
+    try:
+        profile, params = m.grok_profile(str(work), readonly, {'TMPDIR': str(temp)})
+        result = subprocess.run(['/usr/bin/sandbox-exec', '-p', profile, *params, PYTHON, '-c', code,
+                                 str(work), str(temp), str(home), str(m.HOME), str(outside), endpoint], cwd=work,
+                                capture_output=True, text=True, timeout=8)
+        assert result.returncode == 0, result.stdout + result.stderr
+        results = json.loads(result.stdout)
+        expected = {name: 'denied' for name in results}
+        expected.update(temp='allowed', sessions='allowed', work='denied' if readonly else 'allowed')
+        assert results == expected
+    finally: listener.close()
+
+
+@pytest.mark.parametrize('readonly', [False, True])
+@pytest.mark.parametrize('spelling', ['ordinary', 'unicode', 'case', 'symlink', 'data-volume'])
+def test_grok_login_profile_uses_kernel_home_and_exact_grants(tmp_path, monkeypatch, readonly, spelling):
+    m = load('lordd_grok_login_paths')
+    home = tmp_path / 'storage-café'; home.mkdir()
+    spelled = str(home)
+    if spelling == 'unicode': spelled = unicodedata.normalize('NFD', spelled.replace('/storage', '/ſtorage'))
+    elif spelling == 'case': spelled = spelled.upper()
+    elif spelling == 'symlink':
+        link = tmp_path / 'link'; link.symlink_to(home, target_is_directory=True); spelled = str(link)
+    elif spelling == 'data-volume': spelled = '/System/Volumes/Data' + spelled
+    if sys.platform != 'darwin' and spelling in ('unicode', 'case', 'data-volume'): pytest.skip('macOS filesystem spellings')
+    monkeypatch.setenv('GROK_HOME', spelled)
+    profile, args = m.grok_profile(str(tmp_path / 'work'), readonly, {'TMPDIR': str(tmp_path / 'temp')})
+    params = dict(p[2:].split('=', 1) for p in args)
+    assert params['GROK_HOME'] == m.canon(home)
+    assert params['SESSIONS'] == m.canon(home / 'sessions')
+    assert str(home) not in profile
+    for name in ('auth.json', 'auth.json.lock', 'mcp_credentials.json', 'mcp_credentials.json.lock'):
+        assert f'(literal (string-append (param "GROK_HOME") "/{name}"))' in profile
+    assert '(regex-quote (param "GROK_HOME"))' in profile
+    assert r'/\\.[0-9]+\\.[0-9]+\\.tmp$' in profile
+    assert '(allow file-write* grok-login-files)' in profile
+    assert '(require-not grok-login-files)' in profile
+    assert '(require-not (subpath (param "SESSIONS")))' in profile
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='macOS Seatbelt profile')
+@pytest.mark.parametrize('readonly', [False, True])
+@pytest.mark.parametrize('overlapping_temp', [False, True])
+def test_grok_login_real_seatbelt_grants_only_credential_updates(tmp_path, monkeypatch, readonly, overlapping_temp):
+    m = load('lordd_grok_login_kernel')
+    home = tmp_path / 'grok.[test]'; home.mkdir()
+    work = tmp_path / 'work'; work.mkdir()
+    temp = tmp_path / 'temp'; temp.mkdir()
+    (home / 'sessions').mkdir(); (home / 'bin').mkdir(); (home / 'nested').mkdir()
+    for name in ('config.toml', 'sandbox.toml', 'trusted_folders.toml'):
+        (home / name).write_text('decoy')
+    monkeypatch.setenv('GROK_HOME', str(home))
+    profile, params = m.grok_profile(str(work), readonly, {'TMPDIR': str(tmp_path if overlapping_temp else temp)})
+    code = '''
+import errno, fcntl, json, os, pathlib, sys
+home = pathlib.Path(sys.argv[1])
+results = {}
+def probe(name, operation):
+    try: operation(); results[name] = 'allowed'
+    except OSError as error:
+        assert error.errno in (errno.EPERM, errno.EACCES), (name, error)
+        results[name] = 'denied'
+def append(path):
+    with path.open('a') as file: file.write('decoy')
+for stem in ('auth', 'mcp_credentials'):
+    target = home / (stem + '.json')
+    lock = home / (stem + '.json.lock')
+    probe(target.name, lambda: append(target))
+    def locked():
+        with lock.open('a') as file:
+            fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            file.write('decoy'); file.flush(); os.fchmod(file.fileno(), 0o600)
+            fcntl.flock(file, fcntl.LOCK_UN)
+    probe(lock.name, locked)
+    def replace():
+        temporary = home / ('.' + str(os.getpid()) + '.0.tmp')
+        with temporary.open('w') as file:
+            file.write('replacement'); file.flush(); os.fchmod(file.fileno(), 0o600); os.fsync(file.fileno())
+        temporary.replace(target)
+    probe(stem + '-atomic-replace', replace)
+probe('sessions', lambda: append(home / 'sessions/probe'))
+for name in ('config.toml', 'sandbox.toml', 'trusted_folders.toml', 'bin/probe', 'new-file',
+             'auth.json.tmp', 'mcp_credentials.json.tmp', '.tmpABC123', '.123.tmp', '.1.x.tmp',
+             '.1.2.tmp.bak', 'nested/.1.2.tmp'):
+    probe(name, lambda name=name: append(home / name))
+print(json.dumps(results))
+'''
+    result = subprocess.run(['/usr/bin/sandbox-exec', '-p', profile, *params, PYTHON, '-c', code, str(home)],
+                            cwd=work, capture_output=True, text=True, timeout=8)
+    assert result.returncode == 0, result.stdout + result.stderr
+    results = json.loads(result.stdout)
+    expected = {name: 'denied' for name in results}
+    expected.update({name: 'allowed' for name in ('auth.json', 'auth.json.lock', 'auth-atomic-replace',
+                                                 'mcp_credentials.json', 'mcp_credentials.json.lock',
+                                                 'mcp_credentials-atomic-replace', 'sessions')})
+    assert results == expected
+    assert all((home / name).read_text() == 'decoy' for name in ('config.toml', 'sandbox.toml', 'trusted_folders.toml'))
 
 
 @pytest.mark.parametrize('first', ['together', 'tests', 'tools'])

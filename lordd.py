@@ -140,53 +140,79 @@ def load_config():
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0: raise ValueError(f'{key} must be a number of 0 or more')
     return config
 
-# Container sockets grok's built-in read-only profile denies; each symlink hop is denied too, because Seatbelt
-# matches the resolved path.
-SOCKETS = ('/var/run/docker.sock', '/run/podman/podman.sock', '/var/run/podman/podman.sock',
-           '/run/containerd/containerd.sock', '/var/run/containerd/containerd.sock')
-
-def link_chain(path):
-    seen = [path]
-    while os.path.islink(path) and len(seen) < 10:
-        path = os.path.join(os.path.dirname(path), os.readlink(path))
-        seen.append(os.path.normpath(path))
-    seen.append(os.path.realpath(seen[0]))
-    return seen
-
 def grok_home():
     return Path(os.environ.get('GROK_HOME', Path.home() / '.grok'))
 
 LORD_BLOCK = re.compile(r'^# lord: begin[^\n]*\n.*?^# lord: end[^\n]*(?:\n|\Z)', re.M | re.S)
 
-def grok_profiles():
-    # grok runs unconfined, with only a warning, when a built-in profile fails to apply, but refuses to start
-    # when a custom profile fails. Lord therefore runs grok only under its own custom profiles. Both set
-    # restrict_network = false, so commands keep network access; on macOS the setting blocks no Unix-socket
-    # connection either way. Socket denies block file access, stopping connections through the listed link paths
-    # only. Neither profile can read Lord's control key, without which a grok agent cannot ask the daemon for a
-    # less confined agent.
-    import tomllib
+def remove_grok_profiles():
     link = grok_home() / 'sandbox.toml'
     path = Path(os.path.realpath(link))
-    if link.is_symlink() and not path.exists(): raise RuntimeError(f'{link} is a link to {path}, which does not exist')
-    key = canon(HOME / 'control.header')
-    sockets = sorted({p for s in SOCKETS for p in link_chain(s)})
-    listed = lambda paths: '[' + ', '.join(json.dumps(p) for p in paths) + ']'
-    block = ('# lord: begin (written by the lord plugin; edits between these lines are replaced)\n'
-             f'[profiles.lord-workspace]\nextends = "strict"\nread_only = ["/"]\nrestrict_network = false\ndeny = {listed([*sockets, key])}\n\n'
-             f'[profiles.lord-readonly]\nextends = "strict"\nread_only = ["/"]\nrestrict_network = false\ndeny = {listed([*sockets, key])}\n# lord: end\n')
-    original = path.read_text() if path.exists() else ''
-    kept = LORD_BLOCK.sub('', original).rstrip('\n')
-    text = (kept + '\n\n' if kept else '') + block
+    if not path.exists(): return
+    original = path.read_text()
+    text = LORD_BLOCK.sub('', original)
     if text == original: return
-    try: tomllib.loads(text)
-    except tomllib.TOMLDecodeError as error:
-        raise RuntimeError(f"{path} cannot take Lord's grok profiles ({error}); fix that file and try again") from None
-    path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f'.{path.name}.lord')
     temporary.write_text(text)
-    if path.exists(): temporary.chmod(path.stat().st_mode & 0o777)
+    temporary.chmod(path.stat().st_mode & 0o777)
     temporary.replace(path)
+
+
+def grok_project_paths(cwd):
+    launch = Path(canon(cwd))
+    root = next((p for p in (launch, *launch.parents) if os.path.lexists(p / '.git')), launch)
+    directories = [launch, *list(launch.parents)[:len(launch.parents) - len(root.parents)]]
+    protected = {root / name for name in ('.git', '.codex', '.agents')}
+    for directory in directories:
+        configs = [directory / name for name in ('.claude/settings.json', '.claude/settings.local.json', '.cursor/hooks.json')]
+        hooks = directory / '.grok/hooks'
+        configs += list(hooks.glob('*.json'))
+        protected.add(hooks)
+        for path in configs:
+            if os.path.lexists(path):
+                try: info = path.stat()
+                except OSError: raise ValueError(f'refusing grok hook config {path}: target is not a regular file') from None
+                if not stat.S_ISREG(info.st_mode): raise ValueError(f'refusing grok hook config {path}: target is not a regular file')
+                if info.st_nlink > 1: raise ValueError(f'refusing grok hook config {path}: target has more than one hard link')
+            protected.add(path)
+    return protected
+
+
+def grok_profile(cwd, readonly, env):
+    folder = HERE.parent / 'sandbox'
+    profile = '\n'.join((folder / name).read_text() for name in ('seatbelt_base_policy.sbpl', 'seatbelt_preferences_policy.sbpl', 'grok.sbpl'))
+    real_home = Path.home() / '.claude/lord'
+    params = {name: canon(path) for name, path in {
+        'AGENT': cwd, 'TMP': env.get('TMPDIR') or '/tmp', 'PRIVATE_TMP': '/private/tmp',
+        'GROK_HOME': grok_home(), 'SESSIONS': grok_home() / 'sessions', 'KEY': HOME / 'control.header', 'REAL_KEY': real_home / 'control.header',
+        'LORD_HOME': HOME, 'REAL_LORD_HOME': real_home}.items()}
+    if not readonly: profile += '\n(allow file-write* (subpath (param "AGENT")))'
+    protected = grok_project_paths(cwd)
+    writable = [params[name] for name in ('TMP', 'PRIVATE_TMP', 'SESSIONS')] + ([] if readonly else [params['AGENT']])
+    ancestors = {Path(root) for root in writable}
+    for path in protected | {HOME, real_home, HOME / 'control.header', real_home / 'control.header', Path(params['TMP'])}:
+        for spelling in (path, Path(canon(path))):
+            ancestors.update(p for p in spelling.parents if p.is_dir() and (inside(str(p), writable) or inside(canon(p), writable)))
+    # Preserve a symlink's directory entry as well as its target without putting path text into Scheme.
+    def rule(function, name, path):
+        params[name] = canon(path)
+        text = f'\n({function} (param "{name}"))'
+        link = next((p for p in reversed((path, *path.parents)) if p.is_symlink()), None)
+        if link:
+            parent = name + '_PARENT'
+            params[parent] = canon(link.parent)
+            suffix = '/' + str(path.relative_to(link.parent))
+            text += f'\n({function} (string-append (param "{parent}") {json.dumps(suffix, ensure_ascii=False)}))'
+        return text
+    profile += rule('lord-protect-path', 'HOME_PATH', HOME)
+    profile += rule('lord-protect-path', 'REAL_HOME_PATH', real_home)
+    for i, path in enumerate(sorted(protected)):
+        profile += rule('lord-protect-path', f'PROTECTED_{i}', path)
+    for i, path in enumerate(sorted(ancestors)):
+        profile += rule('lord-pin-directory', f'ANCESTOR_{i}', path)
+    for name in ('AGENT', 'TMP', 'PRIVATE_TMP', 'SESSIONS'):
+        if name != 'AGENT' or not readonly: profile += f'\n(lord-pin-directory (param "{name}"))'
+    return profile, [f'-D{name}={path}' for name, path in params.items()]
 
 EXEC_START_TIMEOUT = 10
 
@@ -726,7 +752,7 @@ class Vendor:
             config = self.d.config[self.family]
             command = config.get('program', {'gpt': 'codex', 'grok': 'grok', 'gemini': 'agy'}[self.family])
             command = list(command) if isinstance(command, list) else [command]
-            # A missing program leaves nothing behind: no grok profiles, no agy entry.
+            # A missing program leaves no vendor setup behind.
             if not shutil.which(command[0], path=subscription_env().get('PATH')):
                 raise RuntimeError(f'{command[0]} was not found; {INSTALL[self.family]}')
             # @nice: the vendor starts at that niceness and every command it runs inherits it; a sandboxed command
@@ -739,9 +765,7 @@ class Vendor:
             if self.family == 'gpt': command += ['app-server']
             elif self.family == 'grok':
                 if self.agent: validate_grok_folder(self.agent.cwd)
-                # Seatbelt applies to the whole grok process, so read-only sessions get their own process.
-                command += ['--sandbox', config['readonly_sandbox'] if self.readonly else config['write_sandbox']]
-                command += ['agent', '--always-approve', 'stdio']
+                command += ['--sandbox', 'off', 'agent', '--always-approve', 'stdio']
             else:
                 await self.d.agy_mcp(command)
                 a = self.agent
@@ -750,7 +774,6 @@ class Vendor:
                 if a.vendorSession: command += ['--conversation', a.vendorSession]
                 self.initialized = asyncio.get_running_loop().create_future()
             self.last, self.reason, self.error = time.monotonic(), None, None
-            if self.family == 'grok': grok_profiles()
             env = subscription_env({**({} if self.agent and self.agent.record.get('tools') else GROK_NO_CLAUDE_IMPORTS),
                                     **({'LORD_AGENT_ID': self.agent.agentId, 'LORD_HOME': str(HOME), 'LORD_DAEMON_SOCKET': str(SOCKET), 'LORD_MCP_TOKEN': self.agent.token} if self.agent else {})})
             home = self.agent.record.get('codexHome') if self.agent else self.codex_home
@@ -765,10 +788,11 @@ class Vendor:
                 # codex would keep its thread database in this folder instead, which may be the user's.
                 env.pop('CODEX_SQLITE_HOME', None)
             cwd = self.agent.cwd if self.agent else HOME
-            if self.family == 'grok' and self.readonly:
-                # strict grants writes to the process's starting folder; ACP supplies the agent's folder separately.
-                cwd = grok_home() / 'sessions'
-                cwd.mkdir(parents=True, exist_ok=True)
+            if self.family == 'grok':
+                if self.readonly and inside(canon(cwd), [canon(root) for root in TEMP_ROOTS]):
+                    raise ValueError("grok's read-only profile leaves temp folders writable; pin a read-only grok outside /tmp, /var/tmp and /var/folders")
+                profile, params = grok_profile(cwd, self.readonly, env)
+                command = [*nice, '/usr/bin/sandbox-exec', '-p', profile, *params, *command[len(nice):]]
             try:
                 if self.d.stopping: raise RuntimeError('Daemon stopping')
                 if self.family == 'gpt' and self.agent and self.agent.record.get('tests'):
@@ -2021,7 +2045,11 @@ class Daemon:
         self.stopping = True
         for a in self.agents.values(): a.emit('error', message='Daemon shutting down', retryable=True)
         await asyncio.gather(*(v.close() for v in self.vendors.values()), return_exceptions=True)
-        if self.agy_registered and not await others_answering():
+        others = await others_answering()
+        if not others:
+            try: remove_grok_profiles()
+            except (OSError, UnicodeError) as error: self.log(f'grok sandbox profile cleanup failed: {error}')
+        if self.agy_registered and not others:
             # The entry names this plugin copy's file, which an update or an uninstall later deletes; while no daemon
             # runs, no agy session (the user's own included) is left trying to start it. A daemon of another version
             # still running keeps it, and re-adds its own at its next agy start.
@@ -2049,10 +2077,13 @@ class Daemon:
         server, bound = None, False
         try:
             if await answering(): return
+            if not await others_answering():
+                try: remove_grok_profiles()
+                except (OSError, UnicodeError) as error: self.log(f'grok sandbox profile cleanup failed: {error}')
             # Every request but /health and /mcp (which carries a per-agent token) needs this key. Vendor sandboxes
-            # cannot read the file (grok's profiles deny it; codex's sandbox cannot reach the socket without @net).
+            # cannot read the file (Lord's grok profile denies it; codex cannot reach the socket without @net).
             # Daemons of different versions share it: a new key would lock out the plugins talking to a daemon still
-            # running, and grok's profiles name this one file. It is replaced only when no other daemon runs.
+            # running, and Lord's grok profile names this one file. It is replaced only when no other daemon runs.
             try: self.control = re.fullmatch(r'X-Lord-Control: ([0-9a-f]{32})\n', (HOME / 'control.header').read_text())[1] if await others_answering() else None
             except (OSError, TypeError): self.control = None
             if not self.control:

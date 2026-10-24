@@ -23,7 +23,7 @@ answer becomes the agent's reply. No Claude tokens are spent on these turns.
 `.claude-plugin/{plugin,marketplace}.json`, `hooks/{hooks.json,register.tsx}`, `agents/{gpt,grok,gemini}.md`
 (`tools: Agent, SendMessage`; `effort: high`; `model: haiku` is never called, and its prompt makes any fallback reply a
 visible `lord: error` line), `lordd.py`, `config.json` (defaults; `~/.claude/lord/config.json` is merged over it per
-family), `tests/`, `sandbox/` (the two upstream Seatbelt policies, their `NOTICE` and Apache-2.0 license, and Lord's `tests.sbpl`), `README.md`, `PRIVACY.md`, `LICENSE`.
+family), `tests/`, `sandbox/` (the two upstream Seatbelt policies, their `NOTICE` and Apache-2.0 license, and Lord's `tests.sbpl` and `grok.sbpl`), `README.md`, `PRIVACY.md`, `LICENSE`.
 Runtime files only in `~/.claude/lord/`: `lordd-<version>.sock` (600, folder 700) and `lordd-<version>.lock`, one pair per
 plugin version, since each version's plugin starts and talks to its own daemon (`LORD_DAEMON_SOCKET` overrides; daemons
 before 2.0.18 used `lordd.sock` and `lordd.lock`); `journal.jsonl` (one record per agent save: ids, vendor session, model,
@@ -61,10 +61,10 @@ per path first read, listed, searched or edited, from codex's `commandActions` a
 path; a file a program or script opens is not in codex's actions and is not listed; written only when there is a path;
 it stops at 4 MB with a last line saying so), all removed with the record; `allowance.json` (`{gpt: {<limitId>:
 snapshot}}`, codex's last `account/rateLimits/updated` for each quota bucket, merged within the bucket as codex sends it,
-with `seen`; written under `journal.lock` through one scratch name, so daemons of every version share it; a malformed file reads as empty), `lordd.log` (1 MB, one rotation). Two global side effects: an agy MCP entry `lord` while a daemon runs (added
+with `seen`; written under `journal.lock` through one scratch name, so daemons of every version share it; a malformed file reads as empty), `lordd.log` (1 MB, one rotation). One ongoing global side effect: an agy MCP entry `lord` while a daemon runs (added
 or updated at each gemini agent start, removed when a daemon exits with no daemon of another version running; agy has
-no per-run MCP option) and the `lord-workspace` and `lord-readonly` profiles between `# lord: begin` and `# lord: end` in
-`$GROK_HOME/sandbox.toml` (default `~/.grok`), rewritten only when they differ.
+no per-run MCP option). At start and exit, when no daemon of another version is running, Lord removes only its old
+`# lord: begin` to `# lord: end` block from `$GROK_HOME/sandbox.toml` (default `~/.grok`), preserving user content and symlinks.
 
 ## Daemon HTTP API (JSON bodies)
 Every request but `GET /health` and `POST /mcp` carries `X-Lord-Control: <key>` from `~/.claude/lord/control.header`
@@ -117,25 +117,31 @@ waits undelivered, for up to `keep_undelivered_s` (a day).
   another helper's) is mapped to its agent: the helper's completed steps go to the agent's log as
   `[<agentPath>] <line>` (the helper's thread id in codex's older helper mode, which names no path) and to its read list, never to rows or events. `webSearch` lines name `action`'s query, queries,
   url or pattern; a search with none yet gets its row when it completes.
-- grok: `grok --sandbox <write_sandbox|readonly_sandbox> agent --always-approve stdio` per agent, defaults
-  `lord-workspace` and `lord-readonly`. Both extend `strict` with `read_only = ["/"]` and `restrict_network = false`:
-  reads everywhere, writes to the process's starting folder, temp folders and `~/.grok/sessions` (plus
-  `~/.grok/daemon/run/<profile>` when its daemon backend is used), under `grok_home()` (`$GROK_HOME` or `~/.grok`).
-  A writable process starts in the agent's folder; a read-only one starts in `grok_home()/sessions`, so `strict` grants
-  it no project writes. ACP gets the agent's actual folder for both new and resumed sessions. Both profiles explicitly
-  deny file access to the container sockets and each symlink hop to them. These denies stop connections through the
-  listed link paths only. Both deny Lord's control key. Grok's other folders stay read-only:
-  Lord's grok agents cannot save grok memory or use grok's own git worktrees. Lord uses neither; Claude Code supplies
-  worktree paths through `SubagentStart`, so its worktree isolation still works.
-  A grok working folder may not be inside `~/.grok` or contain it (`$GROK_HOME` if set), because grok's sandbox lets
-  an agent write its whole working folder. Every grok agent, read-only included, can change another grok agent's saved
-  conversation, because grok keeps all sessions in one writable folder. A grok agent, read-only included, can connect
-  to Docker's socket and other local control sockets, such as a tmux server's, which act outside its sandbox.
-  No grok profile setting blocks these connections on macOS, including `restrict_network = true` (grok 1.0.70).
-  Custom profiles only: grok refuses to start when one
-  cannot be applied, while a failed built-in profile runs unconfined with a warning. ACP `session/new|load` with the
-  lord MCP server;
-  `GROK_{CLAUDE,CURSOR}_{MCPS,HOOKS,SKILLS}_ENABLED=false` so grok does not import Claude Code's setup unless `tools`.
+- grok: `/usr/bin/sandbox-exec -p <profile> -D<NAME>=<path> ... grok --sandbox off agent --always-approve stdio`
+  per agent, with `/usr/bin/nice` outside sandbox-exec when requested. Both process cwd and ACP `session/new|load`
+  cwd are the agent's folder in both modes. Lord combines Codex's base and preferences policies with `sandbox/grok.sbpl`;
+  all path parameters use `canon()`, and the profile is passed inline with no profile file written.
+  Reads everywhere except Lord's control key; writes to the agent folder (unless read-only), temp folders and
+  `grok_home()/sessions` (`$GROK_HOME` or `~/.grok`) and its own login files. At the kernel-spelled `GROK_HOME`,
+  literal write grants cover `auth.json`, `auth.json.lock`, `mcp_credentials.json` and `mcp_credentials.json.lock`.
+  Both credential writers use top-level `.<pid>.<counter>.tmp` files for atomic replacement, allowed only by the
+  anchored numeric pattern `\.[0-9]+\.[0-9]+\.tmp`; the home prefix is regex-quoted. All other writes under grok's home
+  are denied except sessions, including `config.toml`, `sandbox.toml`, `trusted_folders.toml` and `bin/`, even if a
+  temp write grant overlaps the home. No writes under Lord's logical or resolved folder.
+  Outbound IP network is allowed; Unix-socket connections allow only `/private/var/run/mDNSResponder` for DNS.
+  Docker's real socket, tmux and Lord's own socket are blocked in both modes. `com.apple.trustd.agent` lookup is allowed;
+  XPC service-name-prefix lookups and mutating fcntl commands 80 and 110 are denied. Writable roots are pinned against unlink.
+  Each start protects `.claude/settings.json`, `.claude/settings.local.json`, `.cursor/hooks.json` and `.grok/hooks/`
+  at every directory from the nearest repository root through the launch folder (just the launch folder outside a repository),
+  plus root `.git`, `.codex` and `.agents`, by logical and resolved path, including absent named configs.
+  Existing parent directories inside writable roots are pinned against unlink and rename. Existing hook configs must
+  resolve to regular files with one hard link; otherwise the start is refused with the file named.
+  A grok working folder may not be inside `grok_home()` or contain it, at `/open` and every start. Read-only grok
+  refuses temp folders at `/open` and every start. Grok's other storage stays read-only, so memory saves and grok's own
+  git worktrees are unavailable; Claude Code supplies worktree paths through `SubagentStart`.
+  Every grok agent, read-only included, can change another grok agent's saved conversation in their shared sessions folder.
+  ACP `session/new|load` supplies the lord MCP server; its subprocess cannot connect to Lord's Unix socket under this profile.
+  `GROK_{CLAUDE,CURSOR}_{MCPS,HOOKS,SKILLS}_ENABLED=false` suppress Claude/Cursor imports unless `tools`.
   Effort as requested (low to xhigh; max runs as xhigh).
 - agy: `agy --model M --effort E --input-format stream-json --output-format stream-json --dangerously-skip-permissions
   [--conversation id]` per agent (default gemini-4-argon); lord tools through the global `lord` MCP entry keyed by
@@ -143,7 +149,7 @@ waits undelivered, for up to `keep_undelivered_s` (a day).
 - Effort: the request (`minimal` to `ultra`), else the nearest level the vendor lists for the model (codex model/list,
   grok configOptions, agy models).
 - A vendor program that is not found on the session PATH ends the request with an error naming how to install and sign
-  in, before Lord writes anything for it (grok profiles, the agy entry).
+  in, before Lord writes anything for it (the agy entry).
 - A vendor that is not signed in (codex answers a turn with 401 Unauthorized, grok a new session with "Authentication
   required") gets the sign-in step added to its error; codex's "failed to load workspace requirements" says the
   settings reload failed and that the next turn starts a new codex.

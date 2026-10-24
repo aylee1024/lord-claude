@@ -69,7 +69,9 @@ def test_refused_open_with_readonly_does_not_leave_a_writable_grok_read_only(rig
     assert status == 400, reply
     rig.open('grok')
     assert rig.turn('PING')[-1]['text'] == 'PONG'
-    assert 'lord-workspace' in _last_prompt_launch(rig)['argv'], _last_prompt_launch(rig)['argv']
+    launch = _last_prompt_launch(rig)
+    profile = next(e['profile'] for e in rig.sandbox_audit() if e['pid'] == launch['pid'])
+    assert '(allow file-write* (subpath (param "AGENT")))' in profile, profile
 
 
 def test_an_interrupt_during_a_start_longer_than_five_seconds_is_not_lost(rig):

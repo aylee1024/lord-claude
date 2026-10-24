@@ -1,0 +1,37 @@
+; Lord confines the whole grok process; paths are supplied through sandbox-exec -D parameters.
+(allow file-read*)
+(allow file-write*
+  (subpath (param "TMP"))
+  (subpath (param "PRIVATE_TMP"))
+  (subpath (param "SESSIONS")))
+; Both credential stores use .<pid>.<counter>.tmp beside their destination for atomic replacement.
+(define grok-login-files
+  (require-any
+    (literal (string-append (param "GROK_HOME") "/auth.json"))
+    (literal (string-append (param "GROK_HOME") "/auth.json.lock"))
+    (literal (string-append (param "GROK_HOME") "/mcp_credentials.json"))
+    (literal (string-append (param "GROK_HOME") "/mcp_credentials.json.lock"))
+    (regex (string-append "^" (regex-quote (param "GROK_HOME")) "/\\.[0-9]+\\.[0-9]+\\.tmp$"))))
+(allow file-write* grok-login-files)
+(deny file-write*
+  (require-all
+    (subpath (param "GROK_HOME"))
+    (require-not grok-login-files)
+    (require-not (subpath (param "SESSIONS")))))
+(allow network-outbound (remote ip "*:*"))
+(allow network-outbound
+  (remote unix-socket (path "/private/var/run/mDNSResponder")))
+(allow mach-lookup (global-name "com.apple.trustd.agent"))
+(allow sysctl-read)
+(allow process-info*)
+(deny file-read* (literal (param "KEY")) (literal (param "REAL_KEY")))
+(deny file-write*
+  (subpath (param "LORD_HOME"))
+  (subpath (param "REAL_LORD_HOME")))
+(deny mach-lookup (xpc-service-name-prefix ""))
+(deny system-fcntl (fcntl-command 80 110))
+
+(define (lord-protect-path path)
+  (deny file-write* (literal path) (subpath path)))
+(define (lord-pin-directory path)
+  (deny file-write-unlink (literal path)))

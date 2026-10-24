@@ -1,6 +1,6 @@
 {
   "gpt": {"model": "gpt-6.1-sol", "effort": "high", "no_progress_s": 0},
-  "grok": {"model": "grok-4.7", "effort": "high", "write_sandbox": "lord-workspace", "readonly_sandbox": "lord-readonly", "no_progress_s": 2400},
+  "grok": {"model": "grok-4.7", "effort": "high", "no_progress_s": 2400},
   "gemini": {"model": "gemini-4-argon", "effort": "high", "no_progress_s": 2400},
   "memory_ceiling_kb": 12582912,
   "idle_exit_s": 600,
