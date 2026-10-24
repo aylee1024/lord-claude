@@ -2983,6 +2983,71 @@ else: raise AssertionError('metadata ancestor moved past the protected path')
     assert (target / 'canary').read_text() == 'protected'
 
 
+@pytest.mark.skipif(sys.platform != 'darwin', reason='macOS Seatbelt profile')
+@pytest.mark.parametrize('operation', ['rename', 'remove'])
+def test_tests_real_seatbelt_anchors_temp_roots(tmp_path, monkeypatch, operation):
+    m = load('lordd_tests_temp_anchors')
+    work = tmp_path / 'work'; work.mkdir()
+    temp = tmp_path / 'vendor-temp'; temp.mkdir()
+    monkeypatch.setattr(m, 'codex_daemon_directory', lambda: tmp_path / 'daemon-parent/daemon')
+    profile, params = m.tests_profile(str(work), [], {'TMPDIR': str(temp) + '/'})
+    code = '''import json, pathlib, sys
+work, temp = map(pathlib.Path, sys.argv[1:3])
+operation = sys.argv[3]
+probe = temp / 'inside'
+probe.write_text('allowed'); assert probe.read_text() == 'allowed'; probe.unlink()
+try:
+ if operation == 'rename': temp.rename(work / 'moved')
+ else: temp.rmdir()
+except PermissionError: outcome = 'denied'
+else: outcome = 'allowed'
+print(json.dumps({'write': 'allowed', operation: outcome}))
+'''
+    result = subprocess.run(['/usr/bin/sandbox-exec', '-p', profile, *params, PYTHON, '-c', code, str(work), str(temp), operation],
+        cwd=work, capture_output=True, text=True, timeout=8)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {'write': 'allowed', operation: 'denied'}
+    assert temp.is_dir() and not (work / 'moved').exists()
+    values = dict(param[2:].split('=', 1) for param in params)
+    anchors = {values[name] for name in m.re.findall(r'\(lord-protect-root \(param "([^"]+)"\)\)', profile)}
+    assert {values['TMP'], values['PRIVATE_TMP']} <= anchors
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='macOS Seatbelt profile')
+def test_tests_real_seatbelt_protects_logical_lord_home_and_parent(tmp_path):
+    m = load('lordd_tests_logical_home')
+    work = tmp_path / 'work'; work.mkdir()
+    extra = tmp_path / 'extra'; extra.mkdir()
+    parent = extra / 'config'; parent.mkdir()
+    real = tmp_path / 'real-home'; real.mkdir()
+    (real / 'control.header').write_text('decoy')
+    home = parent / 'lord'; home.symlink_to(real, target_is_directory=True)
+    outside = tmp_path / 'outside'; outside.mkdir()
+    replacement = parent / 'replacement'; replacement.symlink_to(outside, target_is_directory=True)
+    m.HOME = home
+    profile, params = m.tests_profile(str(work), [str(extra)], {'TMPDIR': str(tmp_path / 'temp')})
+    code = '''import json, pathlib, sys
+work, parent, home, replacement = map(pathlib.Path, sys.argv[1:])
+(parent / 'sibling').write_text('allowed')
+result = {}
+for name, operation in [('write_under', lambda: (home / 'new').write_text('bad')),
+                        ('replace_link', lambda: replacement.replace(home)),
+                        ('rename_parent', lambda: parent.rename(work / 'moved'))]:
+ try: operation(); result[name] = 'allowed'
+ except PermissionError: result[name] = 'denied'
+print(json.dumps(result))
+'''
+    result = subprocess.run(['/usr/bin/sandbox-exec', '-p', profile, *params, PYTHON, '-c', code,
+        str(work), str(parent), str(home), str(replacement)], cwd=work, capture_output=True, text=True, timeout=8)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {name: 'denied' for name in ('write_under', 'replace_link', 'rename_parent')}
+    assert home.is_symlink() and home.resolve() == real and not (real / 'new').exists()
+    assert (parent / 'sibling').read_text() == 'allowed'
+    values = {param.split('=', 1)[1] for param in params}
+    assert {str(home), str(real)} <= values
+    assert str(home) not in profile and str(real) not in profile
+
+
 def test_tests_profile_denies_mutating_fcntls_after_grants(tmp_path):
     m = load('lordd_tests_fcntl_rule')
     profile, _ = m.tests_profile(str(tmp_path), [str(tmp_path / 'extra')], {})

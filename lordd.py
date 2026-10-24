@@ -195,7 +195,7 @@ def tests_profile(cwd, dirs, env):
     folder = HERE.parent / 'sandbox'
     profile = '\n'.join((folder / name).read_text() for name in ('seatbelt_base_policy.sbpl', 'seatbelt_preferences_policy.sbpl', 'tests.sbpl'))
     params = {'TMP': canon(env.get('TMPDIR') or '/tmp'), 'PRIVATE_TMP': '/private/tmp',
-              'KEY': canon(HOME / 'control.header'), 'LORD_HOME': canon(HOME)}
+              'KEY': canon(HOME / 'control.header'), 'LORD_HOME': canon(HOME), 'LORD_HOME_LOGICAL': os.path.abspath(HOME)}
     daemon = codex_daemon_directory()
     params['CODEX_DAEMON'] = str(daemon)
     roots = list(dict.fromkeys(canon(root) for root in [cwd, *dirs]))
@@ -211,10 +211,10 @@ def tests_profile(cwd, dirs, env):
         name = f'PROTECTED_{i}'
         params[name] = path
         profile += f'\n(lord-protect-metadata (param "{name}"))'
-    profile += '\n(lord-protect-home (param "LORD_HOME"))\n(lord-protect-daemon (param "CODEX_DAEMON"))'
+    profile += '\n(lord-protect-home (param "LORD_HOME"))\n(lord-protect-home (param "LORD_HOME_LOGICAL"))\n(lord-protect-daemon (param "CODEX_DAEMON"))'
     writable = [*roots, params['TMP'], params['PRIVATE_TMP']]
-    ancestors = set(roots) | {str(path) for path in daemon.parents}
-    for path in protected | {params['KEY'], params['LORD_HOME']}:
+    ancestors = set(writable) | {str(path) for path in daemon.parents}
+    for path in protected | {params['KEY'], params['LORD_HOME'], params['LORD_HOME_LOGICAL']}:
         ancestors.update(str(parent) for parent in Path(path).parents if inside(str(parent), writable))
     for i, path in enumerate(sorted(ancestors)):
         name = f'ANCESTOR_{i}'

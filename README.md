@@ -61,7 +61,7 @@ gpt permissions measured on macOS with codex 0.164.0 (default `workspace-write`,
 | Write outside those folders | Denied | Denied | Allowed |
 | Direct internet TCP and DNS | Denied | Denied | Allowed |
 
-`@tests` loopback reaches every local TCP service on the machine. `/bin/ps` stays blocked because it is setuid; psutil works. The daemon's Unix socket stays blocked. Writes also cover `@dir` folders; `.git`, `.codex` and `.agents` at each writable project root stay read-only, including first-time creation, as in workspace-write. Launch and turn settings say `sandbox tests`.
+`@tests` loopback reaches every local TCP service on the machine. `/bin/ps` stays blocked because it is setuid; psutil works. `@tests` denies every Unix socket because access to control sockets in temp folders, such as tmux's, could let a command act outside the sandbox; `multiprocessing.Manager` and the forkserver start method fail, while `Pool` with spawn or fork and `ProcessPoolExecutor` work. Writes also cover `@dir` folders; `.git`, `.codex` and `.agents` at each writable project root stay read-only, including first-time creation, as in workspace-write. Launch and turn settings say `sandbox tests`.
 
 Where each agent can write: gpt in its folder, `@dir` folders and temp folders (anywhere with `@nosandbox`); grok in its folder, temp folders and `~/.grok`; gemini anywhere, because agy has no sandbox. A sandbox limits one agent, not the agents it starts, so use `@readonly` when an agent must not change anything. A read-only agent cannot start or message other agents.
 
