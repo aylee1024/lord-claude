@@ -91,7 +91,8 @@ class Rig(Client):
     def __init__(self, home, idle=60):
         super().__init__(home)
         self.data = home / 'vendor'
-        self.env = dict(os.environ, LORD_HOME=str(home), LORD_DAEMON_SOCKET=str(home / 'lordd.sock'), GROK_HOME=str(home / 'grok'), PYTHONDONTWRITEBYTECODE='1',
+        self.grok_home = Path(os.environ['GROK_HOME'])
+        self.env = dict(os.environ, LORD_HOME=str(home), LORD_DAEMON_SOCKET=str(home / 'lordd.sock'), PYTHONDONTWRITEBYTECODE='1',
                         OPENAI_API_KEY='must-not-reach-vendor', SOME_TOKEN='must-not-reach-vendor',
                         ANTHROPIC_BASE_URL='must-not-reach-vendor', CLAUDE_CODE_FLAG='must-not-reach-vendor',
                         RANDOM_SECRET='must-not-reach-vendor', CUSTOM_BEARER='Bearer must-not-reach-vendor',
@@ -325,7 +326,7 @@ def test_prune_only_owned_sessions(rig):
         if row['agentId'] != 'recent':
             row['created'] = row['used'] = '2000-01-01T00:00:00+00:00'
     path.write_text(''.join(json.dumps(row) + '\n' for row in records))
-    grok_root = rig.home / 'grok/sessions' / quote(str(rig.home), safe='')
+    grok_root = rig.grok_home / 'sessions' / quote(str(rig.home), safe='')
     stranger = grok_root / 'unowned'; stranger.mkdir(parents=True)
     (stranger / 'keep').write_text('keep')
     agy_root = rig.data / '.gemini/antigravity-cli/conversations'
@@ -1031,7 +1032,7 @@ def test_a_turn_past_its_wall_clock_limit_is_stopped(rig):
 
 
 def test_grok_runs_only_under_lord_custom_profiles_that_fail_closed(rig):
-    sandbox = rig.home / 'grok/sandbox.toml'
+    sandbox = rig.grok_home / 'sandbox.toml'
     sandbox.parent.mkdir()
     sandbox.write_text('# user profile\n[profiles.mine]\nextends = "strict"\n')
     rig.open('grok', agent='w')
@@ -1039,7 +1040,7 @@ def test_grok_runs_only_under_lord_custom_profiles_that_fail_closed(rig):
     profiles = tomllib.loads(sandbox.read_text())['profiles']
     assert profiles['mine'] == {'extends': 'strict'}
     key = str((rig.home / 'control.header').resolve())
-    assert profiles['lord-workspace'] == {'extends': 'strict', 'read_only': ['/'], 'restrict_network': False, 'deny': [key]}
+    assert profiles['lord-workspace'] == {'extends': 'strict', 'read_only': ['/'], 'restrict_network': False, 'deny': profiles['lord-readonly']['deny']}
     assert profiles['lord-readonly']['extends'] == 'strict' and profiles['lord-readonly']['restrict_network'] is False
     assert profiles['lord-readonly']['read_only'] == ['/'] and 'read_write' not in profiles['lord-readonly']
     assert '/var/run/docker.sock' in profiles['lord-readonly']['deny'] and key in profiles['lord-readonly']['deny']
@@ -1053,27 +1054,32 @@ def test_grok_runs_only_under_lord_custom_profiles_that_fail_closed(rig):
 
 
 @pytest.mark.parametrize('linked_home', [False, True])
-def test_grok_profiles_confine_grok_state(tmp_path, linked_home):
+def test_grok_profiles_confine_grok_state(tmp_path, linked_home, monkeypatch):
     import tomllib
     home = tmp_path / 'grok-home'
     if linked_home:
         real = tmp_path / 'real-grok-home'; real.mkdir()
         home.symlink_to(real, target_is_directory=True)
     m = load('lordd_grok_state')
+    endpoint = tmp_path / 'container.sock'; endpoint.touch()
+    hop = tmp_path / 'socket-hop'; hop.symlink_to(endpoint.name)
+    link = tmp_path / 'socket-link'; link.symlink_to(hop.name)
+    monkeypatch.setattr(m, 'SOCKETS', (*m.SOCKETS, str(link)))
     m.grok_profiles()
     profiles = tomllib.loads((home / 'sandbox.toml').read_text())['profiles']
     key = str((m.HOME / 'control.header').resolve())
-    assert profiles['lord-workspace'] == {'extends': 'strict', 'read_only': ['/'], 'restrict_network': False, 'deny': [key]}
-    readonly = profiles['lord-readonly']
-    assert {k: v for k, v in readonly.items() if k != 'deny'} == {'extends': 'strict', 'read_only': ['/'], 'restrict_network': False}
-    assert key in readonly['deny']
-    for socket_path in m.SOCKETS:
-        assert socket_path in readonly['deny'] and os.path.realpath(socket_path) in readonly['deny']
+    assert profiles['lord-workspace'] == profiles['lord-readonly']
+    for profile in profiles.values():
+        assert {k: v for k, v in profile.items() if k != 'deny'} == {'extends': 'strict', 'read_only': ['/'], 'restrict_network': False}
+        assert key in profile['deny']
+        for socket_path in m.SOCKETS:
+            assert socket_path in profile['deny'] and os.path.realpath(socket_path) in profile['deny']
+        assert str(hop) in profile['deny']
 
 
 def test_grok_strict_profiles_preserve_user_profiles(rig):
     import tomllib
-    sandbox = rig.home / 'grok/sandbox.toml'
+    sandbox = rig.grok_home / 'sandbox.toml'
     sandbox.parent.mkdir()
     before = '# user profile\n[profiles.mine]\nextends = "strict"\n\n'
     after = '\n# another user profile\n[profiles.other]\nextends = "workspace"\nread_only = ["/data"]\n'
@@ -1099,13 +1105,24 @@ def test_readonly_grok_confines_starting_folder_to_sessions(rig, readonly_first)
     assert rig.open('grok')['vendorSession'] == opened['vendorSession']
     assert rig.turn('REMEMBER')[-1]['text'] == 'remember-this'
     launches = [e for e in rig.audit() if e.get('launch') and 'test-readonly' in e['argv']]
-    assert len(launches) == 2 and all(e['cwd'] == str((rig.home / 'grok/sessions').resolve()) for e in launches)
+    assert len(launches) == 2 and all(e['cwd'] == str((rig.grok_home / 'sessions').resolve()) for e in launches)
     sessions = [e['params'] for e in rig.audit() if e.get('method') in ('session/new', 'session/load')]
     assert all(e['cwd'] == str(rig.home.resolve()) for e in sessions)
 
 
+def test_writable_grok_starts_in_its_working_folder(rig):
+    project = rig.home / 'project'; project.mkdir()
+    opened = rig.open('grok', cwd=str(project))
+    assert rig.turn('remember-this')[-1]['type'] == 'done'
+    rig.request('/close', {'agentId': 'a'})
+    assert rig.open('grok')['vendorSession'] == opened['vendorSession']
+    assert rig.turn('REMEMBER')[-1]['text'] == 'remember-this'
+    launches = [e for e in rig.audit() if e.get('launch') and 'lord-workspace' in e['argv']]
+    assert len(launches) == 2 and all(e['cwd'] == str(project.resolve()) for e in launches)
+
+
 def test_a_sandbox_file_that_cannot_take_the_profiles_is_refused_unchanged(rig):
-    sandbox = rig.home / 'grok/sandbox.toml'
+    sandbox = rig.grok_home / 'sandbox.toml'
     sandbox.parent.mkdir()
     sandbox.write_text('profiles = {mine = {extends = "strict"}}\n')
     conn, file, status, _ = rig.connect('/open', {'agentId': 'k', 'family': 'grok', 'cwd': str(rig.home)})
@@ -1127,19 +1144,47 @@ def test_requests_without_the_control_key_are_refused_except_health_and_mcp(rig)
 
 def test_read_only_grok_is_refused_where_its_profile_leaves_writes(rig):
     var_tmp = Path(tempfile.mkdtemp(dir='/var/tmp'))
-    grok_home = rig.home / 'grok'
+    grok_home = rig.grok_home
     grok_home.mkdir()
     try:
-        for cwd in (var_tmp, grok_home):
+        for cwd, reason in ((var_tmp, 'read-only profile'), (grok_home, 'sandbox lets an agent write its whole working folder')):
             conn, file, status, _ = rig.connect('/open', {'agentId': f'r{len(str(cwd))}', 'family': 'grok', 'cwd': str(cwd), 'readonly': True})
             reply = json.loads(file.read()); file.close(); conn.close()
-            assert status == 400 and 'read-only profile' in reply['error']
+            assert status == 400 and reason in reply['error']
         # An agent opened writable in a temp folder cannot become read-only there by naming another folder.
         rig.request('/open', {'agentId': 'w', 'family': 'grok', 'cwd': str(var_tmp)})
         conn, file, status, _ = rig.connect('/open', {'agentId': 'w', 'family': 'grok', 'cwd': str(rig.home), 'readonly': True})
         file.close(); conn.close()
         assert status == 400
     finally: var_tmp.rmdir()
+
+
+@pytest.mark.parametrize('readonly', [False, True])
+@pytest.mark.parametrize('location', ['home', 'child', 'parent', 'symlink'])
+def test_grok_refuses_working_folders_overlapping_its_home(rig, readonly, location):
+    root = rig.home / 'storage'
+    home = root / 'grok'
+    child = home / 'bin'; child.mkdir(parents=True)
+    link = rig.home / 'linked-bin'; link.symlink_to(child, target_is_directory=True)
+    cwd = {'home': home, 'child': child, 'parent': root, 'symlink': link}[location]
+    rig.stop(); rig.env['GROK_HOME'] = str(home); rig.start()
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'a', 'family': 'grok', 'cwd': str(cwd), 'readonly': readonly})
+    reply = json.loads(file.read()); file.close(); conn.close()
+    assert status == 400, reply
+    assert str(cwd.resolve()) in reply['error'] and 'sandbox lets an agent write its whole working folder' in reply['error']
+    assert rig.request('/agents') == [] and not rig.data.exists()
+
+
+@pytest.mark.parametrize('readonly', [False, True])
+def test_grok_checks_its_saved_working_folder_for_home_overlap(rig, readonly):
+    project = rig.home / 'project'; project.mkdir()
+    other = rig.home / 'other'; other.mkdir()
+    rig.open('grok', cwd=str(project))
+    rig.stop(); rig.env['GROK_HOME'] = str(project / 'grok'); rig.start()
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'a', 'family': 'grok', 'cwd': str(other), 'readonly': readonly})
+    reply = json.loads(file.read()); file.close(); conn.close()
+    assert status == 400, reply
+    assert f'refusing {project.resolve()} as a grok working folder' in reply['error'] and 'sandbox lets an agent write its whole working folder' in reply['error']
 
 
 def test_a_failed_first_open_leaves_no_agent_behind(rig):
@@ -1401,11 +1446,11 @@ def test_path_refusals_ignore_letter_case_on_macos(rig):
     conn, file, status, _ = rig.connect('/open', {'agentId': 'h', 'family': 'gpt', 'cwd': str(Path.home()).upper()})
     reply = json.loads(file.read()); file.close(); conn.close()
     assert status == 400 and 'home folder' in reply['error']
-    grok_home = rig.home / 'grok'
+    grok_home = rig.grok_home
     grok_home.mkdir()
     conn, file, status, _ = rig.connect('/open', {'agentId': 'r', 'family': 'grok', 'cwd': str(grok_home).upper(), 'readonly': True})
     reply = json.loads(file.read()); file.close(); conn.close()
-    assert status == 400 and 'read-only profile' in reply['error']
+    assert status == 400 and 'sandbox lets an agent write its whole working folder' in reply['error']
 
 
 def test_a_failed_agy_listing_is_not_cached_and_ultra_stays_in_range():
@@ -1627,7 +1672,7 @@ def test_a_missing_grok_writes_no_sandbox_profiles(rig):
     conn, file, status, _ = rig.connect('/open', {'agentId': 'g', 'family': 'grok', 'cwd': str(rig.home)})
     reply = json.loads(file.read()); file.close(); conn.close()
     assert status != 200 and 'was not found' in reply['error'] and 'x.ai/cli/install.sh' in reply['error']
-    assert not (rig.home / 'grok' / 'sandbox.toml').exists()
+    assert not (rig.grok_home / 'sandbox.toml').exists()
 
 
 def test_health_reports_the_plugin_version(rig):
