@@ -23,8 +23,8 @@ answer becomes the agent's reply. No Claude tokens are spent on these turns.
 `.claude-plugin/{plugin,marketplace}.json`, `hooks/{hooks.json,register.tsx}`, `agents/{gpt,grok,gemini}.md`
 (`tools: Agent, SendMessage`; `effort: high`; `model: haiku` is never called, and its prompt makes any fallback reply a
 visible `lord: error` line), `lordd.py`, `config.json` (defaults; `~/.claude/lord/config.json` is merged over it per
-family), `tests/`, `README.md`, `PRIVACY.md`, `LICENSE`.
-Runtime files only in `~/.claude/lord/`: `lordd-<version>.sock` (600, folder 700) and `lordd-<version>.lock`, one pair per
+family), `tests/`, `sandbox/` (the two upstream Seatbelt policies, their `NOTICE` and Apache-2.0 license, and Lord's `tests.sbpl`), `README.md`, `PRIVACY.md`, `LICENSE`.
+Runtime files only in `~/.claude/lord/`: `exec/<agentId>/` (0700 exec-server home for each `@tests` agent, temporary arg0 aliases only, removed with the agent, see below); `lordd-<version>.sock` (600, folder 700) and `lordd-<version>.lock`, one pair per
 plugin version, since each version's plugin starts and talks to its own daemon (`LORD_DAEMON_SOCKET` overrides; daemons
 before 2.0.18 used `lordd.sock` and `lordd.lock`); `journal.jsonl` (one record per agent save: ids, vendor session, model,
 effort, cwd, options, last usage, created, used; never task text), shared by every daemon from 2.0.18: appends and
@@ -74,7 +74,7 @@ can reach them; grok's Lord profiles deny reading it); without it the reply is 4
 | Method | Path | Body | Reply |
 |---|---|---|---|
 | GET | /health | - | `{ok, pid, version}` (`version` from the daemon's own plugin.json) |
-| POST | /open | `{agentId, family, cwd, version?, session?, model?, effort?, readonly?, net?, nosandbox?, dirs?, memory_gb?, hang_s?, wall_s?, tools?, nice?}` | `{vendorSession, model, effort, cwd, dirs, sandbox, network, tools, nice, memory_gb, hang_s, wall_s, codexHome?, line}`, the effective settings with defaults (`line`: the same as one line); idempotent; a refusal is logged in `lordd.log` as `<agentId>: open refused: <reason>`, a missing or relative `@dir` named; a different `nice` (0 to 19, absolute) restarts the vendor under `/usr/bin/nice -n <nice minus the daemon's own niceness>`, or plain when the daemon's is already that high; resumes after a daemon restart from the journal. A new agent whose configured default model the vendor does not list gets the vendor's own default (codex `isDefault`, grok's current `model` option, agy's first listed model), logged. A later `readonly`, `net`, `nosandbox`, `tools` or new `dirs` restarts the vendor session before the next turn. Refused with the reason: a named model the vendor does not list (the vendor's list), `dirs` for grok/gemini, `nosandbox` for grok/gemini or with `readonly`, `readonly` for gemini, for gpt with `net`, or for grok under a temp folder or `~/.grok` (an existing agent is judged by its own folder), `/` or the home folder as cwd |
+| POST | /open | `{agentId, family, cwd, version?, session?, model?, effort?, readonly?, net?, nosandbox?, tests?, dirs?, memory_gb?, hang_s?, wall_s?, tools?, nice?}` | `{vendorSession, model, effort, cwd, dirs, sandbox, network, tools, nice, memory_gb, hang_s, wall_s, codexHome?, line}`, the effective settings with defaults (`line`: the same as one line; gpt `nosandbox` reports `network: true` and `network on` even without `net`); idempotent; a refusal is logged in `lordd.log` as `<agentId>: open refused: <reason>`, a missing or relative `@dir` named; a different `nice` (0 to 19, absolute) restarts the vendor under `/usr/bin/nice -n <nice minus the daemon's own niceness>`, or plain when the daemon's is already that high; resumes after a daemon restart from the journal. A new agent whose configured default model the vendor does not list gets the vendor's own default (codex `isDefault`, grok's current `model` option, agy's first listed model), logged. A later `readonly`, `net`, `nosandbox`, `tests`, `tools` or new `dirs` restarts the vendor session before the next turn. Refused with the reason: a named model the vendor does not list (the vendor's list), `dirs` for grok/gemini, `nosandbox` for grok/gemini or with `readonly`, `tests` for any family but gpt or with `readonly`, `nosandbox` or `net` (inherited options included), `readonly` for gemini, for gpt with `net`, or for grok under a temp folder or `~/.grok` (an existing agent is judged by its own folder), `/` or the home folder as cwd |
 | POST | /turn | `{agentId, text, model?, effort?, rows?}` | NDJSON stream; if the agent has a running or undelivered turn (its client went away), that turn streams first (a pending lord tool call is offered again, its queued steps and text are dropped) and this text starts when it ends, its done text prefixed with the earlier result. An interrupted turn leaves nothing to deliver |
 | POST | /continue | `{agentId, rows?}` | NDJSON stream of the same turn after a tool result or a row |
 | POST | /row | `{agentId, rowId}` | `{output, stopped}` once the vendor reports the step finished, or the turn ends (`stopped` when it ended in an error or a stop); `output` is the step's output, redacted, its last 2,000 characters with a line counting the rest |
@@ -107,7 +107,7 @@ waits undelivered, for up to `keep_undelivered_s` (a day).
 
 ## Vendor setup
 - codex: `codex app-server` per agent; `thread/start|resume` with cwd, `approvalPolicy: never`, sandbox
-  `workspace-write` (writable roots = cwd + `dirs`), `read-only`, or `danger-full-access` with `nosandbox`, network per `net`, the lord MCP server, and the
+  `workspace-write` (writable roots = cwd + `dirs`), `read-only`, or `danger-full-access` with `nosandbox` (network on), otherwise network per `net`, the lord MCP server, and the
   user's codex MCP servers, codex plugins and notifier disabled unless `tools`; without `tools` also
   `skills: {include_instructions: false, bundled: {enabled: false}}` (codex lists skills from its skills folder and plugin
   caches, the remote ones included, which the plugin switch-off misses), and for `readonly` `features: {multi_agent: false, multi_agent_v2: false}` and `agents: {enabled: false}`
@@ -139,6 +139,39 @@ waits undelivered, for up to `keep_undelivered_s` (a day).
   `ANTHROPIC_*`, `CLAUDE_CODE_*`, bearer values, whatever their prefix; the daemon's own settings (agent id, MCP token,
   grok import switches) are added after the scrub. Subscription logins only; auth files are
   never read.
+
+## gpt `@tests`
+`@tests` is gpt only and cannot coexist with `@readonly`, `@nosandbox` or `@net`, including an option kept from an earlier turn. The mod refuses a launch and a later turn with a message naming the clash; the daemon checks independently at `/open`, before any process starts or record changes. Like `@nosandbox`, `tests` can only turn on, is journalled, and restarts the vendor. Its effective `/open` `sandbox` and the existing launch and turn settings line say `tests` (`sandbox tests`). A running agent's `@tests` message waits for the next mod `/open` rather than being steered or queued past it.
+
+Each such vendor owns two process trees: its normal, unconfined app-server (account connection and Lord MCP), and a sandboxed exec-server (commands and edits, including codex helpers). Start sequence:
+
+1. Start the configured codex program as `codex exec-server --listen ws://127.0.0.1:0 --ws-auth capability-token --ws-token-sha256 <SHA-256 hex of fresh UUID token>` under `/usr/bin/sandbox-exec -p <inline profile text> -D<NAME>=<path> ...`. When needed, `/usr/bin/nice -n <requested minus daemon niceness>` precedes **sandbox-exec**, so it takes effect before Seatbelt denies priority changes. Both processes run in the agent's cwd at the same niceness. The exec-server inherits the scrubbed vendor environment minus `LORD_MCP_TOKEN` and `LORD_DAEMON_SOCKET`, with `CODEX_HOME=<LORD_HOME>/exec/<agentId>` (normally `~/.claude/lord/exec/<agentId>`). Each agent has its own folder, created and chmodded 0700; `tmp/arg0-macos` is created before entering the sandbox. It has no login or conversation links. Codex's arg0 janitor removes stale alias directories whose `.lock` can be acquired on each start; active locks stay. Profiles are never written to disk.
+2. Wait at most 10 seconds for the exec-server's first stdout line, accepting only `ws://127.0.0.1:<port>` with a valid nonzero port. Missing, invalid or late output fails startup with an `@tests exec-server` reason, cleaning up both trees. Drain later stdout and stderr to the daemon log; an unexpected exec-server exit stops its app-server too.
+3. After app-server `initialize` (experimental API) and `initialized`, call `environment/add {environmentId, execServerUrl, authBearerToken}` with the fresh environment id, returned URL and unhashed token. The token is only an RPC value, never a command argument or prompt, and is registered with the daemon's redactor.
+4. `thread/start` and `thread/resume` omit `sandbox` and carry `environments: [{environmentId, cwd: <agent cwd>}]`. All other thread settings and Lord MCP remain as above.
+5. Every `turn/start` carries the same `environments` and `sandboxPolicy: {type: "externalSandbox", networkAccess: "restricted"}`. The task text, schemas and answers gain no explanatory text or instructions.
+
+Profile assembly is in `tests_profile`: `sandbox/seatbelt_base_policy.sbpl` and `seatbelt_preferences_policy.sbpl`, verbatim from OpenAI codex tag `rust-v0.164.0` with source and Apache-2.0 notices, then `sandbox/tests.sbpl`. The last file contains these rules:
+
+```scheme
+(allow file-read*)
+(allow file-write* (subpath (param "TMP")) (subpath (param "PRIVATE_TMP")) (subpath (param "EXEC_TMP")))
+(allow network-bind (local ip "*:*"))
+(allow network-inbound (local ip "localhost:*"))
+(allow network-outbound (remote ip "localhost:*"))
+(allow sysctl-read)
+(allow process-info*)
+(deny file-read* (literal (param "KEY")))
+(deny file-read-data (literal (param "KEY")))
+(deny mach-lookup (xpc-service-name-prefix ""))
+(define (lord-writable-root root) (allow file-write* (subpath root)))
+(define (lord-protect-root root) (deny file-write-unlink (literal root)))
+(define (lord-protect-metadata path) (deny file-write* (literal path) (subpath path)))
+```
+
+`TMP` is the real vendor TMPDIR (or `/tmp`), `PRIVATE_TMP` is `/private/tmp`, `EXEC_TMP` is that agent's real `exec/<agentId>/tmp/arg0-macos`, and `KEY` is the real `control.header`. For cwd and each `@dir`, append only `(lord-writable-root (param "ROOT_n"))` and `(lord-protect-root (param "ROOT_n"))`; for each root's `.git`, `.codex` and `.agents`, append `(lord-protect-metadata (param "PROTECTED_n"))` for both its name and resolved target. All paths are `-D` values, never inserted into profile code. Metadata denies also cover absent directories, symlink targets and overlapping writable roots, mirroring `protected_metadata_names_for_writable_root` in codex's `seatbelt.rs`; root unlink protection prevents replacing a boundary. The separate key `file-read-data` deny is required on macOS even with the `file-read*` deny. AF_UNIX has no network allow: commands cannot reach Lord's daemon socket. Loopback TCP reaches every local TCP service, not just the exec-server. Setuid `/bin/ps` stays denied; psutil process lookups work.
+
+The exec-server belongs to the vendor for every measure and stop: memory adds both trees' RSS, and descendant tracking covers both. Close, crash, idle close, memory/hang/wall guards, interrupt restart, prune and daemon shutdown kill both groups and descendants through `kill_tree`. Turning on `tests`, changing `nice`, or adding `dirs` restarts both trees before the next turn, resuming the same saved thread. No profile files are created. Each profile grants writes only to its own exec home's `tmp/arg0-macos`, so one agent cannot plant aliases on another's PATH. Pruning removes `exec/<agentId>` with the agent's other files. Under `journal.lock`, the sweep also removes any `exec/<id>` folder whose exact id has no in-memory or journal record and whose modification time is older than the prune period; a missing `logs/` folder does not skip this sweep.
 
 ## Guards (config.json)
 Every `guard_interval_s` (5 s): an agent's whole process tree over `memory_ceiling_kb` (12 GB), or no vendor output for
@@ -196,7 +229,7 @@ goes as an `@model` first line); `send_message(to, text)` becomes SendMessage; `
   start an agent-team teammate in its own Claude process.
 - Turn text from `turn.start`, with the Workflow header, the coordinator envelope and task notifications unwrapped.
   First-line directives, removed before the vendor reads the text: `@model <id>`, `@effort <level>` (persists; beats
-  the Agent call's effort, which only reaches low to max), `@readonly`, `@net`, `@cwd <path>`
+  the Agent call's effort, which only reaches low to max), `@readonly`, `@net`, `@nosandbox`, `@tests`, `@cwd <path>`
   (first turn only; a different one later is an error), `@dir <path>` (repeatable), `@memory <GB>`, `@hang <seconds>`, `@wall <seconds>`, `@nice <0-19>`, `@tools` (the user's own vendor
   skills, tool servers and grok's Claude imports, which a new process loads). A line `@<letters>` with at most one value
   that is no directive, a repeated directive other than `@dir`, or a directive written wrongly is an error: an Agent call

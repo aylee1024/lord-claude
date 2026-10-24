@@ -2,6 +2,7 @@
 import asyncio
 import contextlib
 import fcntl
+import hashlib
 import importlib.util
 import json
 import os
@@ -32,6 +33,8 @@ def grok_home(tmp_path, monkeypatch):
     monkeypatch.setenv('LORD_HOME', str(tmp_path / 'lord-home'))
     # The user's codex folder in tests is the vendor data folder's .codex.
     monkeypatch.delenv('CODEX_HOME', raising=False); monkeypatch.delenv('CODEX_SQLITE_HOME', raising=False)
+    for vendor in ('CLAUDE', 'CURSOR'):
+        for cell in ('MCPS', 'HOOKS', 'SKILLS'): monkeypatch.delenv(f'GROK_{vendor}_{cell}_ENABLED', raising=False)
 
 
 def test_daemon_exists():
@@ -2238,7 +2241,7 @@ def test_an_interrupt_while_a_retry_is_being_sent_still_stops_codexs_turn():
                 return {'turn': {'id': 't2'}}
             if method == 'turn/interrupt': a.emit('error', message='interrupted', retryable=False)
             return {}
-        v = types.SimpleNamespace(last=0, rpc=rpc, close=AsyncMock(), process=None)
+        v = types.SimpleNamespace(last=0, exec_process=None, rpc=rpc, close=AsyncMock(), process=None)
         d.backend = lambda agent: v
         a.retry_task = asyncio.create_task(d.retry(a, 0))
         await sent.wait()
@@ -2403,7 +2406,7 @@ def test_an_interrupt_right_after_at_capacity_cancels_the_retry_at_once(monkeypa
         async def kill_tree(process, known=()): killed.append(process)
         monkeypatch.setattr(m, 'kill_tree', kill_tree)
         async def rpc(method, params): return {}
-        v = types.SimpleNamespace(last=0, rpc=rpc, process=None, close=None)
+        v = types.SimpleNamespace(last=0, exec_process=None, rpc=rpc, process=None, close=None)
         d.backend = lambda agent: v
         # codex's "at capacity" schedules the retry; the interrupt is handled before the retry task first runs.
         m.Vendor(d, 'gpt', a).failed(a, {'message': 'Selected model is at capacity', 'codexErrorInfo': 'serverOverloaded'}, 'failed', 't1')
@@ -2422,7 +2425,7 @@ def test_a_retry_keeps_the_turns_wall_clock_and_its_wait_is_not_silence(monkeypa
         a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '/w', 'model': 'gpt-6.1-sol', 'vendorSession': 's', 'hang_s': 5})
         a.state, a.turn_body, a.started = 'running', {'text': 'work'}, 100.0
         async def rpc(method, params): return {'turn': {'id': 't2'}}
-        v = types.SimpleNamespace(last=0, rpc=rpc, agent=a, process=types.SimpleNamespace(pid=999999, returncode=None), reason=None, descendants=set())
+        v = types.SimpleNamespace(last=0, exec_process=None, rpc=rpc, agent=a, process=types.SimpleNamespace(pid=999999, returncode=None), reason=None, descendants=set())
         d.backend, d.vendors = (lambda agent: v), {'a': v}
         await d.retry(a, 0)
         kept = a.started
@@ -2465,7 +2468,7 @@ def test_a_turn_id_codex_already_ended_is_never_taken_back():
         # codex's start response arrives after the same turn already failed "at capacity" (failed() ended it).
         a.ended_turns.add('t1')
         async def rpc(method, params): return {'turn': {'id': 't1'}}
-        d.backend = lambda agent: types.SimpleNamespace(last=0, rpc=rpc)
+        d.backend = lambda agent: types.SimpleNamespace(last=0, exec_process=None, rpc=rpc)
         await d.run_turn(a, {'text': 'work'})
         return a.turn_id
     assert asyncio.run(main()) is None
@@ -2481,7 +2484,7 @@ def test_a_pending_retry_ends_with_its_turn_and_never_reaches_a_later_one(monkey
         async def rpc(method, params):
             starts.append(params['input'][0]['text'])
             return {'turn': {'id': 'n'}}
-        d.backend = lambda agent: types.SimpleNamespace(last=0, rpc=rpc)
+        d.backend = lambda agent: types.SimpleNamespace(last=0, exec_process=None, rpc=rpc)
         m.Vendor(d, 'gpt', a).failed(a, {'message': 'at capacity', 'codexErrorInfo': 'serverOverloaded'}, 'failed', 't1')
         # The turn ends another way (the wall-clock guard) while the retry waits; a new turn then runs.
         a.emit('error', message='stopped: the turn ran past its 60 s wall-clock limit', retryable=True)
@@ -2541,7 +2544,7 @@ def test_a_retry_whose_turn_was_replaced_while_it_waited_sends_nothing():
         a.state, a.turn_body = 'running', {'text': 'old task'}
         starts = []
         async def rpc(method, params): starts.append(params['input'][0]['text']); return {'turn': {'id': 'n'}}
-        d.backend = lambda agent: types.SimpleNamespace(last=0, rpc=rpc)
+        d.backend = lambda agent: types.SimpleNamespace(last=0, exec_process=None, rpc=rpc)
         waiting = asyncio.create_task(d.retry(a, .1))
         await asyncio.sleep(.02)
         a.turn_body = {'text': 'new task'}
@@ -2605,3 +2608,359 @@ def test_the_sweep_names_an_agents_files_exactly_and_works_under_the_journal_loc
     # 'live' is not an agent: its file goes. Only an agent's own file names count, and nothing else in logs/ is touched.
     assert sorted(removed) == [('gone.answers', True), ('gone.json', True), ('live.json', True)]
     assert sorted(p.name for p in logs.iterdir()) == ['live.review.answers', 'live.review.json', 'live.review.log', 'notes.txt', 'other.log.1']
+
+
+@pytest.fixture
+def tests_backend(rig, monkeypatch):
+    d = local_daemon(rig, monkeypatch)
+    # local_daemon loads a fresh module without registering it in sys.modules.
+    m = d.open.__func__.__globals__
+    real = asyncio.create_subprocess_exec
+    launched = []
+    async def start(*argv, **kw):
+        launched.append((argv, kw))
+        if '/usr/bin/sandbox-exec' in argv:
+            at = argv.index('/usr/bin/sandbox-exec')
+            i = at + 3
+            while argv[i].startswith('-D'): i += 1
+            argv = (*argv[:at], *argv[i:])
+        return await real(*argv, **kw)
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', start)
+    return d, m, launched
+
+
+def test_tests_wiring_settings_environment_and_resume(tests_backend, rig):
+    d, m, launched = tests_backend
+    async def scenario():
+        try:
+            opened = await d.open({'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home), 'tests': True, 'nice': 12})
+            assert opened['sandbox'] == 'tests' and 'sandbox tests' in opened['line'] and opened['network'] is False
+            a = d.agents['a']; v = d.backend(a)
+            await d.begin(a, {'text': 'PING'})
+            await asyncio.wait_for(a.finished.wait(), 3)
+            audit = rig.audit()
+            methods = [e.get('method') for e in audit if e['pid'] == v.process.pid and e.get('method')]
+            assert methods.index('initialize') < methods.index('environment/add') < methods.index('thread/start')
+            env = next(e['params'] for e in audit if e.get('method') == 'environment/add')
+            ex = next(e for e in audit if e.get('exec_launch'))
+            argv = next(argv for argv, _ in launched if '/usr/bin/sandbox-exec' in argv)
+            step = 12 - os.getpriority(os.PRIO_PROCESS, 0)
+            assert argv[:4] == ('/usr/bin/nice', '-n', str(step), '/usr/bin/sandbox-exec') if step > 0 else argv[0] == '/usr/bin/sandbox-exec'
+            assert ex['cwd'] == str(rig.home.resolve()) and ex['nice'] == max(12, os.getpriority(os.PRIO_PROCESS, 0))
+            assert ex['mcp_env'] == {} and ex['env'] == {} and ex['codex_home'] == str(d.journal.parent / 'exec/a')
+            assert (Path(ex['codex_home']).stat().st_mode & 0o777) == 0o700
+            args = ex['argv']
+            assert args[args.index('--listen') + 1] == 'ws://127.0.0.1:0'
+            assert args[args.index('--ws-auth') + 1] == 'capability-token'
+            assert args[args.index('--ws-token-sha256') + 1] == hashlib.sha256(env['authBearerToken'].encode()).hexdigest()
+            assert env['authBearerToken'] not in args
+            entries = [{'environmentId': env['environmentId'], 'cwd': a.cwd}]
+            thread = next(e['params'] for e in audit if e.get('method') == 'thread/start')
+            turn = next(e['params'] for e in audit if e.get('method') == 'turn/start')
+            assert thread['environments'] == turn['environments'] == entries
+            assert turn['sandboxPolicy'] == {'type': 'externalSandbox', 'networkAccess': 'restricted'}
+            assert turn['input'] == [{'type': 'text', 'text': 'PING'}]
+            assert 'sandbox tests' in a.log_path.read_text()
+            await v.close()
+            a.generation = 0
+            await d.attach(a)
+            resumed = [e['params'] for e in rig.audit() if e.get('method') == 'thread/resume'][-1]
+            assert resumed['environments'] == [{'environmentId': v.environment_id, 'cwd': a.cwd}]
+            assert len([e for e in rig.audit() if e.get('exec_launch')]) == 2
+            assert not list(d.journal.parent.rglob('*.sbpl'))
+        finally: await d.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('family,clash', [('grok', None), ('gemini', None), *[('gpt', c) for c in ('readonly', 'nosandbox', 'net')]])
+def test_tests_rejects_families_and_clashes_before_start(rig, family, clash):
+    body = {'agentId': 'a', 'family': family, 'cwd': str(rig.home), 'tests': True, **({clash: True} if clash else {})}
+    conn, file, status, _ = rig.connect('/open', body)
+    try:
+        error = json.loads(file.read()).get('error', '')
+        assert status == 400 and '@tests' in error and ('@' + clash if clash else 'gpt only') in error
+    finally: file.close(); conn.close()
+    assert not rig.data.exists(), 'a refused option started a vendor'
+
+
+@pytest.mark.parametrize('clash', ['readonly', 'nosandbox', 'net'])
+@pytest.mark.parametrize('first_tests', [False, True])
+def test_tests_rejects_inherited_clashes(tests_backend, rig, clash, first_tests):
+    d, _, _ = tests_backend
+    async def scenario():
+        try:
+            body = {'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home)}
+            await d.open({**body, **({'tests': True} if first_tests else {clash: True})})
+            with pytest.raises(ValueError, match='@tests.*@' + clash):
+                await d.open({**body, **({clash: True} if first_tests else {'tests': True})})
+        finally: await d.close()
+    asyncio.run(scenario())
+
+
+def test_tests_later_enable_is_sticky_and_start_options_restart_both(tests_backend, rig):
+    d, _, _ = tests_backend
+    async def scenario():
+        try:
+            body = {'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home)}
+            await d.open(body)
+            v = d.backend(d.agents['a']); original = v.process
+            await d.open({**body, 'tests': True})
+            assert original.returncode is not None and v.exec_process is not None
+            for change in ({'nice': 15}, {'dirs': [str(rig.data)]}):
+                app, ex = v.process, v.exec_process
+                await d.open({**body, **change})
+                assert app.returncode is not None and ex.returncode is not None
+                assert v.process is not app and v.exec_process is not ex
+            app, ex = v.process, v.exec_process
+            await d.open({**body, 'tests': False})
+            assert v.process is app and v.exec_process is ex
+            assert d.agents['a'].record['tests'] is True
+            await d.open({**body, 'agentId': 'b', 'tests': True})
+            assert {e['codex_home'] for e in rig.audit() if e.get('exec_launch')} == {str(d.journal.parent / 'exec' / aid) for aid in ('a', 'b')}
+        finally: await d.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('stop', ['close', 'crash', 'memory', 'hang', 'wall', 'interrupt', 'shutdown', 'exec-crash', 'idle'])
+def test_tests_exec_server_tree_dies_with_vendor(tests_backend, rig, stop):
+    d, m, _ = tests_backend
+    async def scenario():
+        try:
+            await d.open({'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home), 'tests': True})
+            a = d.agents['a']; v = d.backend(a)
+            app, ex = v.process, v.exec_process
+            child = next(e['child'] for e in rig.audit() if e.get('exec_launch'))
+            await d.guard(time.monotonic())
+            if stop == 'crash': await d.begin(a, {'text': 'CRASH'})
+            elif stop == 'close': await d.route('POST', '/close', {'agentId': 'a'})
+            elif stop == 'shutdown': await d.close()
+            elif stop == 'exec-crash':
+                await d.begin(a, {'text': 'SLOW'})
+                while not a.turn_id: await asyncio.sleep(.01)
+                v.reason = 'stopped: test guard'
+                ex.kill()
+            elif stop == 'idle':
+                v.last = 0
+                await d.guard(time.monotonic())
+            else:
+                await d.begin(a, {'text': 'SLOW'})
+                while not a.turn_id: await asyncio.sleep(.01)
+                if stop == 'interrupt': await d.interrupt(a)
+                else:
+                    if stop == 'memory':
+                        # Only the exec-server's RSS crosses the limit.
+                        async def table(): return {ex.pid: [child]}, {ex.pid: 2000, child: 500}
+                        m['process_table'] = table
+                        a.record['memory_gb'] = .001
+                    elif stop == 'hang': a.record['hang_s'] = .01; v.last = 0
+                    else: a.record['wall_s'] = .01; a.started = 0
+                    await d.guard(time.monotonic())
+            await asyncio.wait_for(app.wait(), 4)
+            await asyncio.wait_for(ex.wait(), 4)
+            if stop == 'exec-crash':
+                await asyncio.wait_for(a.finished.wait(), 4)
+                events = []
+                while not a.events.empty(): events.append(a.events.get_nowait())
+                assert events[-1]['message'] == 'stopped: test guard'
+            deadline = time.monotonic() + 4
+            while True:
+                try: os.kill(child, 0)
+                except ProcessLookupError: break
+                assert time.monotonic() < deadline, 'exec-server left a command running'
+                await asyncio.sleep(.02)
+        finally: await d.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('failure', ['--exec-eof', '--exec-invalid', '--exec-silent', '--fail-environment'])
+def test_tests_failed_start_is_bounded_and_reaps_both(tests_backend, rig, failure):
+    d, m, _ = tests_backend
+    m['EXEC_START_TIMEOUT'] = 1
+    d.config['gpt']['program'].append(failure)
+    async def scenario():
+        try:
+            started = time.monotonic()
+            with pytest.raises(RuntimeError, match='exec-server|environment refused') as failed:
+                await d.open({'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home), 'tests': True})
+            expected = {'--exec-eof': 'closed stdout', '--exec-invalid': 'not a URL', '--exec-silent': 'within 1 s', '--fail-environment': 'environment refused'}
+            assert expected[failure] in str(failed.value)
+            assert time.monotonic() - started < 4
+            assert not d.agents
+            for event in rig.audit():
+                if event.get('exec_launch') or event.get('launch'):
+                    for pid in [event['pid'], *([event['child']] if event.get('exec_launch') else [])]:
+                        with pytest.raises(ProcessLookupError): os.kill(pid, 0)
+        finally: await d.close()
+    asyncio.run(scenario())
+
+
+def test_tests_profile_uses_parameters_and_protects_resolved_metadata(tmp_path, monkeypatch):
+    m = load('lordd_tests_profile')
+    work = tmp_path / 'work " (odd)'; work.mkdir()
+    extra = tmp_path / 'extra'; extra.mkdir()
+    target = extra / 'gitdata'; target.mkdir()
+    (work / '.git').symlink_to(target, target_is_directory=True)
+    key = tmp_path / 'actual-key'; key.write_text('decoy')
+    m.HOME.mkdir(); (m.HOME / 'control.header').symlink_to(key)
+    temp = tmp_path / 'temp'; temp.mkdir()
+    profile, params = m.tests_profile(str(work), [str(extra)], {'TMPDIR': str(temp), 'CODEX_HOME': str(m.HOME / 'exec/a')})
+    assert str(work) not in profile and str(extra) not in profile and str(key) not in profile
+    assert all(p.startswith('-D') for p in params)
+    assert {str(p.resolve()) for p in (work, extra, temp, key, target)} <= {p.split('=', 1)[1] for p in params}
+    assert '(deny file-read*' in profile and '(deny file-read-data' in profile
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='macOS Seatbelt profile')
+@pytest.mark.parametrize('metadata_exists', [False, True])
+def test_tests_real_seatbelt_permissions(tmp_path, metadata_exists):
+    m = load('lordd_real_tests_profile')
+    work = tmp_path / 'work'; work.mkdir()
+    extra = tmp_path / 'extra'; extra.mkdir()
+    temp = tmp_path / 'temp'; temp.mkdir()
+    outside = tmp_path / 'outside'; outside.mkdir()
+    m.HOME = outside
+    (outside / 'control.header').write_text('decoy')
+    gitdata = extra / 'gitdata'; gitdata.mkdir()
+    (work / '.git').symlink_to(gitdata, target_is_directory=True)
+    if metadata_exists:
+        for root in (work, extra):
+            for name in ('.git', '.codex', '.agents'):
+                if not (root / name).exists(): (root / name).mkdir()
+    listener = socket.socket(socket.AF_UNIX)
+    # A short socket path under the suite's own basetemp.
+    endpoint = str(tmp_path.parents[0] / ('s' + str(os.getpid())))
+    listener.bind(endpoint); listener.listen()
+    code = r'''
+import json, os, pathlib, socket, subprocess, sys
+work, extra, temp, outside, endpoint = map(pathlib.Path, sys.argv[1:])
+s = socket.socket(); s.bind(('127.0.0.1', 0)); s.listen()
+c = socket.create_connection(s.getsockname(), timeout=2); a, _ = s.accept(); c.send(b'x'); assert a.recv(1) == b'x'
+assert subprocess.run(['/usr/sbin/sysctl', '-n', 'kern.boottime'], capture_output=True).returncode == 0
+for root in (work, extra, temp): (root / 'ok').write_text('ok')
+for path in (outside / 'no', outside / 'control.header', extra / 'gitdata/no', *[root / name / 'no' for root in (work, extra) for name in ('.git', '.codex', '.agents')]):
+ try:
+  if path.name == 'control.header': path.read_text()
+  else: path.parent.mkdir(exist_ok=True); path.write_text('bad')
+ except PermissionError: pass
+ else: raise AssertionError(str(path) + ' allowed')
+try: socket.socket(socket.AF_UNIX).connect(str(endpoint))
+except PermissionError: pass
+else: raise AssertionError('unix socket allowed')
+try: assert subprocess.run(['/bin/ps', '-p', '1'], capture_output=True).returncode != 0
+except PermissionError: pass
+print('profile ok')
+'''
+    try:
+        profile, params = m.tests_profile(str(work), [str(extra)], {'TMPDIR': str(temp), 'CODEX_HOME': str(m.HOME / 'exec/a')})
+        result = subprocess.run(['/usr/bin/sandbox-exec', '-p', profile, *params, PYTHON, '-c', code, str(work), str(extra), str(temp), str(outside), endpoint], cwd=work, capture_output=True, text=True, timeout=8)
+        assert result.returncode == 0, result.stdout + result.stderr
+    finally: listener.close(); Path(endpoint).unlink(missing_ok=True)
+
+
+def test_the_gpt_description_grows_no_longer_with_its_options():
+    # The description is in every Claude Code session's context, so a new option replaces words rather than adding them.
+    line = next(line for line in (ROOT / "agents/gpt.md").read_text().splitlines() if line.startswith("description: "))
+    assert len(json.loads(line.removeprefix("description: "))) <= 975
+
+
+def test_tests_exec_homes_are_per_agent(tests_backend, rig):
+    d, _, _ = tests_backend
+    async def scenario():
+        try:
+            for aid in ('a', 'b'):
+                await d.open({'agentId': aid, 'family': 'gpt', 'cwd': str(rig.home), 'tests': True})
+            homes = [Path(e['codex_home']) for e in rig.audit() if e.get('exec_launch')]
+            assert homes == [d.journal.parent / 'exec' / aid for aid in ('a', 'b')]
+            assert all(home.stat().st_mode & 0o777 == 0o700 for home in homes)
+        finally: await d.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='macOS Seatbelt profile')
+def test_tests_exec_profiles_cannot_write_other_agents_aliases(tests_backend, rig):
+    d, _, launched = tests_backend
+    async def scenario():
+        try:
+            for aid in ('a', 'b'):
+                cwd = rig.home / aid; cwd.mkdir()
+                await d.open({'agentId': aid, 'family': 'gpt', 'cwd': str(cwd), 'tests': True})
+            profiles, aliases = {}, {}
+            for argv, kw in launched:
+                if '/usr/bin/sandbox-exec' not in argv: continue
+                at = argv.index('/usr/bin/sandbox-exec')
+                end = at + 3
+                while argv[end].startswith('-D'): end += 1
+                aid = kw['env']['LORD_AGENT_ID']
+                profiles[aid] = (argv[at:end], kw)
+                aliases[aid] = Path(kw['env']['CODEX_HOME']) / 'tmp/arg0-macos' / f'codex-arg0-{aid}'
+                aliases[aid].mkdir()
+            code = '''import pathlib, sys
+own, other = map(pathlib.Path, sys.argv[1:])
+(own / 'apply_patch').write_text('own alias')
+try: (other / 'apply_patch').write_text('planted alias')
+except PermissionError: pass
+else: raise AssertionError("another agent's alias folder is writable")
+'''
+            for aid, other in (('a', 'b'), ('b', 'a')):
+                argv, kw = profiles[aid]
+                result = subprocess.run([*argv, PYTHON, '-c', code, str(aliases[aid]), str(aliases[other])],
+                    cwd=kw['cwd'], env=kw['env'], capture_output=True, text=True, timeout=8)
+                assert result.returncode == 0, result.stdout + result.stderr
+        finally: await d.close()
+    asyncio.run(scenario())
+
+
+def test_tests_prune_removes_the_agents_exec_home(tests_backend, rig):
+    d, _, _ = tests_backend
+    async def scenario():
+        try:
+            await d.open({'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home), 'tests': True})
+            home = d.journal.parent / 'exec/a'
+            home.mkdir(parents=True, exist_ok=True)
+            (home / 'alias').write_text('stale')
+            assert (await d.prune(0))['pruned'] == ['a']
+            assert not home.exists()
+        finally: await d.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('with_logs', [False, True])
+def test_tests_sweep_removes_only_old_unrecorded_exec_homes_under_lock(tmp_path, monkeypatch, with_logs):
+    m = load('lordd_exec_sweep')
+    root = m.HOME / 'exec'; root.mkdir(parents=True)
+    if with_logs: (m.HOME / 'logs').mkdir()
+    for aid in ('gone', 'live', 'live.review', 'journal-only', 'legacy-only', 'recent'):
+        home = root / aid; home.mkdir()
+        (home / 'alias').write_text('kept until sweep')
+        if aid != 'recent': os.utime(home, (0, 0))
+    (root / 'notes.txt').write_text('not a home'); os.utime(root / 'notes.txt', (0, 0))
+    d = object.__new__(m.Daemon)
+    d.agents = {'live.review': object()}
+    d.journal, d.legacy_journal = m.HOME / 'journal.jsonl', m.HOME / 'sessions.jsonl'
+    d.journal.write_text(json.dumps({'agentId': 'journal-only'}) + '\n')
+    d.legacy_journal.write_text(json.dumps({'agentId': 'legacy-only'}) + '\n')
+    held, removed = [], []
+    real_lock, real_rmtree = m.Daemon.journal_lock, m.shutil.rmtree
+    @contextlib.contextmanager
+    def lock(self):
+        with real_lock(self):
+            held.append(True)
+            try: yield
+            finally: held.pop()
+    def remove(path, **kw):
+        removed.append((Path(path).name, bool(held)))
+        return real_rmtree(path, **kw)
+    monkeypatch.setattr(m.Daemon, 'journal_lock', lock)
+    monkeypatch.setattr(m.shutil, 'rmtree', remove)
+    d.sweep(14)
+    assert sorted(removed) == [('gone', True), ('live', True)]
+    assert sorted(p.name for p in root.iterdir()) == ['journal-only', 'legacy-only', 'live.review', 'notes.txt', 'recent']
+
+
+def test_nosandbox_reports_network_on_in_open_and_turn_log(rig):
+    opened = rig.open('gpt', nosandbox=True, net=False)
+    assert opened['sandbox'] == 'none' and opened['network'] is True
+    assert 'sandbox none · network on' in opened['line']
+    rig.turn('PING')
+    assert 'sandbox none · network on' in (rig.home / 'logs/a.log').read_text()
+    assert rig.open('gpt', net=False)['network'] is True

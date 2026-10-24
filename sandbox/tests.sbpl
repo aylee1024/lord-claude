@@ -1,0 +1,18 @@
+; Lord's test sandbox. All paths are supplied through sandbox-exec -D parameters.
+(allow file-read*)
+(allow file-write* (subpath (param "TMP")) (subpath (param "PRIVATE_TMP")) (subpath (param "EXEC_TMP")))
+(allow network-bind (local ip "*:*"))
+(allow network-inbound (local ip "localhost:*"))
+(allow network-outbound (remote ip "localhost:*"))
+(allow sysctl-read)
+(allow process-info*)
+(deny file-read* (literal (param "KEY")))
+(deny file-read-data (literal (param "KEY")))
+(deny mach-lookup (xpc-service-name-prefix ""))
+
+(define (lord-writable-root root)
+  (allow file-write* (subpath root)))
+(define (lord-protect-root root)
+  (deny file-write-unlink (literal root)))
+(define (lord-protect-metadata path)
+  (deny file-write* (literal path) (subpath path)))

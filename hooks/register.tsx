@@ -66,6 +66,7 @@ function task(text: string): Task {
     else if (line === '@readonly') result.readonly = true
     else if (line === '@net') result.net = true
     else if (line === '@nosandbox') result.nosandbox = true
+    else if (line === '@tests') result.tests = true
     else if (/^@memory\s+\d+(\.\d+)?\s*$/.test(line)) result.limits = { ...result.limits, memory_gb: Number(line.split(/\s+/)[1]) }
     else if (/^@hang\s+\d+\s*$/.test(line)) result.limits = { ...result.limits, hang_s: Number(line.split(/\s+/)[1]) }
     else if (/^@wall\s+\d+\s*$/.test(line)) result.limits = { ...result.limits, wall_s: Number(line.split(/\s+/)[1]) }
@@ -74,7 +75,7 @@ function task(text: string): Task {
     else if (/^@cwd\s+\S/.test(line)) result.cwd = line.replace(/^@cwd\s+/, '')
     else if (/^@dir\s+\S/.test(line)) result.dirs = [...(result.dirs ?? []), line.replace(/^@dir\s+/, '')]
     // A known option written wrongly would end the options here and leave the rest (an @readonly, say) as task text.
-    else if (/^@(model|effort|readonly|net|nosandbox|memory|hang|wall|tools|cwd|dir|nice)\b/.test(line)) { result.error = `option line not understood: ${line}`; break }
+    else if (/^@(model|effort|readonly|net|nosandbox|tests|memory|hang|wall|tools|cwd|dir|nice)\b/.test(line)) { result.error = `option line not understood: ${line}`; break }
     // A misspelt option would otherwise run the task at a default (@efort max at high effort).
     else if (word) { result.error = `unknown option line: ${line} (options: ${OPTIONS})`; break }
     else break
@@ -85,8 +86,16 @@ function task(text: string): Task {
   return result
 }
 
-const OPTIONS = '@model, @effort, @cwd, @dir, @readonly, @net, @nosandbox, @tools, @memory, @hang, @wall, @nice'
+const OPTIONS = '@model, @effort, @cwd, @dir, @readonly, @net, @nosandbox, @tests, @tools, @memory, @hang, @wall, @nice'
 const KNOWN = new Set(OPTIONS.split(', ').map(option => option.slice(1)))
+
+function testsError(family: string, options: Partial<Task>): string | undefined {
+  if (!options.tests) return undefined
+  if (family !== 'gpt') return '@tests is available for gpt only'
+  for (const clash of ['readonly', 'nosandbox', 'net'] as const)
+    if (options[clash]) return `@tests cannot be used with @${clash}`
+  return undefined
+}
 
 function merge(base: Task, more: Partial<Task>): Task {
   return { ...base, ...more, dirs: more.dirs ? [...new Set([...(base.dirs ?? []), ...more.dirs])] : base.dirs,
@@ -380,7 +389,7 @@ async function steer($: EngineInterface, agentId: string, text: string): Promise
   const parsed = task(text)
   // Directives alter the next turn's session options rather than an in-flight request. A message asking for
   // @readonly is never put into a turn that can write: it waits for a turn that starts read-only.
-  if (parsed.error || (parsed.readonly && !agent.readonly)) return false
+  if (parsed.error || parsed.tests || testsError(agent.family, { ...agent, ...parsed }) || (parsed.readonly && !agent.readonly)) return false
   const { text: _, ...options } = parsed
   agent.pending = merge({ text: '', ...agent.pending }, options)
   await keep($, agentId)
@@ -418,9 +427,9 @@ async function launchLine($: EngineInterface, family: string, options: Task, eff
   const model = options.model ?? setting(c => c[family]?.model) ?? 'default'
   const memory = options.limits?.memory_gb ?? Math.round(Number(setting(c => c.memory_ceiling_kb) ?? 12 * 1048576) / 104857.6) / 10
   const hang = options.limits?.hang_s ?? setting(c => c[family]?.no_progress_s)
-  const sandbox = options.readonly ? 'read-only' : options.nosandbox || family === 'gemini' ? 'none' : 'workspace-write'
+  const sandbox = options.tests ? 'tests' : options.readonly ? 'read-only' : options.nosandbox || family === 'gemini' ? 'none' : 'workspace-write'
   return `lord: requested ${model} ${effort} · cwd ${options.cwd ?? 'the agent\'s start folder'} · dirs ${options.dirs?.join(', ') || 'none'} · sandbox ${sandbox}` +
-    ` · network ${family !== 'gpt' || options.net ? 'on' : 'off'} · tools ${options.limits?.tools ? 'on' : 'off'} · nice ${options.limits?.nice ?? 0}` +
+    ` · network ${family !== 'gpt' || options.net || options.nosandbox ? 'on' : 'off'} · tools ${options.limits?.tools ? 'on' : 'off'} · nice ${options.limits?.nice ?? 0}` +
     ` · memory ${memory} GB · hang ${hang ? hang + ' s' : 'none'} · wall ${options.limits?.wall_s ? options.limits.wall_s + ' s' : 'none'}`
 }
 
@@ -589,7 +598,9 @@ export const register: Register = on => {
           const known = await request($, '/agents').then(text => JSON.parse(text).find((a: any) => a.agentId === agentId), () => undefined)
           if (known) Object.assign(agent, { opened: true, cwd: known.cwd, effort: agent.effort ?? known.effort, model: agent.model ?? known.model })
         }
-        const chosen = merge({ text: '', model: agent.model, effort: agent.effort, readonly: agent.readonly, net: agent.net, nosandbox: agent.nosandbox, dirs: agent.dirs, limits: agent.limits }, input)
+        const chosen = merge({ text: '', model: agent.model, effort: agent.effort, readonly: agent.readonly, net: agent.net, nosandbox: agent.nosandbox, tests: agent.tests, dirs: agent.dirs, limits: agent.limits }, input)
+        const error = testsError(agent.family, chosen)
+        if (error) throw new Error(error)
         // Only an absolute @cwd replaces the worktree; a relative one would be under the main tree.
         if (agent.worktree && !(input.cwd && /^[/~]/.test(input.cwd)) && !directories.get(agentId)) throw new Error('worktree isolation was requested but Claude Code reported no worktree path; refusing to run in the main tree')
         // A task can name the vendor's working folder (fixed at the first turn; the daemon compares folders, not
@@ -599,8 +610,8 @@ export const register: Register = on => {
         // A relative @dir is under the agent's working folder too.
         if (input.dirs) input.dirs = input.dirs.map(dir => /^[/~]/.test(dir) ? dir : `${input.cwd ?? (agent.opened ? agent.cwd : undefined) ?? base}/${dir}`)
         const cwd = input.cwd ?? (agent.opened ? agent.cwd : undefined) ?? directories.get(agentId) ?? agent.cwd ?? await $.session.cwd()
-        await request($, '/open', { agentId, family: agent.family, cwd, pin_cwd: !!input.cwd, path: await $.env.get('PATH'), version: await version($), session: await $.session.id().catch(() => undefined), model: chosen.model, effort: chosen.effort ?? e.effort, readonly: chosen.readonly, net: chosen.net, nosandbox: chosen.nosandbox, dirs: chosen.dirs, ...chosen.limits })
-        Object.assign(agent, { model: chosen.model, effort: chosen.effort, readonly: chosen.readonly, net: chosen.net, nosandbox: chosen.nosandbox, dirs: chosen.dirs, limits: chosen.limits })
+        await request($, '/open', { agentId, family: agent.family, cwd, pin_cwd: !!input.cwd, path: await $.env.get('PATH'), version: await version($), session: await $.session.id().catch(() => undefined), model: chosen.model, effort: chosen.effort ?? e.effort, readonly: chosen.readonly, net: chosen.net, nosandbox: chosen.nosandbox, tests: chosen.tests, dirs: chosen.dirs, ...chosen.limits })
+        Object.assign(agent, { model: chosen.model, effort: chosen.effort, readonly: chosen.readonly, net: chosen.net, nosandbox: chosen.nosandbox, tests: chosen.tests, dirs: chosen.dirs, limits: chosen.limits })
         agent.opened = true
         agent.cwd = cwd
         agent.daemon = await socket($)
@@ -770,6 +781,8 @@ export const register: Register = on => {
       const input = e as any, family = String(input.subagent_type).slice(5), options = task(String(input.prompt ?? ''))
       // A launch whose option lines Lord cannot read is refused before an agent starts.
       if (options.error) return { deny: `lord: ${options.error}` }
+      const error = testsError(family, options)
+      if (error) return { deny: `lord: ${error}` }
       const effort = capped(family, options.effort ?? input.effort ?? 'high')
       callEfforts.set(e.tool_use_id, effort)
       if (effort !== input.effort && ['low', 'medium', 'high', 'xhigh', 'max'].includes(effort)) call = { ...e, effort } as typeof e

@@ -5,6 +5,7 @@ import asyncio
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -184,6 +185,28 @@ def grok_profiles():
     temporary.write_text(text)
     if path.exists(): temporary.chmod(path.stat().st_mode & 0o777)
     temporary.replace(path)
+
+EXEC_START_TIMEOUT = 10
+
+def tests_profile(cwd, dirs, env):
+    folder = HERE.parent / 'sandbox'
+    profile = '\n'.join((folder / name).read_text() for name in ('seatbelt_base_policy.sbpl', 'seatbelt_preferences_policy.sbpl', 'tests.sbpl'))
+    params = {'TMP': canon(env.get('TMPDIR') or '/tmp'), 'PRIVATE_TMP': '/private/tmp',
+              'EXEC_TMP': canon(Path(env['CODEX_HOME']) / 'tmp/arg0-macos'), 'KEY': canon(HOME / 'control.header')}
+    roots = list(dict.fromkeys(canon(root) for root in [cwd, *dirs]))
+    protected = set()
+    for i, root in enumerate(roots):
+        name = f'ROOT_{i}'
+        params[name] = root
+        profile += f'\n(lord-writable-root (param "{name}"))\n(lord-protect-root (param "{name}"))'
+        # Protect absent metadata too, and both a link's name and its target, even under another writable root.
+        for metadata in ('.git', '.codex', '.agents'):
+            protected.update((os.path.join(root, metadata), canon(os.path.join(root, metadata))))
+    for i, path in enumerate(sorted(protected)):
+        name = f'PROTECTED_{i}'
+        params[name] = path
+        profile += f'\n(lord-protect-metadata (param "{name}"))'
+    return profile + '\n', [f'-D{name}={path}' for name, path in params.items()]
 
 TEMP_ROOTS = ('/tmp', '/private/tmp', '/var/tmp', '/private/var/tmp', '/var/folders', '/private/var/folders')
 
@@ -603,6 +626,8 @@ class Vendor:
         # An agent-less codex's folder; an agent's codex uses the folder in its record. None is the user's own.
         self.codex_home = codex_home
         self.process, self.serial, self.generation = None, 0, 0
+        self.exec_process, self.exec_descendants, self.environment_id = None, set(), None
+        self.exec_error = ''
         self.last, self.reason, self.efforts, self.descendants = time.monotonic(), None, [], set()
         self.pending, self.models = {}, []
         self.lock, self.write_lock = asyncio.Lock(), asyncio.Lock()
@@ -616,7 +641,7 @@ class Vendor:
         async with self.lock:
             await self.reaped.wait()
             if self.ready and self.process and self.process.returncode is None: return
-            if self.process: await self.close()
+            if self.process or self.exec_process: await self.close()
             self.stopping = False
             self.readonly = bool(self.agent and self.agent.record.get('readonly'))
             config = self.d.config[self.family]
@@ -628,8 +653,10 @@ class Vendor:
             # @nice: the vendor starts at that niceness and every command it runs inherits it; a sandboxed command
             # cannot lower its own priority. nice -n adds to the daemon's own niceness, which no one may lower, so a
             # daemon already at or past the level starts the vendor at its own.
+            nice = []
             if self.agent and (step := self.agent.record.get('nice', 0) - os.getpriority(os.PRIO_PROCESS, 0)) > 0:
-                command = ['/usr/bin/nice', '-n', str(step), *command]
+                nice = ['/usr/bin/nice', '-n', str(step)]
+                command = [*nice, *command]
             if self.family == 'gpt': command += ['app-server']
             elif self.family == 'grok':
                 # Seatbelt applies to the whole grok process, so read-only sessions get their own process.
@@ -658,18 +685,29 @@ class Vendor:
                 # codex would keep its thread database in this folder instead, which may be the user's.
                 env.pop('CODEX_SQLITE_HOME', None)
             try:
+                if self.family == 'gpt' and self.agent and self.agent.record.get('tests'):
+                    await self.start_exec(command[len(nice):-1], env, nice)
                 self.process = await asyncio.create_subprocess_exec(*command,
                     cwd=self.agent.cwd if self.agent else HOME, start_new_session=True, env=env,
                     stdin=-1, stdout=-1, stderr=-1, limit=LIMIT)
-            except FileNotFoundError: raise RuntimeError(f'{command[0]} was not found; {INSTALL[self.family]}') from None
+            except BaseException as error:
+                await self.close()
+                if isinstance(error, FileNotFoundError): raise RuntimeError(f'{command[0]} was not found; {INSTALL[self.family]}') from None
+                raise
             self.generation += 1
             self.d.task(self.read(self.process))
             self.stderr_task = self.d.task(self.stderr(self.process))
+            if self.exec_process:
+                self.d.task(self.exec_stdout(self.exec_process))
+                self.d.task(self.watch_exec(self.exec_process))
             try:
                 if self.family == 'gpt':
                     await self.rpc('initialize', {'clientInfo': {'name': 'lord', 'version': VERSION},
                                                  'capabilities': {'experimentalApi': True}})
                     await self.send({'method': 'initialized', 'params': {}})
+                    if self.exec_process:
+                        await self.rpc('environment/add', {'environmentId': self.environment_id, 'execServerUrl': self.exec_url,
+                                                          'authBearerToken': self.exec_token})
                     self.models = (await self.rpc('model/list', {'includeHidden': True}))['data']
                 elif self.family == 'grok': await self.rpc('initialize', {'protocolVersion': 1, 'clientCapabilities': {}})
                 else: await asyncio.wait_for(asyncio.shield(self.initialized), 45)
@@ -677,6 +715,47 @@ class Vendor:
             except BaseException:
                 await self.close()
                 raise
+
+    async def start_exec(self, command, env, nice):
+        home = HOME / 'exec' / self.agent.agentId
+        home.mkdir(parents=True, exist_ok=True, mode=0o700)
+        home.chmod(0o700)
+        (home / 'tmp/arg0-macos').mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.exec_token, self.environment_id = uuid.uuid4().hex, 'lord-' + uuid.uuid4().hex
+        self.exec_descendants = set()
+        self.d.redact.secrets.add(self.exec_token)
+        env = {k: v for k, v in env.items() if k not in ('LORD_MCP_TOKEN', 'LORD_DAEMON_SOCKET')}
+        env['CODEX_HOME'] = str(home)
+        profile, params = tests_profile(self.agent.cwd, self.agent.record.get('dirs', []), env)
+        try:
+            self.exec_process = await asyncio.create_subprocess_exec(*nice, '/usr/bin/sandbox-exec', '-p', profile, *params,
+                *command, 'exec-server', '--listen', 'ws://127.0.0.1:0', '--ws-auth', 'capability-token',
+                '--ws-token-sha256', hashlib.sha256(self.exec_token.encode()).hexdigest(),
+                cwd=self.agent.cwd, env=env, start_new_session=True, stdin=-1, stdout=-1, stderr=-1, limit=LIMIT)
+        except OSError as error: raise RuntimeError(f'@tests exec-server could not start (requires macOS sandbox-exec): {error}') from None
+        self.exec_error = ''
+        stderr = self.d.task(self.stderr(self.exec_process))
+        try: line = await asyncio.wait_for(self.exec_process.stdout.readline(), EXEC_START_TIMEOUT)
+        except TimeoutError: raise RuntimeError(f'@tests exec-server did not print its loopback URL within {EXEC_START_TIMEOUT} s') from None
+        self.exec_url = line.decode('utf8', 'replace').strip()
+        if not re.fullmatch(r'ws://127\.0\.0\.1:([1-9][0-9]{0,4})', self.exec_url) or int(self.exec_url.rsplit(':', 1)[-1]) > 65535:
+            if not line: await asyncio.wait([stderr], timeout=.2)
+            raise RuntimeError(f'@tests exec-server did not print a valid loopback URL: {self.d.redact(self.exec_error or self.exec_url or "closed stdout")}')
+
+    def environments(self):
+        return [{'environmentId': self.environment_id, 'cwd': self.agent.cwd}] if self.exec_process else []
+
+    async def exec_stdout(self, process):
+        while line := await process.stdout.readline(): self.d.log(line.decode('utf8', 'replace'))
+
+    async def watch_exec(self, process):
+        await process.wait()
+        if self.stopping or self.d.stopping or self.exec_process is not process: return
+        self.reason = self.reason or '@tests exec-server exited'
+        await kill_tree(self.process, self.descendants)
+
+    async def kill(self):
+        await asyncio.gather(kill_tree(self.process, self.descendants), kill_tree(self.exec_process, self.exec_descendants))
 
     async def send(self, value):
         async with self.write_lock:
@@ -697,6 +776,7 @@ class Vendor:
         while line := await process.stderr.readline():
             text = line.decode('utf8', 'replace')
             self.d.log(text)
+            if process is self.exec_process: self.exec_error = (self.exec_error + self.d.redact(text))[-2000:]
             if self.family == 'gemini' and text.startswith('AGY_ERROR: '): self.agy_error(text[len('AGY_ERROR: '):])
 
     def agy_error(self, text):
@@ -742,7 +822,7 @@ class Vendor:
                     a.generation = 0
                     a.emit('error', message=self.d.redact(reason or self.error or error), retryable=not (reason or self.error))
             self.d.log(error)
-            try: await kill_tree(process, self.descendants)
+            try: await self.kill()
             finally: self.reaped.set()
 
     async def request(self, value):
@@ -911,9 +991,10 @@ class Vendor:
         self.stopping, self.ready = True, False
         for future in [*self.pending.values(), getattr(self, 'initialized', None)]:
             if future and not future.done(): future.set_exception(RuntimeError('Vendor closed'))
-        process = self.process
-        await kill_tree(process, self.descendants)
+        process, ex = self.process, self.exec_process
+        await self.kill()
         if self.process is process: self.process = None
+        if self.exec_process is ex: self.exec_process = None
 
 class Daemon:
     def __init__(self):
@@ -1080,6 +1161,9 @@ class Daemon:
                           'sandbox': 'read-only' if a.record.get('readonly') else 'danger-full-access' if a.record.get('nosandbox') else 'workspace-write',
                           'config': {**lean, 'mcp_servers': {**lean['mcp_servers'], 'lord': server},
                                      'sandbox_workspace_write': {'network_access': bool(a.record.get('net')), 'writable_roots': a.record.get('dirs', [])}}}
+                if vendor.exec_process:
+                    params.pop('sandbox')
+                    params['environments'] = vendor.environments()
                 if a.vendorSession: params['threadId'] = a.vendorSession
                 result = await vendor.rpc('thread/resume' if a.vendorSession else 'thread/start', params)
                 a.vendorSession = result['thread']['id']
@@ -1160,6 +1244,7 @@ class Daemon:
         if not isinstance(aid, str) or not aid or family not in ('gpt', 'grok', 'gemini'): raise ValueError('Invalid agent or family')
         async with self.open_locks.setdefault(aid, asyncio.Lock()):
             self.refresh(aid)
+            if body.get('tests') and family != 'gpt': raise ValueError('@tests is available for gpt only')
             if body.get('nosandbox') and family != 'gpt':
                 raise ValueError({'grok': '@nosandbox is available for gpt only; grok keeps its sandbox',
                                   'gemini': '@nosandbox is not needed for gemini: agy has no sandbox'}[family])
@@ -1173,6 +1258,9 @@ class Daemon:
             if inside(canon(str(Path.home())), (canon(cwd),)) or (sys.platform == 'darwin' and inside('/System/Volumes/Data', (cwd,))):
                 raise ValueError('refusing / or a folder holding your home folder as a working folder: start Claude Code in a project folder, or put "@cwd <folder>" on the first line of the task')
             a = self.agents.get(aid)
+            if body.get('tests') or (a and a.record.get('tests')):
+                for clash in ('readonly', 'nosandbox', 'net'):
+                    if body.get(clash) or (a and a.record.get(clash)): raise ValueError(f'@tests cannot be used with @{clash}')
             if a and body.get('pin_cwd') and not os.path.samefile(cwd, a.cwd): raise ValueError(f'@cwd is fixed at the first turn ({a.cwd})')
             if isinstance(body.get('path'), str) and body['path']:
                 global SESSION_PATH
@@ -1215,7 +1303,7 @@ class Daemon:
             # older daemon, with own_home off, or for a codex setup the folder cannot share) resumes in the user's
             # folder, where its thread is.
             own = family == 'gpt' and config.get('own_home', True) and not codex_home_unshareable(self.user_codex_home)
-            a = Agent({**{k: body[k] for k in ('readonly', 'net', 'nosandbox') if k in body}, 'agentId': aid,
+            a = Agent({**{k: body[k] for k in ('readonly', 'net', 'nosandbox', 'tests') if k in body}, 'agentId': aid,
                 **({'codexHome': str(HOME / 'codex')} if own else {}),
                 'family': family, 'cwd': cwd, 'model': body.get('model') or config['model'],
                 'effort': body.get('effort') or config['effort'], 'created': datetime.now(timezone.utc).isoformat()})
@@ -1235,7 +1323,7 @@ class Daemon:
         if any(inside(canon(str(Path.home())), (canon(x),)) or (sys.platform == 'darwin' and inside('/System/Volumes/Data', (x,))) for x in dirs):
             raise ValueError('refusing / or a folder holding your home folder as an @dir')
         if missing := [x for x in dirs if not Path(x).is_dir()]: raise ValueError(f'@dir {missing[0]} is not an existing directory')
-        for key in ('readonly', 'net', 'nosandbox'):
+        for key in ('readonly', 'net', 'nosandbox', 'tests'):
             if body.get(key) and not a.record.get(key):
                 # A sandbox change needs a new process (grok) or a reattached thread (codex).
                 a.record[key] = True
@@ -1252,13 +1340,13 @@ class Daemon:
             # The user's tool servers load at process start, so the agent gets a new process and resumes.
             a.record['tools'] = True
             a.restart = True
+        if set(dirs) - set(a.record.get('dirs', [])):
+            a.record['dirs'] = sorted(set(a.record.get('dirs', [])) | set(dirs))
+            a.generation = 0
+            if a.record.get('tests'): a.restart = True
         if a.restart and a.state not in ('running', 'waiting_tool'):
             a.restart = False
             await self.backend(a).close()
-            a.generation = 0
-        if set(dirs) - set(a.record.get('dirs', [])):
-            # Extra writable folders change the sandbox, so the session reattaches with them.
-            a.record['dirs'] = sorted(set(a.record.get('dirs', [])) | set(dirs))
             a.generation = 0
         # A result held for this agent is handed over by /turn without the vendor, and a vendor that failed to start here
         # would strand it; the next turn's start attaches the vendor instead.
@@ -1346,8 +1434,8 @@ class Daemon:
         folder = (Path(r['codexHome']) if r.get('codexHome') else self.user_codex_home) if family == 'gpt' else \
             grok_home() if family == 'grok' else self.vendor_home / '.gemini'
         return {'model': a.model, 'effort': a.effort, 'cwd': a.cwd, 'dirs': r.get('dirs', []),
-                'sandbox': 'read-only' if r.get('readonly') else 'none' if r.get('nosandbox') or family == 'gemini' else 'workspace-write',
-                'network': bool(r.get('net')) if family == 'gpt' else True, 'tools': bool(r.get('tools')),
+                'sandbox': 'tests' if r.get('tests') else 'read-only' if r.get('readonly') else 'none' if r.get('nosandbox') or family == 'gemini' else 'workspace-write',
+                'network': bool(r.get('net') or r.get('nosandbox')) if family == 'gpt' else True, 'tools': bool(r.get('tools')),
                 'nice': max(r.get('nice', 0), os.getpriority(os.PRIO_PROCESS, 0)),
                 'memory_gb': round(ceiling / 1048576, 1), 'hang_s': hang or None, 'wall_s': r.get('wall_s') or None,
                 **({'codexHome': str(folder)} if family == 'gpt' else {}), 'codex_folder': str(folder)}
@@ -1413,6 +1501,8 @@ class Daemon:
                           'sandboxPolicy': {'type': 'readOnly', 'networkAccess': bool(a.record.get('net'))} if a.record.get('readonly')
                                            else {'type': 'dangerFullAccess'} if a.record.get('nosandbox')
                                            else {'type': 'workspaceWrite', 'networkAccess': bool(a.record.get('net')), 'writableRoots': a.record.get('dirs', [])}}
+                if v.exec_process:
+                    params.update(sandboxPolicy={'type': 'externalSandbox', 'networkAccess': 'restricted'}, environments=v.environments())
                 if body.get('schema'): params['outputSchema'] = body['schema']
                 result = await v.rpc('turn/start', params)
                 # The response can arrive after codex already reported this turn ended (an "at capacity" failure read
@@ -1475,7 +1565,7 @@ class Daemon:
                 a.emit('error', message='interrupted', retryable=False)
             try: await asyncio.wait_for(a.finished.wait(), 5)
             except TimeoutError:
-                await kill_tree(v.process)
+                await v.close()
                 a.emit('error', message='interrupted', retryable=False)
             if started:
                 # codex ends an interrupted turn but leaves the command it was running alive; closing the process
@@ -1742,6 +1832,10 @@ class Daemon:
         for v in live:
             a, pids = v.agent, tree(children, v.process.pid)
             v.descendants = set(pids) - {v.process.pid}
+            if v.exec_process:
+                extra = tree(children, v.exec_process.pid)
+                v.exec_descendants = set(extra) - {v.exec_process.pid}
+                pids = set(pids) | set(extra)
             ceiling = a.record['memory_gb'] * 1048576 if a.record.get('memory_gb') else self.config.get('memory_ceiling_kb', 12 * 1024 * 1024)
             used = sum(rss.get(pid, 0) for pid in pids)
             silent = a.record['hang_s'] if a.record.get('hang_s') is not None else self.config[a.family].get('no_progress_s', 0)
@@ -1752,8 +1846,10 @@ class Daemon:
             else: continue
             self.log(f'{a.agentId}: {v.reason}')
             # The vendor's process group and every descendant by pid, since tool commands may leave the group.
-            try: os.killpg(v.process.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError): pass
+            for process in (v.process, v.exec_process):
+                if process:
+                    try: os.killpg(process.pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError): pass
             signal_all(pids, signal.SIGKILL)
 
     async def prune(self, days):
@@ -1791,6 +1887,7 @@ class Daemon:
                 removed.append(aid)
                 for path in a.files(): path.unlink(missing_ok=True)
                 shutil.rmtree(a.answers_path, ignore_errors=True)
+                shutil.rmtree(HOME / 'exec' / aid, ignore_errors=True)
                 del self.agents[aid]
                 self.open_locks.pop(aid, None)
         self.pruned.update(removed)
@@ -1802,18 +1899,20 @@ class Daemon:
         # Files of an agent no journal holds, older than the prune period: a daemon of an earlier version pruned the
         # agent and removed only the files it knew. Under the journal lock, which every daemon holds to add a record,
         # so an agent reopened meanwhile is seen; a file is the agent's by its exact name, never a prefix, and any
-        # other file in logs/ is left alone.
+        # other file in logs/ is left alone. Each exec home is named by its agent's exact id too.
         cutoff = time.time() - days * 86400
         with self.journal_lock():
             known = set(self.agents) | set(self.records(self.legacy_journal, self.journal))
-            try: paths = list((HOME / 'logs').iterdir())
-            except OSError: return
-            for path in paths:
-                owner = next((path.name[:-len(suffix)] for suffix in AGENT_FILES if path.name.endswith(suffix) and len(path.name) > len(suffix)), None)
-                try:
-                    if owner is None or owner in known or path.lstat().st_mtime >= cutoff: continue
-                    shutil.rmtree(path) if path.is_dir() and not path.is_symlink() else path.unlink()
-                except OSError as error: self.log(f'{path} not removed: {error}')
+            for folder in ('logs', 'exec'):
+                try: paths = list((HOME / folder).iterdir())
+                except OSError: continue
+                for path in paths:
+                    try:
+                        owner = (path.name if path.is_dir() else None) if folder == 'exec' else next(
+                            (path.name[:-len(suffix)] for suffix in AGENT_FILES if path.name.endswith(suffix) and len(path.name) > len(suffix)), None)
+                        if owner is None or owner in known or path.lstat().st_mtime >= cutoff: continue
+                        shutil.rmtree(path) if path.is_dir() and not path.is_symlink() else path.unlink()
+                    except OSError as error: self.log(f'{path} not removed: {error}')
 
     def compact(self, removed=()):
         # The journal rewritten with one line per agent: the newest record of each, from the file (which daemons of

@@ -323,6 +323,13 @@ async def handle(value):
             return
         result = {'data': [{'id': model, 'isDefault': model == 'gpt-6-luna', 'supportedReasoningEfforts': [{'reasoningEffort': effort} for effort in efforts]}
                     for model, efforts in [('gpt-6.1-sol', ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']), ('gpt-6-luna', ['low', 'medium', 'high'])]]}
+    elif method == 'environment/add':
+        assert FAMILY == 'gpt' and p['environmentId'] and p['execServerUrl'].startswith('ws://127.0.0.1:')
+        assert len(p['authBearerToken']) >= 32
+        SESSIONS['environment'] = p['environmentId']
+        if '--fail-environment' in sys.argv:
+            send({'id': rid, 'error': {'code': -32000, 'message': 'environment refused'}})
+            return
     elif method in ('thread/start', 'session/new'):
         assert 'dynamicTools' not in p and '_meta' not in p
         if '--signed-out' in sys.argv and FAMILY == 'grok':
@@ -330,7 +337,11 @@ async def handle(value):
             return
         sid = str(uuid.uuid4())
         if FAMILY == 'gpt':
-            assert p['approvalPolicy'] == 'never' and p['sandbox'] in ('workspace-write', 'read-only', 'danger-full-access')
+            assert p['approvalPolicy'] == 'never'
+            if p.get('environments'):
+                assert p['environments'] == [{'environmentId': SESSIONS['environment'], 'cwd': p['cwd']}]
+                assert 'sandbox' not in p
+            else: assert p['sandbox'] in ('workspace-write', 'read-only', 'danger-full-access')
             server = p['config']['mcp_servers']['lord']
         else:
             server = p['mcpServers'][0]
@@ -343,6 +354,7 @@ async def handle(value):
             if '--list-models' in sys.argv:
                 result['configOptions'].append({'id': 'model', 'currentValue': 'grok-4.7', 'options': [{'value': v} for v in ('grok-4.5', 'grok-4.7')]})
     elif method in ('thread/resume', 'session/load'):
+        if p.get('environments'): assert p['environments'] == [{'environmentId': SESSIONS['environment'], 'cwd': p['cwd']}]
         sid = p.get('threadId') or p['sessionId']
         load(sid)
         result = {'thread': {'id': sid}} if FAMILY == 'gpt' else {'sessionId': sid}
@@ -378,6 +390,16 @@ async def handle(value):
 
 async def main():
     global AGY_SESSION
+    if 'exec-server' in sys.argv:
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'], start_new_session='--exec-eof' not in sys.argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        audit(exec_launch=True, child=child.pid, argv=sys.argv[3:], cwd=os.getcwd(), nice=os.getpriority(os.PRIO_PROCESS, 0),
+              codex_home=os.environ.get('CODEX_HOME'), mcp_env={k: os.environ[k] for k in ('LORD_MCP_TOKEN', 'LORD_DAEMON_SOCKET') if k in os.environ},
+              env={k: v for k, v in os.environ.items() if 'must-not-reach' in v})
+        if '--exec-eof' in sys.argv: return
+        if '--exec-invalid' in sys.argv: print('not a URL', flush=True)
+        elif '--exec-silent' not in sys.argv: print('ws://127.0.0.1:43210', flush=True)
+        await asyncio.Event().wait()
+        return
     audit(launch=True, argv=sys.argv[3:], path=os.environ.get('PATH', ''), grok_env={k: v for k, v in os.environ.items() if k.startswith('GROK_')}, env={k: v for k, v in os.environ.items() if 'must-not-reach' in v}, codex_home=os.environ.get('CODEX_HOME'), sqlite_home=os.environ.get('CODEX_SQLITE_HOME'), nice=os.getpriority(os.PRIO_PROCESS, 0), cwd=os.getcwd())
     print('fixture Bearer fake-bearer-value', file=sys.stderr, flush=True)
     if FAMILY == 'gemini' and (DATA / 'start-quota-late').exists():

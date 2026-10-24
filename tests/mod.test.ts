@@ -1147,7 +1147,7 @@ test('a launch whose option lines Lord cannot read is refused before an agent st
   world(on)
   on('fs.read', (_, e) => CONFIGS(e.path))
   const call = (prompt: string) => $.tool.call({ tool: 'Agent', tool_use_id: 'L', subagent_type: 'lord:gpt', prompt, description: 'x' } as any) as Promise<any>
-  expect((await call('@efort max\nwork')).deny).toBe('lord: unknown option line: @efort max (options: @model, @effort, @cwd, @dir, @readonly, @net, @nosandbox, @tools, @memory, @hang, @wall, @nice)')
+  expect((await call('@efort max\nwork')).deny).toBe('lord: unknown option line: @efort max (options: @model, @effort, @cwd, @dir, @readonly, @net, @nosandbox, @tests, @tools, @memory, @hang, @wall, @nice)')
   expect((await call('@model gpt-6-astra\n@model gpt-6-luna\nwork')).deny).toBe('lord: option line repeated: @model gpt-6-luna (only @dir may be given more than once)')
   expect((await call('@dir /a\n@dir /b\nwork')).deny).toBeUndefined()
   // A line naming someone, with more than one word after it, is task text.
@@ -1289,4 +1289,88 @@ test('a description holding the short name inside a word still gets the label', 
   expect(await launch('@model gpt-6-sol\nwork', 'Resolve the failing test')).toBe('Sol, high · Resolve the failing test')
   expect(await launch('@model gpt-6-luna\nwork', 'Lunar lander physics check')).toBe('Luna, high · Lunar lander physics check')
   expect(await launch('@model gpt-6-sol\nwork', 'Sol review of the fix')).toBe('Sol review of the fix')
+})
+
+test('@tests reaches /open, is removed from task text and stays on for later turns', async ($, on) => {
+  const w = world(on)
+  await spawn($)
+  await step($, '@tests\nbuild it')
+  await step($, 'again')
+  expect(w.requests.filter(x => x.path === '/open').map(x => x.body.tests)).toEqual([true, true])
+  expect(w.requests.filter(x => x.path === '/turn').map(x => x.body.text)).toEqual(['build it', 'again'])
+  expect(w.modelCalls()).toBe(0)
+})
+
+test('@tests is accepted on a later message and survives a plugin reload', async ($, on) => {
+  const w = world(on), state = sessionState(on)
+  await spawn($)
+  await step($, 'first')
+  await step($, '@tests\nrun tests')
+  expect(w.requests.filter(x => x.path === '/open').map(x => x.body.tests)).toEqual([undefined, true])
+  expect(state.get('agent', 'a1').tests).toBe(true)
+  state.put('agent', 'a1', { ...state.get('agent', 'a1'), tests: true })
+  await step($, 'after reload')
+  expect(w.requests.filter(x => x.path === '/open').at(-1)?.body.tests).toBe(true)
+})
+
+test('@tests launch settings use only the existing settings line', async ($, on) => {
+  const w = world(on)
+  on('fs.read', (_, e) => CONFIGS(e.path))
+  const reply: any = await $.tool.call({ tool: 'Agent', tool_use_id: 'L', subagent_type: 'lord:gpt', prompt: '@tests\nwork', description: 'x' } as any)
+  expect(reply.context).toEqual(["lord: requested gpt-6.1-sol high · cwd the agent's start folder · dirs none · sandbox tests · network off · tools off · nice 0 · memory 12 GB · hang none · wall none"])
+  expect(w.toolCalls.length).toBe(1)
+})
+
+for (const family of ['grok', 'gemini']) test(`@tests is refused for ${family} at launch and turn`, async ($, on) => {
+  const w = world(on)
+  const reply: any = await $.tool.call({ tool: 'Agent', tool_use_id: 'L', subagent_type: `lord:${family}`, prompt: '@tests\nwork', description: 'x' } as any)
+  expect(reply.deny).toBe('lord: @tests is available for gpt only')
+  await spawn($, `lord:${family}`)
+  expect((await step($, '@tests\nwork')).result.answer).toContain('@tests is available for gpt only')
+  expect(w.requests.filter(x => x.path === '/open')).toEqual([])
+})
+
+for (const clash of ['readonly', 'nosandbox', 'net']) test(`@tests names its clash with @${clash} on launches and later messages`, async ($, on) => {
+  const w = world(on)
+  const reply: any = await $.tool.call({ tool: 'Agent', tool_use_id: 'L', subagent_type: 'lord:gpt', prompt: `@tests\n@${clash}\nwork`, description: 'x' } as any)
+  expect(reply.deny).toBe(`lord: @tests cannot be used with @${clash}`)
+  await spawn($)
+  await step($, '@tests\nwork')
+  const before = w.requests.filter(x => x.path === '/open').length
+  expect((await step($, `@${clash}\nwork`)).result.answer).toContain(`@tests cannot be used with @${clash}`)
+  expect(w.requests.filter(x => x.path === '/open').length).toBe(before)
+})
+
+for (const clash of ['readonly', 'nosandbox', 'net']) test(`@tests cannot override an inherited @${clash}`, async ($, on) => {
+  const w = world(on)
+  await spawn($)
+  await step($, `@${clash}\nwork`)
+  expect((await step($, '@tests\nwork')).result.answer).toContain(`@tests cannot be used with @${clash}`)
+  expect(w.requests.filter(x => x.path === '/open').length).toBe(1)
+})
+
+test('@tests malformed and repeated lines are refused by name', async ($, on) => {
+  world(on)
+  const call = (prompt: string) => $.tool.call({ tool: 'Agent', tool_use_id: 'L', subagent_type: 'lord:gpt', prompt, description: 'x' } as any) as any
+  expect((await call('@tests yes please\nwork')).deny).toBe('lord: option line not understood: @tests yes please')
+  expect((await call('@tests\n@tests\nwork')).deny).toBe('lord: option line repeated: @tests (only @dir may be given more than once)')
+})
+
+test('@tests in a running agent message waits for the next /open', async ($, on) => {
+  const w = world(on, [{ type: 'tool', callId: 'call1', name: 'SendMessage', input: { to: 'other', message: 'hi', summary: 'hi' } }])
+  await spawn($)
+  await step($, 'running')
+  await $.tool.call({ tool: 'SendMessage', tool_use_id: 'm1', to: 'a1', message: '@tests\nrun tests', summary: 'x' } as any)
+  expect(w.requests.filter(x => x.path === '/steer' || x.path === '/queue')).toEqual([])
+  expect(w.toolCalls.filter(x => x.tool_use_id === 'm1').length).toBe(1)
+  await step($, '@tests\nrun tests')
+  expect(w.requests.filter(x => x.path === '/open').at(-1)?.body.tests).toBe(true)
+})
+
+test('@nosandbox launch settings report network on without @net', async ($, on) => {
+  world(on)
+  on('fs.read', (_, e) => CONFIGS(e.path))
+  const reply: any = await $.tool.call({ tool: 'Agent', tool_use_id: 'L', subagent_type: 'lord:gpt', prompt: '@nosandbox\nwork', description: 'x' } as any)
+  expect(reply.context).toHaveLength(1)
+  expect(reply.context[0]).toContain('sandbox none · network on')
 })
