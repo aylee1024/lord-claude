@@ -1,5 +1,6 @@
 """HTTP and MCP contract tests against strict subprocess protocol peers."""
 import asyncio
+import contextlib
 import fcntl
 import importlib.util
 import json
@@ -2361,8 +2362,14 @@ def test_a_usage_limit_is_refused_until_the_reset_of_the_models_own_bucket():
     m.HOME.mkdir(parents=True, exist_ok=True)
     (m.HOME / 'allowance.json').write_text(json.dumps({'gpt': {
         'codex': {'primary': {'usedPercent': 100, 'resetsAt': now + 3600}},
-        'gpt-reserve': {'limitId': 'gpt-reserve', 'limitName': 'gpt-reserve', 'normalModelSlug': 'gpt-6-luna', 'primary': {'usedPercent': 100, 'resetsAt': now + 604800}}}}))
+        # codex names a bucket in lower case with '_' for '-', and its rate-limit events carry no limitName.
+        'gpt_reserve': {'limitId': 'gpt_reserve', 'normalModelSlug': 'gpt-6-luna', 'primary': {'usedPercent': 100, 'resetsAt': now + 604800}},
+        # A bucket whose id is not the model's: only its limitName (from codex's response headers) names the model.
+        'codex_bengalfox': {'limitId': 'codex_bengalfox', 'limitName': 'gpt-6-sol', 'primary': {'usedPercent': 100, 'resetsAt': now + 7200}}}}))
     d = object.__new__(m.Daemon); d.quota = {}; d.log = lambda text: None
+    s = m.Agent({'agentId': 's', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6-sol'})
+    d.gpt_quota(s, 'limit')
+    assert abs(d.quota[('gpt', 'gpt-6-sol')][0] - (now + 7200)) < 5
     a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6.1-sol'})
     d.gpt_quota(a, 'limit')
     assert abs(d.quota[('gpt', 'gpt-6.1-sol')][0] - (now + 3600)) < 5
@@ -2498,6 +2505,33 @@ def test_a_restarted_daemon_keeps_the_helpers_its_record_names(tmp_path):
     assert [h['thread'] for h in document['helpers']] == ['child'] and document['turns'][0]['helpers'] == ['child']
 
 
+def test_the_record_keeps_only_the_helpers_its_kept_turns_name():
+    m = load('lordd_helpers_bounded')
+    for n in range(102):
+        a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6.1-sol'})
+        started = time.strftime('%Y-%m-%dT%H:%M:%S+00:00', time.gmtime(1767225600 + 60 * n))
+        a.state, a.turn_started = 'running', started
+        m.helper_seen(a, {'type': 'subAgentActivity', 'agentThreadId': f'child-{n}', 'agentPath': f'/root/{n}', 'model': 'gpt-6-luna'})
+        a.helpers[f'child-{n}']['started'] = started
+        a.turn_record('done', {'text': 'ok'})
+    document = json.loads(a.record_path.read_text())
+    named = [t for turn in document['turns'] for t in turn['helpers']]
+    assert len(document['turns']) == 100 and [h['thread'] for h in document['helpers']] == named == [f'child-{n}' for n in range(2, 102)]
+
+
+def test_a_hand_edited_helper_in_the_record_never_breaks_a_later_step():
+    m = load('lordd_helper_edited')
+    a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6.1-sol'})
+    a.record_path.parent.mkdir(parents=True, exist_ok=True)
+    a.record_path.write_text(json.dumps({'helpers': [{'thread': 'child', 'started': '2026-01-01T00:00:00+00:00', 'commands': 'many'}], 'turns': []}))
+    a.state, a.turn_started = 'running', '2026-01-02T00:00:00+00:00'
+    a.turn_record('done', {'text': 'one'})
+    m.helper_seen(a, {'type': 'subAgentActivity', 'agentThreadId': 'child', 'agentPath': '/root/x', 'model': 'gpt-6-luna'})
+    v = object.__new__(m.Vendor)
+    v.helper_event(a, a.helpers['child'], 'item/completed', {'item': {'type': 'commandExecution', 'command': 'ls', 'commandActions': []}})
+    assert a.helpers['child']['model'] == 'gpt-6-luna' and a.helpers['child']['commands'] == 1
+
+
 
 def test_a_retry_whose_turn_was_replaced_while_it_waited_sends_nothing():
     m = load('lordd_retry_identity')
@@ -2538,3 +2572,36 @@ def test_prune_removes_files_of_agents_an_older_daemon_pruned(rig):
     rig.request('/prune', {'days': 14})
     # No record and older than the prune period: removed. A young file, or one whose agent has a record, stays.
     assert sorted(p.name for p in logs.iterdir()) == sorted(['fresh.json', *[p.name for p in logs.glob('kept*')]]) and (logs / 'kept.log').exists()
+
+
+def test_the_sweep_names_an_agents_files_exactly_and_works_under_the_journal_lock(monkeypatch):
+    m = load('lordd_sweep_owner')
+    logs = m.HOME / 'logs'
+    logs.mkdir(parents=True)
+    old = time.time() - 20 * 86400
+    names = ['live.review.json', 'live.review.log', 'live.review.answers', 'live.json', 'gone.json', 'gone.answers', 'notes.txt', 'other.log.1']
+    for name in names:
+        (logs / name).mkdir() if name.endswith('.answers') else (logs / name).write_text('x')
+        os.utime(logs / name, (old, old))
+    d = object.__new__(m.Daemon); d.log = lambda text: None
+    d.agents = {'live.review': None}
+    d.journal, d.legacy_journal = m.HOME / 'journal.jsonl', m.HOME / 'sessions.jsonl'
+    # An agent a daemon of another version holds: in the journal only, never in this daemon's memory.
+    d.journal.write_text(json.dumps({'agentId': 'other', 'family': 'grok', 'cwd': '/w', 'model': 'x'}) + '\n')
+    inside = []
+    real = m.Daemon.journal_lock
+    @contextlib.contextmanager
+    def lock(self):
+        with real(self):
+            inside.append(True)
+            try: yield
+            finally: inside.pop()
+    monkeypatch.setattr(m.Daemon, 'journal_lock', lock)
+    removed = []
+    real_unlink, real_rmtree = m.Path.unlink, m.shutil.rmtree
+    monkeypatch.setattr(m.Path, 'unlink', lambda self, missing_ok=False: (removed.append((self.name, bool(inside))), real_unlink(self, missing_ok=missing_ok))[1])
+    monkeypatch.setattr(m.shutil, 'rmtree', lambda path, **kw: (removed.append((Path(path).name, bool(inside))), real_rmtree(path, **kw))[1])
+    d.sweep(14)
+    # 'live' is not an agent: its file goes. Only an agent's own file names count, and nothing else in logs/ is touched.
+    assert sorted(removed) == [('gone.answers', True), ('gone.json', True), ('live.json', True)]
+    assert sorted(p.name for p in logs.iterdir()) == ['live.review.answers', 'live.review.json', 'live.review.log', 'notes.txt', 'other.log.1']

@@ -53,7 +53,7 @@ gets the starting daemon's socket as `LORD_DAEMON_SOCKET`; one without it (start
 `logs/<agentId>.log` (the agent's activity: vendor commands and file actions, redacted, moved to `.log.1` at 4 MB, removed with the
 record; agy tool steps are logged once each, as the tool's name and parameters), `logs/<agentId>.answer.md` (the
 agent's latest non-empty final answer, redacted, removed with the record), `logs/<agentId>.json` (the effective settings,
-`lordVersion`, the calling `session`, `vendorSession`, the vendor's transcript path when found, codex helpers, and the last
+`lordVersion`, the calling `session`, `vendorSession`, the vendor's transcript path when found, the codex helpers the kept turns name, and the last
 100 turns: `turn`, `started`, `ended`, `ended_how` (`done`, `interrupted`, `error (<codexErrorInfo kind or vendor>)`),
 `commands`, `retries`, `helpers`, `usage` or `error`, `answer`), `logs/<agentId>.answers/<n>.md` (each turn's answer or
 `lord: error:` line, redacted; turn n-100's is deleted as turn n is written), `logs/<agentId>.reads.txt` (gpt only: one line
@@ -83,7 +83,7 @@ can reach them; grok's Lord profiles deny reading it); without it the reply is 4
 | GET | /allowance | - | `{gpt, refused}`: `allowance.json`'s codex buckets, and each quota reset Lord refuses turns until |
 | POST | /interrupt, /close | `{agentId}` | `{ok}` (codex `turn/interrupt`, then the codex process is stopped once a started turn ends, since codex leaves the running command alive; grok `session/cancel`; agy process kill; close also stops the process) |
 | POST | /mcp | `{agentId, name, arguments, token}` | the lord tool call of a vendor's MCP server; the per-agent token is required |
-| POST | /prune | `{days}` | `{ok, pruned}`; also at daemon start and hourly: journal records unused for `prune_days`; codex threads archived, vendor history otherwise kept; then any `logs/<id>.*` with no journal record and older than `prune_days` (left by an earlier version's prune, which knew fewer files) is removed |
+| POST | /prune | `{days}` | `{ok, pruned}`; also at daemon start and hourly: journal records unused for `prune_days`; codex threads archived, vendor history otherwise kept; then, under `journal.lock`, each agent file in `logs/` (`<id>` plus one of `.log`, `.log.1`, `.answer.md`, `.json`, `.json.tmp`, `.reads.txt`, `.answers`) whose exact `<id>` has no journal record and that is older than `prune_days` (left by an earlier version's prune, which knew fewer files) is removed; nothing else in `logs/` is touched |
 | GET | /agents | - | `[{agentId, family, model, effort, state, activity, cwd, log, answer, usage, quiet_s}]` (`quiet_s`: seconds since the vendor's last output while its turn runs, else null) (`answer`: the answer file's path, null before a first answer) (`usage`: the vendor's last turn; codex input excludes its cached tokens) |
 
 NDJSON events: `text` (vendor text as it streams), `activity` (one line of vendor work), `row` (`{rowId, shell, title,
@@ -147,8 +147,8 @@ the reason. Every stop kills the vendor's whole process tree by pid as well as i
 retried once; a crash, or a codex turn that ends failed, restarts the vendor on the next turn, never in a loop, except
 the codex kinds `cyberPolicy` and `misalignmentPolicyViolation` (the error reads `refused by vendor (<kind>): …`, names
 the last completed command and says a reworded message resumes the session), `usageLimitExceeded` (the reset of the
-window codex last reported at 100%, in the bucket named after the agent's model (its `limitId` or `limitName`, for
-example `gpt-reserve`), else the `codex` bucket, is kept in `quota.json` (written under the journal lock through the one
+window codex last reported at 100%, in the bucket named after the agent's model (a `limitId` that is the model in
+lower case with `_` for `-`, as codex writes it, for example `gpt_reserve`, or a `limitName` equal to the model), else the `codex` bucket, is kept in `quota.json` (written under the journal lock through the one
 scratch name `quota.json.tmp`); none reported, nothing is refused), `rateLimitExceeded` and
 `serverOverloaded`. `serverOverloaded` before any `fileChange` in the turn (a helper's included) waits `capacity_retry_s` (30) and starts a
 turn on the same thread asking it to continue, up to `capacity_retries` (2) times (both numbers checked at start-up); an

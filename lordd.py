@@ -428,6 +428,9 @@ def usage(value):
 
 REDACT = Redactor()
 
+# The names of an agent's files in logs/, after its id (Agent.files and the answers folder).
+AGENT_FILES = ('.log', '.log.1', '.answer.md', '.json', '.json.tmp', '.reads.txt', '.answers')
+
 # The read list stops at the activity log's size, with a last line saying so.
 READS_LIMIT = 4 * 1024 * 1024
 READS_FULL = '[the read list stopped at 4 MB; later reads are in the activity log]'
@@ -522,10 +525,14 @@ class Agent:
         except (OSError, ValueError): saved = {}
         saved = saved if isinstance(saved, dict) else {}
         turns = saved.get('turns', [])
-        # Helpers the record named before a daemon restart stay, so earlier turns' helper ids keep their models.
+        # Helpers the record named before a daemon restart stay, so earlier turns' helper ids keep their models. Each
+        # field is taken only in the type helper_seen writes, else its default, since later steps read every field.
         for helper in saved.get('helpers') if isinstance(saved.get('helpers'), list) else []:
             if isinstance(helper, dict) and isinstance(helper.get('thread'), str) and isinstance(helper.get('started'), str):
-                self.helpers.setdefault(helper['thread'], helper)
+                fields = {k: helper.get(k) if isinstance(helper.get(k), str) else None for k in ('path', 'model', 'effort')}
+                commands = helper.get('commands')
+                self.helpers.setdefault(helper['thread'], {**fields, 'thread': helper['thread'], 'path': fields['path'] or helper['thread'],
+                                                           'started': helper['started'], 'commands': commands if type(commands) is int else 0})
         # A record edited by hand or cut short is read for what it still holds, never a reason the turn cannot end.
         turns = [turn for turn in turns if isinstance(turn, dict)] if isinstance(turns, list) else []
         last = turns[-1].get('turn') if turns else 0
@@ -539,9 +546,12 @@ class Agent:
                 'helpers': [h['thread'] for h in mine],
                 **({'usage': value.get('usage')} if kind == 'done' else {'error': str(value.get('message'))}),
                 **({'answer': str(answer)} if text and text.strip() else {})}
+        kept = [*turns, turn][-100:]
+        # Only the helpers the kept turns name, in the order they started, so the record stays as bounded as its turns.
+        named = dict.fromkeys(t for k in kept for t in (k.get('helpers') if isinstance(k.get('helpers'), list) else []) if isinstance(t, str))
         document = {'agentId': self.agentId, 'family': self.family, 'lordVersion': VERSION, 'session': self.record.get('session'),
                     **{k: v for k, v in settings.items() if k != 'codex_folder'}, 'vendorSession': self.vendorSession,
-                    'transcript': transcript, 'helpers': list(self.helpers.values()), 'turns': [*turns, turn][-100:]}
+                    'transcript': transcript, 'helpers': [self.helpers[t] for t in named if t in self.helpers], 'turns': kept}
         try:
             if text and text.strip():
                 self.answers_path.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -1372,10 +1382,13 @@ class Daemon:
 
     def gpt_quota(self, a, message):
         # A spent codex allowance is refused until the window that ran out resets, as codex last reported it.
-        # The bucket that meters this model: the one named after it (a limit such as gpt-reserve), else codex's own.
-        # normalModelSlug is only the model lending an alias quota its display name.
+        # The bucket that meters this model: the one named after it, else codex's own. codex writes a limit id in lower
+        # case with '_' for '-' (gpt-reserve's is gpt_reserve) and sends no limitName in its rate-limit events; a limitName,
+        # when its response headers carried one, is the model's own name. normalModelSlug is only the model lending an
+        # alias quota its display name.
         buckets = allowance_buckets()
-        own = [b for k, b in buckets.items() if a.model in (k, b.get('limitName'))] or [b for k, b in buckets.items() if k == 'codex']
+        limit = str(a.model).strip().lower().replace('-', '_')
+        own = [b for k, b in buckets.items() if k == limit or b.get('limitName') == a.model] or [b for k, b in buckets.items() if k == 'codex']
         resets = [w.get('resetsAt') for bucket in own for w in (bucket.get('primary'), bucket.get('secondary'))
                   if isinstance(w, dict) and isinstance(w.get('resetsAt'), (int, float)) and (w.get('usedPercent') or 0) >= 100]
         if not resets: return a.note('usage limit reached; codex named no reset time, so new turns are not refused')
@@ -1787,16 +1800,20 @@ class Daemon:
 
     def sweep(self, days):
         # Files of an agent no journal holds, older than the prune period: a daemon of an earlier version pruned the
-        # agent and removed only the files it knew.
-        known = set(self.agents) | set(self.records(self.legacy_journal, self.journal))
+        # agent and removed only the files it knew. Under the journal lock, which every daemon holds to add a record,
+        # so an agent reopened meanwhile is seen; a file is the agent's by its exact name, never a prefix, and any
+        # other file in logs/ is left alone.
         cutoff = time.time() - days * 86400
-        try: paths = list((HOME / 'logs').iterdir())
-        except OSError: return
-        for path in paths:
-            try:
-                if path.name.split('.', 1)[0] in known or path.lstat().st_mtime >= cutoff: continue
-                shutil.rmtree(path) if path.is_dir() and not path.is_symlink() else path.unlink()
-            except OSError as error: self.log(f'{path} not removed: {error}')
+        with self.journal_lock():
+            known = set(self.agents) | set(self.records(self.legacy_journal, self.journal))
+            try: paths = list((HOME / 'logs').iterdir())
+            except OSError: return
+            for path in paths:
+                owner = next((path.name[:-len(suffix)] for suffix in AGENT_FILES if path.name.endswith(suffix) and len(path.name) > len(suffix)), None)
+                try:
+                    if owner is None or owner in known or path.lstat().st_mtime >= cutoff: continue
+                    shutil.rmtree(path) if path.is_dir() and not path.is_symlink() else path.unlink()
+                except OSError as error: self.log(f'{path} not removed: {error}')
 
     def compact(self, removed=()):
         # The journal rewritten with one line per agent: the newest record of each, from the file (which daemons of
