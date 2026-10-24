@@ -192,7 +192,8 @@ def tests_profile(cwd, dirs, env):
     folder = HERE.parent / 'sandbox'
     profile = '\n'.join((folder / name).read_text() for name in ('seatbelt_base_policy.sbpl', 'seatbelt_preferences_policy.sbpl', 'tests.sbpl'))
     params = {'TMP': canon(env.get('TMPDIR') or '/tmp'), 'PRIVATE_TMP': '/private/tmp',
-              'EXEC_TMP': canon(Path(env['CODEX_HOME']) / 'tmp/arg0-macos'), 'KEY': canon(HOME / 'control.header')}
+              'EXEC_TMP': canon(Path(env['CODEX_HOME']) / 'tmp/arg0-macos'), 'KEY': canon(HOME / 'control.header'),
+              'LORD_HOME': canon(HOME)}
     roots = list(dict.fromkeys(canon(root) for root in [cwd, *dirs]))
     protected = set()
     for i, root in enumerate(roots):
@@ -206,7 +207,8 @@ def tests_profile(cwd, dirs, env):
         name = f'PROTECTED_{i}'
         params[name] = path
         profile += f'\n(lord-protect-metadata (param "{name}"))'
-    return profile + '\n', [f'-D{name}={path}' for name, path in params.items()]
+    profile += '\n(lord-protect-home (param "LORD_HOME"))\n(lord-writable-root (param "EXEC_TMP"))\n'
+    return profile, [f'-D{name}={path}' for name, path in params.items()]
 
 TEMP_ROOTS = ('/tmp', '/private/tmp', '/var/tmp', '/private/var/tmp', '/var/folders', '/private/var/folders')
 
@@ -627,7 +629,7 @@ class Vendor:
         self.codex_home = codex_home
         self.process, self.serial, self.generation = None, 0, 0
         self.exec_process, self.exec_descendants, self.environment_id = None, set(), None
-        self.exec_error = ''
+        self.exec_home, self.exec_error = None, ''
         self.last, self.reason, self.efforts, self.descendants = time.monotonic(), None, [], set()
         self.pending, self.models = {}, []
         self.lock, self.write_lock = asyncio.Lock(), asyncio.Lock()
@@ -717,7 +719,7 @@ class Vendor:
                 raise
 
     async def start_exec(self, command, env, nice):
-        home = HOME / 'exec' / self.agent.agentId
+        self.exec_home = home = HOME / 'exec' / self.agent.agentId
         home.mkdir(parents=True, exist_ok=True, mode=0o700)
         home.chmod(0o700)
         (home / 'tmp/arg0-macos').mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -752,7 +754,7 @@ class Vendor:
         await process.wait()
         if self.stopping or self.d.stopping or self.exec_process is not process: return
         self.reason = self.reason or '@tests exec-server exited'
-        await kill_tree(self.process, self.descendants)
+        await self.kill()
 
     async def kill(self):
         await asyncio.gather(kill_tree(self.process, self.descendants), kill_tree(self.exec_process, self.exec_descendants))
@@ -822,7 +824,7 @@ class Vendor:
                     a.generation = 0
                     a.emit('error', message=self.d.redact(reason or self.error or error), retryable=not (reason or self.error))
             self.d.log(error)
-            try: await self.kill()
+            try: await self.close()
             finally: self.reaped.set()
 
     async def request(self, value):
@@ -991,10 +993,14 @@ class Vendor:
         self.stopping, self.ready = True, False
         for future in [*self.pending.values(), getattr(self, 'initialized', None)]:
             if future and not future.done(): future.set_exception(RuntimeError('Vendor closed'))
-        process, ex = self.process, self.exec_process
+        process, ex, home = self.process, self.exec_process, self.exec_home
         await self.kill()
         if self.process is process: self.process = None
         if self.exec_process is ex: self.exec_process = None
+        # A close finishing after another start must not remove the new process's folder.
+        if self.exec_home is home:
+            self.exec_home = None
+            if home: shutil.rmtree(home, ignore_errors=True)
 
 class Daemon:
     def __init__(self):
@@ -1259,7 +1265,7 @@ class Daemon:
                 raise ValueError('refusing / or a folder holding your home folder as a working folder: start Claude Code in a project folder, or put "@cwd <folder>" on the first line of the task')
             a = self.agents.get(aid)
             if body.get('tests') or (a and a.record.get('tests')):
-                for clash in ('readonly', 'nosandbox', 'net'):
+                for clash in ('readonly', 'nosandbox', 'net', 'tools'):
                     if body.get(clash) or (a and a.record.get(clash)): raise ValueError(f'@tests cannot be used with @{clash}')
             if a and body.get('pin_cwd') and not os.path.samefile(cwd, a.cwd): raise ValueError(f'@cwd is fixed at the first turn ({a.cwd})')
             if isinstance(body.get('path'), str) and body['path']:

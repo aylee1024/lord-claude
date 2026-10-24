@@ -1374,3 +1374,18 @@ test('@nosandbox launch settings report network on without @net', async ($, on) 
   expect(reply.context).toHaveLength(1)
   expect(reply.context[0]).toContain('sandbox none · network on')
 })
+
+test('@tests with @tools is refused before launch', async ($, on) => {
+  const w = world(on)
+  const reply: any = await $.tool.call({ tool: 'Agent', tool_use_id: 'L', subagent_type: 'lord:gpt', prompt: '@tests\n@tools\nwork', description: 'x' } as any)
+  expect(reply.deny).toBe('lord: @tests cannot be used with @tools')
+  expect(w.toolCalls).toEqual([])
+})
+
+for (const first of ['tests', 'tools']) test(`@tests with @tools is refused after an inherited @${first}`, async ($, on) => {
+  const w = world(on)
+  await spawn($)
+  await step($, `@${first}\nwork`)
+  expect((await step($, `@${first === 'tests' ? 'tools' : 'tests'}\nwork`)).result.answer).toContain('@tests cannot be used with @tools')
+  expect(w.requests.filter(x => x.path === '/open')).toHaveLength(1)
+})

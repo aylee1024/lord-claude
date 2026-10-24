@@ -2768,6 +2768,10 @@ def test_tests_exec_server_tree_dies_with_vendor(tests_backend, rig, stop):
                 except ProcessLookupError: break
                 assert time.monotonic() < deadline, 'exec-server left a command running'
                 await asyncio.sleep(.02)
+            deadline = time.monotonic() + 4
+            while (d.journal.parent / 'exec/a').exists():
+                assert time.monotonic() < deadline, 'stopped exec-server left its home behind'
+                await asyncio.sleep(.02)
         finally: await d.close()
     asyncio.run(scenario())
 
@@ -2964,3 +2968,94 @@ def test_nosandbox_reports_network_on_in_open_and_turn_log(rig):
     rig.turn('PING')
     assert 'sandbox none · network on' in (rig.home / 'logs/a.log').read_text()
     assert rig.open('gpt', net=False)['network'] is True
+
+
+@pytest.mark.parametrize('first', ['together', 'tests', 'tools'])
+def test_tests_refuses_tools_in_both_orders(tests_backend, rig, first):
+    d, _, _ = tests_backend
+    async def scenario():
+        try:
+            body = {'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home)}
+            if first != 'together': await d.open({**body, first: True})
+            before = dict(d.agents['a'].record) if first != 'together' else None
+            options = {'tests': True, 'tools': True} if first == 'together' else {'tools' if first == 'tests' else 'tests': True}
+            with pytest.raises(ValueError, match='@tests cannot be used with @tools'):
+                await d.open({**body, **options})
+            if before is not None: assert d.agents['a'].record == before
+            else: assert not d.agents
+        finally: await d.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='macOS Seatbelt profile')
+def test_tests_dir_cannot_open_lord_home_for_writes(tmp_path):
+    m = load('lordd_tests_home_protection')
+    real = tmp_path / 'lord-real'; real.mkdir()
+    home = tmp_path / 'lord'; home.symlink_to(real, target_is_directory=True)
+    m.HOME = home
+    key = home / 'control.header'; key.write_text('decoy')
+    own = home / 'exec/a/tmp/arg0-macos'; own.mkdir(parents=True)
+    other = home / 'exec/b/tmp/arg0-macos'; other.mkdir(parents=True)
+    work = tmp_path / 'work'; work.mkdir()
+    profile, params = m.tests_profile(str(work), [str(home)], {'TMPDIR': str(home), 'CODEX_HOME': str(home / 'exec/a')})
+    code = '''import json, pathlib, sys
+home, own, other = map(pathlib.Path, sys.argv[1:])
+result = {}
+for name, path in [('key', home / 'control.header'), ('journal', home / 'journal.jsonl'), ('other', other / 'apply_patch'), ('own', own / 'apply_patch')]:
+ try: path.write_text('' if name == 'key' else 'x'); result[name] = 'allowed'
+ except PermissionError: result[name] = 'denied'
+print(json.dumps(result))
+'''
+    result = subprocess.run(['/usr/bin/sandbox-exec', '-p', profile, *params, PYTHON, '-c', code, str(home), str(own), str(other)],
+        cwd=work, capture_output=True, text=True, timeout=8)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {'key': 'denied', 'journal': 'denied', 'other': 'denied', 'own': 'allowed'}
+    assert key.read_text() == 'decoy'
+
+
+def test_tests_watch_exec_kills_child_before_any_guard(tmp_path):
+    m = load('lordd_watch_exec_child')
+    async def scenario():
+        v = m.Vendor(types.SimpleNamespace(stopping=False), 'gpt')
+        try:
+            v.process = await asyncio.create_subprocess_exec(PYTHON, '-c', 'import time; time.sleep(300)',
+                cwd=tmp_path, start_new_session=True)
+            code = ('import subprocess, sys, time\n'
+                    'p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n'
+                    'print(p.pid, flush=True)\ntime.sleep(300)\n')
+            v.exec_process = await asyncio.create_subprocess_exec(PYTHON, '-c', code, cwd=tmp_path, start_new_session=True, stdout=-1)
+            child = int(await asyncio.wait_for(v.exec_process.stdout.readline(), 3))
+            assert not v.descendants and not v.exec_descendants
+            ex = v.exec_process
+            watching = asyncio.create_task(v.watch_exec(ex))
+            ex.kill()
+            await asyncio.wait_for(watching, 3)
+            deadline = time.monotonic() + 4
+            while True:
+                try: os.kill(child, 0)
+                except ProcessLookupError: break
+                assert time.monotonic() < deadline, 'exec-server left a child alive before the first guard pass'
+                await asyncio.sleep(.02)
+            assert v.process.returncode is not None
+        finally: await v.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('stop', ['close', '--exec-eof', '--exec-invalid', '--exec-silent', '--fail-environment'])
+def test_tests_close_removes_home_after_normal_or_failed_start(tests_backend, rig, stop):
+    d, m, _ = tests_backend
+    m['EXEC_START_TIMEOUT'] = 1
+    async def scenario():
+        try:
+            body = {'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home), 'tests': True}
+            home = d.journal.parent / 'exec/a'
+            if stop == 'close':
+                await d.open(body)
+                assert home.is_dir()
+                await d.backend(d.agents['a']).close()
+            else:
+                d.config['gpt']['program'].append(stop)
+                with pytest.raises(RuntimeError, match='exec-server|environment refused'): await d.open(body)
+            assert not home.exists()
+        finally: await d.close()
+    asyncio.run(scenario())

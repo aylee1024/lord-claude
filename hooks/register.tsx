@@ -94,6 +94,7 @@ function testsError(family: string, options: Partial<Task>): string | undefined 
   if (family !== 'gpt') return '@tests is available for gpt only'
   for (const clash of ['readonly', 'nosandbox', 'net'] as const)
     if (options[clash]) return `@tests cannot be used with @${clash}`
+  if (options.limits?.tools) return '@tests cannot be used with @tools'
   return undefined
 }
 
