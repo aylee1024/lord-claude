@@ -11,7 +11,7 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
   let streamFinished = false
   // Each /turn or /continue stream takes the next queued event list, else `events`; /row answers `replies.row`.
   const sequence: unknown[][] = []
-  const replies: { row: unknown } = { row: { output: 'row output', stopped: false } }
+  const replies: { row: unknown; allowance?: unknown } = { row: { output: 'row output', stopped: false } }
   mock.env(on, { HOME: '/test', ...(socket ? { LORD_DAEMON_SOCKET: socket } : {}), ...env })
   let spawned = 'lord:gpt'
   const clock = mock.clock(on)
@@ -70,7 +70,10 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
         : requests.some(x => x.path === '/open') ? [{ agentId: 'a1', family: 'gpt', state: 'running' }] : [])
       : path === '/health' ? { ok: true }
       : path === '/open' ? { vendorSession: 'v1', model: 'fake-gpt', effort: 'high' }
-      : path === '/steer' ? { ok: true, steered: true }
+      // codex takes a message into its running turn; grok takes none, and the daemon queues it.
+      : path === '/steer' ? { ok: true, steered: spawned !== 'lord:grok' }
+      : path === '/queue' ? { ok: true, queued: true }
+      : path === '/allowance' ? replies.allowance ?? {}
       : { ok: true }
     return { value: { ok: true, status: 200, headers: {}, text: path === '/turn' || path === '/continue' ? events.map(x => JSON.stringify(x)).join('\n') + '\n' : JSON.stringify(result) } }
   })
@@ -1137,4 +1140,88 @@ test('the plugin keeps the model the daemon ran, not one it refused to switch to
   w.sequence.push([{ type: 'done', text: 'fine' }])
   await step($, 'next')
   expect(w.requests.filter(x => x.path === '/turn').at(-1)?.body?.model).toBe('gemini-4-argon')
+})
+
+
+test('a launch whose option lines Lord cannot read is refused before an agent starts, naming the line', async ($, on) => {
+  world(on)
+  on('fs.read', (_, e) => CONFIGS(e.path))
+  const call = (prompt: string) => $.tool.call({ tool: 'Agent', tool_use_id: 'L', subagent_type: 'lord:gpt', prompt, description: 'x' } as any) as Promise<any>
+  expect((await call('@efort max\nwork')).deny).toBe('lord: unknown option line: @efort max (options: @model, @effort, @cwd, @dir, @readonly, @net, @nosandbox, @tools, @memory, @hang, @wall, @nice)')
+  expect((await call('@model gpt-6-astra\n@model gpt-6-luna\nwork')).deny).toBe('lord: option line repeated: @model gpt-6-luna (only @dir may be given more than once)')
+  expect((await call('@dir /a\n@dir /b\nwork')).deny).toBeUndefined()
+  // A line naming someone, with more than one word after it, is task text.
+  expect((await call('@claude please review this\nwork')).deny).toBeUndefined()
+})
+
+test('a launch result carries one line of the settings asked for, defaults included', async ($, on) => {
+  world(on)
+  on('fs.read', (_, e) => CONFIGS(e.path))
+  const call = (prompt: string) => $.tool.call({ tool: 'Agent', tool_use_id: 'L', subagent_type: 'lord:gpt', prompt, description: 'x' } as any) as Promise<any>
+  expect((await call('@model gpt-6-astra\n@effort max\n@nice 10\n@dir /d\n@memory 20\n@wall 900\nwork')).context)
+    .toEqual(['lord: requested gpt-6-astra max · cwd the agent\'s start folder · dirs /d · sandbox workspace-write · network off · tools off · nice 10 · memory 20 GB · hang none · wall 900 s'])
+  expect((await call('work')).context).toEqual(['lord: requested gpt-6.1-sol high · cwd the agent\'s start folder · dirs none · sandbox workspace-write · network off · tools off · nice 0 · memory 12 GB · hang none · wall none'])
+})
+
+test('@nice reaches the daemon with the other limits', async ($, on) => {
+  const w = world(on)
+  await spawn($)
+  await step($, '@nice 10\nwork')
+  expect(w.requests.find(x => x.path === '/open')?.body.nice).toBe(10)
+})
+
+const RECORD = { ended_how: 'done', model: 'gpt-6.1-sol', effort: 'high', started: '2026-10-24T01:02:03+00:00', ended: '2026-10-24T01:04:05+00:00', commands: 3, retries: 0, helpers: ['gpt-6-luna', 'gpt-6-luna'], session: 's1' }
+
+test('an answer ends with one footer line naming how the turn ended and what ran; a JSON answer gets none', async ($, on) => {
+  world(on, [{ type: 'done', text: 'the answer', record: RECORD }])
+  await spawn($)
+  expect((await step($, 'hello')).result.answer).toBe('the answer\n\n[lord: done · gpt-6.1-sol high · 01:02:03Z to 01:04:05Z · 3 commands · 2 helpers (gpt-6-luna) · session s1]')
+})
+
+test('a JSON answer gets no footer, and an error leads with lord: error and its kind', async ($, on) => {
+  const w = world(on, [{ type: 'done', text: '{"word":"hi"}', record: RECORD }])
+  await spawn($)
+  expect((await step($, 'hello')).result.answer).toBe('{"word":"hi"}')
+  w.events.splice(0, w.events.length, { type: 'error', message: 'refused by vendor (cyberPolicy): flagged', record: { ...RECORD, ended_how: 'error (cyberPolicy)', helpers: [], commands: 1, retries: 1 } })
+  expect((await step($, 'again')).result.answer).toBe('lord: error: refused by vendor (cyberPolicy): flagged\n\n[lord: error (cyberPolicy) · gpt-6.1-sol high · 01:02:03Z to 01:04:05Z · 1 command · 1 retry at capacity · session s1]')
+})
+
+test('SendMessage to a running agent says whether the message was injected or queued', async ($, on) => {
+  const w = world(on, [{ type: 'tool', callId: 'call1', name: 'SendMessage', input: { to: 'other', message: 'hi', summary: 'hi' } }])
+  await spawn($)
+  await step($, 'running')
+  const sent: any = await $.tool.call({ tool: 'SendMessage', tool_use_id: 'm1', to: 'a1', message: 'change course', summary: 'x' } as any)
+  expect(sent.result).toEqual({ success: true, message: "Injected into a1's running turn: gpt reads it at its next step." })
+  expect(w.toolCalls.filter(x => x.tool === 'SendMessage' && x.tool_use_id === 'm1')).toEqual([])
+})
+
+test('SendMessage to a running grok agent is queued as its next turn', async ($, on) => {
+  const w = world(on, [{ type: 'tool', callId: 'call1', name: 'SendMessage', input: { to: 'other', message: 'hi', summary: 'hi' } }])
+  await spawn($, 'lord:grok')
+  await step($, 'running')
+  const sent: any = await $.tool.call({ tool: 'SendMessage', tool_use_id: 'm1', to: 'a1', message: 'and also this', summary: 'x' } as any)
+  expect(sent.result.message).toBe('Queued for a1: grok takes no message mid-turn, so it reads this as soon as its current turn ends and works on it before reporting; its answer will carry both results.')
+  expect(w.requests.find(x => x.path === '/queue')?.body).toEqual({ agentId: 'a1', text: 'and also this' })
+})
+
+test('a description that already names the model is kept as written', async ($, on) => {
+  const w = world(on)
+  on('fs.read', (_, e) => CONFIGS(e.path))
+  const launch = async (prompt: string, description: string) => {
+    await $.tool.call({ tool: 'Agent', tool_use_id: 'L', subagent_type: 'lord:gpt', prompt, description } as any)
+    await $.agent.spawn({ tool_use_id: 'L', prompt, description, subagentType: 'lord:gpt', provider: { plugin: 'lord', tier: 'user' }, parentModel: 'haiku', background: true, fork: false } as any)
+    return w.spawnInputs.at(-1).description
+  }
+  expect(await launch('work', 'gpt-6.1-sol high · review outage memory change')).toBe('gpt-6.1-sol high · review outage memory change')
+  expect(await launch('work', 'Sol 6.1 review of the fix')).toBe('Sol 6.1 review of the fix')
+  expect(await launch('work', 'review of the fix')).toBe('Sol 6.1, high · review of the fix')
+})
+
+test('/lord shows codex\'s allowance and every reset Lord refuses turns until', async ($, on) => {
+  const w = world(on)
+  w.replies.allowance = { gpt: { primary: { usedPercent: 40, windowDurationMins: 10080, resetsAt: 1793000000 }, secondary: { usedPercent: 5, windowDurationMins: 300, resetsAt: 1792000000 }, seen: '2026-10-24T02:00:00+00:00' },
+    refused: [{ family: 'gemini', model: 'gemini-4-argon', until: '2026-10-25T02:00:38+00:00', reason: 'Individual quota reached' }] }
+  const listed: any = await $.command.run({ command: 'lord', args: '' })
+  expect(listed.text).toContain('allowance: codex 7-day window 40% used, resets 2026-10-26 07:33Z; 5-hour window 5% used, resets 2026-10-14 17:46Z (as of 2026-10-24 02:00Z)')
+  expect(listed.text).toContain('refused until 2026-10-25 02:00Z: gemini gemini-4-argon (Individual quota reached)')
 })

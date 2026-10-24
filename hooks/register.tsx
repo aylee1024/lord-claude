@@ -3,7 +3,9 @@ import type { LordAgent as Agent, LordTask as Task } from '../types'
 
 // shown: the text of the latest text block, which the engine takes as the agent's result unless another follows.
 // failed: the turn's new message failed though an earlier answer was delivered; model: the model the daemon ran.
-type Stream = { next: number; live: number; answer: string; shown: string; failed?: boolean; model?: string }
+// record: the daemon's account of the finished turn, for the answer's footer.
+type Stream = { next: number; live: number; answer: string; shown: string; failed?: boolean; model?: string; record?: TurnRecord }
+type TurnRecord = { ended_how: string; model: string; effort: string; started: string; ended: string; commands: number; retries: number; helpers: string[]; session?: string }
 type Outcome = { tool?: { callId: string; name: string; input: Record<string, unknown> }; row?: { rowId: string; shell: boolean; title: string } }
 // A vendor's tool steps are drawn as rows: a shell command as a Bash row, any other step under the plugin's own tool for
 // that vendor, which Claude Code labels "lord - <family>". Neither runs anything; the plugin answers each with the
@@ -50,8 +52,12 @@ function task(text: string): Task {
   })
   const result: Task = { text: '' }
   const lines = text.trim().split(/\r?\n/)
+  const seen = new Set<string>()
   while (lines.length) {
     const line = lines[0].trim()
+    // An option line is @word with at most one value; a longer line starting with @ (a mention) is task text.
+    const word = /^@([a-z]+)(?:\s+\S+)?\s*$/.exec(line)?.[1]
+    if (word && word !== 'dir' && seen.has(word)) { result.error = `option line repeated: ${line} (only @dir may be given more than once)`; break }
     const model = /^@model\s+(\S+)\s*$/.exec(line)
     if (model) result.model = model[1]
     else if (/^@effort\s+(minimal|low|medium|high|xhigh|max|ultra)\s*$/.test(line)) result.effort = line.split(/\s+/)[1]
@@ -62,20 +68,36 @@ function task(text: string): Task {
     else if (/^@hang\s+\d+\s*$/.test(line)) result.limits = { ...result.limits, hang_s: Number(line.split(/\s+/)[1]) }
     else if (/^@wall\s+\d+\s*$/.test(line)) result.limits = { ...result.limits, wall_s: Number(line.split(/\s+/)[1]) }
     else if (line === '@tools') result.limits = { ...result.limits, tools: true }
+    else if (/^@nice\s+\d+\s*$/.test(line)) result.limits = { ...result.limits, nice: Number(line.split(/\s+/)[1]) }
     else if (/^@cwd\s+\S/.test(line)) result.cwd = line.replace(/^@cwd\s+/, '')
     else if (/^@dir\s+\S/.test(line)) result.dirs = [...(result.dirs ?? []), line.replace(/^@dir\s+/, '')]
     // A known option written wrongly would end the options here and leave the rest (an @readonly, say) as task text.
-    else if (/^@(model|effort|readonly|net|nosandbox|memory|hang|wall|tools|cwd|dir)\b/.test(line)) { result.error = `option line not understood: ${line}`; break }
+    else if (/^@(model|effort|readonly|net|nosandbox|memory|hang|wall|tools|cwd|dir|nice)\b/.test(line)) { result.error = `option line not understood: ${line}`; break }
+    // A misspelt option would otherwise run the task at a default (@efort max at high effort).
+    else if (word) { result.error = `unknown option line: ${line} (options: ${OPTIONS})`; break }
     else break
+    if (word) seen.add(word)
     lines.shift()
   }
   result.text = lines.join('\n')
   return result
 }
 
+const OPTIONS = '@model, @effort, @cwd, @dir, @readonly, @net, @nosandbox, @tools, @memory, @hang, @wall, @nice'
+
 function merge(base: Task, more: Partial<Task>): Task {
   return { ...base, ...more, dirs: more.dirs ? [...new Set([...(base.dirs ?? []), ...more.dirs])] : base.dirs,
     limits: more.limits ? { ...base.limits, ...more.limits } : base.limits }
+}
+
+// One line naming how the turn ended and what ran, as the daemon recorded it (logs/<agentId>.json holds the rest). An
+// answer that is one JSON value gets none, so a caller parsing the whole answer still can.
+function signed(text: string, record: TurnRecord | undefined): string {
+  if (!record || typeof record !== 'object') return text
+  try { JSON.parse(text.trim()); return text } catch {}
+  const time = (iso: unknown) => typeof iso === 'string' ? iso.slice(11, 19) + 'Z' : '?'
+  const helpers = record.helpers?.length ? ` · ${record.helpers.length} helper${record.helpers.length > 1 ? 's' : ''} (${[...new Set(record.helpers)].join(', ')})` : ''
+  return `${text}\n\n[lord: ${record.ended_how} · ${record.model} ${record.effort} · ${time(record.started)} to ${time(record.ended)} · ${record.commands} command${record.commands === 1 ? '' : 's'}${helpers}${record.retries ? ` · ${record.retries} retr${record.retries > 1 ? 'ies' : 'y'} at capacity` : ''}${record.session ? ` · session ${record.session}` : ''}]`
 }
 
 function errorLine(error: unknown): string {
@@ -364,6 +386,37 @@ async function steer($: EngineInterface, agentId: string, text: string): Promise
   } catch { return false }
 }
 
+// A SendMessage to a running Lord agent, answered here so the sender learns when it is read: codex takes it into the
+// running turn; grok, agy, and codex between turns take none mid-turn, so the daemon runs it as the next turn as soon as
+// this one ends, and the answer then carries both results. Undefined: not a running Lord agent (the engine delivers).
+async function message($: EngineInterface, to: string, text: string): Promise<string | undefined> {
+  const agent = await lordAgent($, to)
+  if (!agent?.running) return undefined
+  if (await steer($, to, text)) return `Injected into ${to}'s running turn: ${agent.family} reads it at its next step.`
+  const parsed = task(text)
+  if (parsed.error) return undefined
+  try {
+    if (JSON.parse(await request($, '/queue', { agentId: to, text: parsed.text }, await daemonOf($, agent))).queued)
+      return `Queued for ${to}: ${agent.family} takes no message mid-turn, so it reads this as soon as its current turn ends and works on it before reporting; its answer will carry both results.`
+  } catch {}
+  return undefined
+}
+
+// The settings a launch asks for, defaults included, as one line the caller reads with the launch result; the daemon
+// states the effective ones in the agent's log at each turn and the answer's footer names the model that ran.
+async function launchLine($: EngineInterface, family: string, options: Task, effort: string): Promise<string> {
+  const read = (path: string) => $.fs.read(path).then(text => JSON.parse(String(text)), () => undefined)
+  const configs = [await read(`${await $.env.get('HOME')}/.claude/lord/config.json`), await read(`${$.plugin.root}/config.json`)]
+  const setting = (pick: (c: any) => unknown) => configs.map(c => c && pick(c)).find(v => v !== undefined && v !== null)
+  const model = options.model ?? setting(c => c[family]?.model) ?? 'default'
+  const memory = options.limits?.memory_gb ?? Math.round(Number(setting(c => c.memory_ceiling_kb) ?? 12 * 1048576) / 104857.6) / 10
+  const hang = options.limits?.hang_s ?? setting(c => c[family]?.no_progress_s)
+  const sandbox = options.readonly ? 'read-only' : options.nosandbox || family === 'gemini' ? 'none' : 'workspace-write'
+  return `lord: requested ${model} ${effort} · cwd ${options.cwd ?? 'the agent\'s start folder'} · dirs ${options.dirs?.join(', ') || 'none'} · sandbox ${sandbox}` +
+    ` · network ${family !== 'gpt' || options.net ? 'on' : 'off'} · tools ${options.limits?.tools ? 'on' : 'off'} · nice ${options.limits?.nice ?? 0}` +
+    ` · memory ${memory} GB · hang ${hang ? hang + ' s' : 'none'} · wall ${options.limits?.wall_s ? options.limits.wall_s + ' s' : 'none'}`
+}
+
 async function lordAgent($: EngineInterface, agentId: string): Promise<Agent | undefined> {
   // Module state starts empty after a reload; the engine's roster still names each agent's type.
   if (others.has(agentId)) return undefined
@@ -411,13 +464,28 @@ async function* vendorTurn($: EngineInterface, path: string, body: unknown, stre
     } else if (event.type === 'done' && typeof event.text === 'string') {
       // The vendor's final answer alone; narration streamed before it is not the result.
       stream.answer = event.text
+      stream.record = event.record
       stream.failed = event.failed === true
       if (typeof event.model === 'string' && event.model) stream.model = event.model
       return {}
-    } else if (event.type === 'error') throw new Error(event.message || 'daemon turn failed')
+    } else if (event.type === 'error') {
+      stream.record = event.record
+      throw new Error(event.message || 'daemon turn failed')
+    }
     else throw new Error('invalid daemon event')
   }
   throw new Error('daemon stream ended without done or tool')
+}
+
+// codex's allowance windows as it last reported them, and every reset Lord refuses turns until.
+function allowanceLines(allowance: any): string[] {
+  const lines: string[] = []
+  const gpt = allowance?.gpt
+  const when = (at: unknown) => typeof at === 'number' ? new Date(at > 1e12 ? at : at * 1000).toISOString().slice(0, 16).replace('T', ' ') + 'Z' : '?'
+  const windows = [gpt?.primary, gpt?.secondary].filter((w: any) => w && typeof w === 'object')
+  if (windows.length) lines.push(`allowance: codex ${windows.map((w: any) => `${w.windowDurationMins >= 1440 ? Math.round(w.windowDurationMins / 1440) + '-day' : Math.round(w.windowDurationMins / 60) + '-hour'} window ${w.usedPercent}% used, resets ${when(w.resetsAt)}`).join('; ')}${gpt.credits?.balance ? `; credits ${gpt.credits.balance}` : ''} (as of ${String(gpt.seen ?? '?').slice(0, 16).replace('T', ' ')}Z)`)
+  for (const r of allowance?.refused ?? []) lines.push(`refused until ${String(r.until).slice(0, 16).replace('T', ' ')}Z: ${r.family} ${r.model} (${r.reason})`)
+  return lines
 }
 
 export const register: Register = on => {
@@ -445,7 +513,9 @@ export const register: Register = on => {
       const label = model ? `${shortName(model)}, ${effort}` : effort
       // A caller that copied a Lord label into its description gets this one in its place, not a second one.
       const description = (e.description ?? '').replace(new RegExp(`^(?:(?:[^·,]+, )?(?:${RANKS.join('|')}) · )+`), '')
-      input = { ...e, description: description ? `${label} · ${description}` : label, ...(model ? { model } : {}) }
+      // A description that already names the model, by id or short name, is kept as written.
+      const named = !!model && [model, shortName(model)].some(name => description.toLowerCase().includes(name.toLowerCase()))
+      input = { ...e, description: named ? description : description ? `${label} · ${description}` : label, ...(model ? { model } : {}) }
     }
     callEfforts.delete(e.tool_use_id)
     const r = await next(input)
@@ -521,7 +591,7 @@ export const register: Register = on => {
         // A relative @dir is under the agent's working folder too.
         if (input.dirs) input.dirs = input.dirs.map(dir => /^[/~]/.test(dir) ? dir : `${input.cwd ?? (agent.opened ? agent.cwd : undefined) ?? base}/${dir}`)
         const cwd = input.cwd ?? (agent.opened ? agent.cwd : undefined) ?? directories.get(agentId) ?? agent.cwd ?? await $.session.cwd()
-        await request($, '/open', { agentId, family: agent.family, cwd, pin_cwd: !!input.cwd, path: await $.env.get('PATH'), version: await version($), model: chosen.model, effort: chosen.effort ?? e.effort, readonly: chosen.readonly, net: chosen.net, nosandbox: chosen.nosandbox, dirs: chosen.dirs, ...chosen.limits })
+        await request($, '/open', { agentId, family: agent.family, cwd, pin_cwd: !!input.cwd, path: await $.env.get('PATH'), version: await version($), session: await $.session.id().catch(() => undefined), model: chosen.model, effort: chosen.effort ?? e.effort, readonly: chosen.readonly, net: chosen.net, nosandbox: chosen.nosandbox, dirs: chosen.dirs, ...chosen.limits })
         Object.assign(agent, { model: chosen.model, effort: chosen.effort, readonly: chosen.readonly, net: chosen.net, nosandbox: chosen.nosandbox, dirs: chosen.dirs, limits: chosen.limits })
         agent.opened = true
         agent.cwd = cwd
@@ -627,6 +697,7 @@ export const register: Register = on => {
       if (stream.failed && stream.model) agent.model = stream.model
       agent.running = false
       await keep($, agentId)
+      stream.answer = signed(stream.answer, stream.record)
       // The latest block must read as the final answer: the rest of it is added to the block on screen when that block
       // is its beginning, and otherwise the answer is a block of its own.
       if (stream.answer !== stream.shown) {
@@ -652,7 +723,7 @@ export const register: Register = on => {
       }
       // The result is the error alone, so a partial answer is never mistaken for a finished one; the
       // partial text was already shown live.
-      const text = errorLine(error)
+      const text = signed(errorLine(error), stream.record)
       yield { kind: 'text', index: stream.next, text }
       agent.report = text
       agent.lastAnswer = undefined
@@ -683,16 +754,23 @@ export const register: Register = on => {
     if (e.tool === 'Agent' && String((e as any).subagent_type ?? '').startsWith('lord:') && (e as any).name)
       return { deny: `lord agents cannot be named: a named Agent call starts a separate Claude process instead of ${String((e as any).subagent_type).slice(5)}. Launch it without name and message it by the agent id the launch returns.` }
     if (e.tool === 'Agent' && String((e as any).subagent_type ?? '').startsWith('lord:') && (e as any).isolation === 'worktree') isolated.add(e.tool_use_id)
-    let call = e
+    let call = e, launched: string | undefined
     if (e.tool === 'Agent' && String((e as any).subagent_type ?? '').startsWith('lord:')) {
       // The level the vendor will run: an @effort line, else the Agent call's, else the agent files' high, capped per
       // vendor. Claude Code shows the call's effort beside the agent's model, so the call carries that level when it
       // is one Claude Code accepts (ultra is codex-only and stays an @effort line).
-      const input = e as any, effort = capped(String(input.subagent_type).slice(5), task(String(input.prompt ?? '')).effort ?? input.effort ?? 'high')
+      const input = e as any, family = String(input.subagent_type).slice(5), options = task(String(input.prompt ?? ''))
+      // A launch whose option lines Lord cannot read is refused before an agent starts.
+      if (options.error) return { deny: `lord: ${options.error}` }
+      const effort = capped(family, options.effort ?? input.effort ?? 'high')
       callEfforts.set(e.tool_use_id, effort)
       if (effort !== input.effort && ['low', 'medium', 'high', 'xhigh', 'max'].includes(effort)) call = { ...e, effort } as typeof e
+      if (!input.resume) launched = await launchLine($, family, options, effort).catch(() => undefined)
     }
-    const r = await next(call)
+    const input = e as any
+    const sent = e.tool === 'SendMessage' && typeof input.to === 'string' && typeof input.message === 'string' ? await message($, input.to, input.message) : undefined
+    // A message a Lord agent's own vendor sent still reports its result to that vendor below.
+    const r: any = sent ? { result: { success: true, message: sent } } : await next(call)
     const agent = e.agentId ? await lordAgent($, e.agentId) : undefined
     if (e.tool === HANDBACK) {
       if (agent?.handback === 'sent') {
@@ -711,6 +789,7 @@ export const register: Register = on => {
       catch (error) { agent.error = errorLine(error) }
       await keep($, e.agentId!)
     }
+    if (launched && !r.deny && !r.isError) return { ...r, context: [...(r.context ?? []), launched] }
     return r
   })
 
@@ -803,11 +882,13 @@ export const register: Register = on => {
         return { text: `lord: ${args[1]} will use ${args[2]} next turn.` }
       }
       if (args[0]) return { text: 'Usage: /lord [model <agentId> <model>]' }
-      return { text: list.map((agent: any) => {
+      const allowance = JSON.parse(await request($, '/allowance').catch(() => '{}'))
+      return { text: [list.map((agent: any) => {
         const next = agents.get(agent.agentId)?.model
         const tokens = agent.usage ? ` ${agent.usage.input_tokens}+${agent.usage.cache_read_input_tokens} in ${agent.usage.output_tokens} out` : ''
-        return `${agent.agentId} ${agent.family} ${agent.model}${next && next !== agent.model ? ` (next: ${next})` : ''} ${agent.effort ?? ''} ${agent.state}${tokens} ${agent.cwd ?? ''}${agent.activity ? ' — ' + agent.activity : ''}\n  log: ${agent.log}${agent.answer ? `\n  answer: ${agent.answer}` : ''}`
-      }).join('\n') || 'lord: no agents' }
+        const quiet = typeof agent.quiet_s === 'number' ? ` (last vendor action ${agent.quiet_s} s ago)` : ''
+        return `${agent.agentId} ${agent.family} ${agent.model}${next && next !== agent.model ? ` (next: ${next})` : ''} ${agent.effort ?? ''} ${agent.state}${quiet}${tokens} ${agent.cwd ?? ''}${agent.activity ? ' — ' + agent.activity : ''}\n  log: ${agent.log}${agent.answer ? `\n  answer: ${agent.answer}` : ''}`
+      }).join('\n') || 'lord: no agents', ...allowanceLines(allowance)].join('\n') }
     } catch (error) { return { text: errorLine(error) } }
   })
 }
