@@ -188,17 +188,22 @@ def grok_profiles():
 
 EXEC_START_TIMEOUT = 10
 
+def codex_daemon_directory():
+    return Path('/tmp').resolve(strict=True) / f'codex-daemon-{os.geteuid()}'
+
 def tests_profile(cwd, dirs, env):
     folder = HERE.parent / 'sandbox'
     profile = '\n'.join((folder / name).read_text() for name in ('seatbelt_base_policy.sbpl', 'seatbelt_preferences_policy.sbpl', 'tests.sbpl'))
     params = {'TMP': canon(env.get('TMPDIR') or '/tmp'), 'PRIVATE_TMP': '/private/tmp',
               'KEY': canon(HOME / 'control.header'), 'LORD_HOME': canon(HOME)}
+    daemon = codex_daemon_directory()
+    params['CODEX_DAEMON'] = str(daemon)
     roots = list(dict.fromkeys(canon(root) for root in [cwd, *dirs]))
     protected = set()
     for i, root in enumerate(roots):
         name = f'ROOT_{i}'
         params[name] = root
-        profile += f'\n(lord-writable-root (param "{name}"))\n(lord-protect-root (param "{name}"))'
+        profile += f'\n(lord-writable-root (param "{name}"))'
         # Protect absent metadata too, and both a link's name and its target, even under another writable root.
         for metadata in ('.git', '.codex', '.agents'):
             protected.update((os.path.join(root, metadata), canon(os.path.join(root, metadata))))
@@ -206,7 +211,16 @@ def tests_profile(cwd, dirs, env):
         name = f'PROTECTED_{i}'
         params[name] = path
         profile += f'\n(lord-protect-metadata (param "{name}"))'
-    profile += '\n(lord-protect-home (param "LORD_HOME"))\n'
+    profile += '\n(lord-protect-home (param "LORD_HOME"))\n(lord-protect-daemon (param "CODEX_DAEMON"))'
+    writable = [*roots, params['TMP'], params['PRIVATE_TMP']]
+    ancestors = set(roots) | {str(path) for path in daemon.parents}
+    for path in protected | {params['KEY'], params['LORD_HOME']}:
+        ancestors.update(str(parent) for parent in Path(path).parents if inside(str(parent), writable))
+    for i, path in enumerate(sorted(ancestors)):
+        name = f'ANCESTOR_{i}'
+        params[name] = path
+        profile += f'\n(lord-protect-root (param "{name}"))'
+    profile += '\n(deny system-fcntl (fcntl-command 80 110))\n'
     return profile, [f'-D{name}={path}' for name, path in params.items()]
 
 TEMP_ROOTS = ('/tmp', '/private/tmp', '/var/tmp', '/private/var/tmp', '/var/folders', '/private/var/folders')
@@ -641,6 +655,7 @@ class Vendor:
     async def ensure(self):
         async with self.lock:
             await self.reaped.wait()
+            if self.d.stopping: raise RuntimeError('Daemon stopping')
             if self.ready and self.process and self.process.returncode is None: return
             if self.process or self.exec_process: await self.close()
             self.stopping = False
@@ -686,6 +701,7 @@ class Vendor:
                 # codex would keep its thread database in this folder instead, which may be the user's.
                 env.pop('CODEX_SQLITE_HOME', None)
             try:
+                if self.d.stopping: raise RuntimeError('Daemon stopping')
                 if self.family == 'gpt' and self.agent and self.agent.record.get('tests'):
                     await self.start_exec(command[len(nice):-1], env, nice)
                 self.process = await asyncio.create_subprocess_exec(*command,

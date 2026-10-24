@@ -2848,9 +2848,10 @@ def test_tests_close_during_spawn_reaps_the_late_process(tests_backend, rig, mon
         await v.close()
         entered, release = asyncio.Event(), asyncio.Event()
         real = asyncio.create_subprocess_exec
-        spawned = []
+        spawned, app_starts = [], []
         async def gated(*argv, **kw):
             process = await real(*argv, **kw)
+            if 'app-server' in argv: app_starts.append(process)
             if spawn in argv:
                 spawned.append(process)
                 entered.set()
@@ -2865,6 +2866,7 @@ def test_tests_close_during_spawn_reaps_the_late_process(tests_backend, rig, mon
             result, = await asyncio.wait_for(asyncio.gather(starting, return_exceptions=True), 5)
             assert spawned[0].returncode is not None, 'a spawn completed after close and left its process alive'
             assert isinstance(result, RuntimeError) and 'closed' in str(result).lower()
+            if spawn == 'exec-server': assert not app_starts, 'app-server started after close during exec-server spawn'
             for event in rig.audit():
                 if event.get('launch') or event.get('exec_launch'):
                     for pid in [event['pid'], *([event['child']] if event.get('exec_launch') else [])]:
@@ -2874,6 +2876,152 @@ def test_tests_close_during_spawn_reaps_the_late_process(tests_backend, rig, mon
             await asyncio.gather(starting, return_exceptions=True)
             await d.close()
     asyncio.run(scenario())
+
+
+def test_tests_attach_retry_cannot_start_after_daemon_shutdown(tests_backend, rig, monkeypatch):
+    d, _, launched = tests_backend
+    async def scenario():
+        await d.open({'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home), 'tests': True})
+        a = d.agents['a']; v = d.backend(a)
+        await v.close()
+        entered, release = asyncio.Event(), asyncio.Event()
+        real_sleep, real_rpc = asyncio.sleep, v.rpc
+        d.config['retry_delay_s'] = 3
+        failed = False
+        async def fail_once(method, params, **kw):
+            nonlocal failed
+            if method == 'initialize' and not failed:
+                failed = True
+                raise RuntimeError('first start failed')
+            return await real_rpc(method, params, **kw)
+        async def delay(seconds, *args):
+            if seconds == 3:
+                entered.set()
+                await release.wait()
+            else: await real_sleep(seconds, *args)
+        monkeypatch.setattr(v, 'rpc', fail_once)
+        monkeypatch.setattr(asyncio, 'sleep', delay)
+        attaching = asyncio.create_task(d.attach(a))
+        try:
+            await asyncio.wait_for(entered.wait(), 5)
+            await d.close()
+            launched.clear()
+            release.set()
+            result, = await asyncio.wait_for(asyncio.gather(attaching, return_exceptions=True), 5)
+            assert not any('exec-server' in argv or 'app-server' in argv for argv, _ in launched), 'retry spawned a vendor after daemon shutdown'
+            assert isinstance(result, RuntimeError) and 'stopping' in str(result).lower()
+            assert v.process is None and v.exec_process is None
+        finally:
+            release.set()
+            await asyncio.gather(attaching, return_exceptions=True)
+            await v.close()
+            await d.close()
+    asyncio.run(scenario())
+
+
+def test_tests_daemon_path_uses_system_tmp_and_effective_uid(tmp_path, monkeypatch):
+    m = load('lordd_tests_daemon_path')
+    monkeypatch.setattr(m.os, 'geteuid', lambda: 12345)
+    profile, params = m.tests_profile(str(tmp_path), [], {'TMPDIR': str(tmp_path / 'temp'), 'CODEX_HOME': str(tmp_path / 'codex')})
+    values = dict(param[2:].split('=', 1) for param in params)
+    expected = str(Path('/tmp').resolve(strict=True) / 'codex-daemon-12345')
+    assert values.get('CODEX_DAEMON') == expected
+    assert expected not in profile
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='macOS Seatbelt profile')
+def test_tests_real_seatbelt_hides_daemon_and_protects_ancestors(tmp_path, monkeypatch):
+    m = load('lordd_tests_daemon_protection')
+    parent = tmp_path / 'parent'; parent.mkdir()
+    daemon = parent / 'daemon'; daemon.mkdir()
+    canary = daemon / 'canary'; canary.write_text('decoy')
+    work = tmp_path / 'work'; work.mkdir()
+    monkeypatch.setattr(m, 'codex_daemon_directory', lambda: daemon, raising=False)
+    profile, params = m.tests_profile(str(work), [str(tmp_path), str(daemon)], {'TMPDIR': str(parent)})
+    code = '''import errno, json, pathlib, sys
+parent, daemon = map(pathlib.Path, sys.argv[1:])
+(parent / 'sibling').write_text('allowed')
+result = {}
+for name, operation in [('create', lambda: (daemon / 'new').write_text('bad')),
+                        ('read', lambda: (daemon / 'canary').read_text()),
+                        ('delete', lambda: (daemon / 'canary').unlink()),
+                        ('remove_parent', parent.rmdir),
+                        ('rename_parent', lambda: parent.rename(parent.with_name('moved')))]:
+ try: operation(); result[name] = 'allowed'
+ except OSError as error: result[name] = error.errno
+print(json.dumps(result))
+'''
+    result = subprocess.run(['/usr/bin/sandbox-exec', '-p', profile, *params, PYTHON, '-c', code, str(parent), str(daemon)],
+        cwd=work, capture_output=True, text=True, timeout=8)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {name: 1 for name in ('create', 'read', 'delete', 'remove_parent', 'rename_parent')}
+    assert canary.read_text() == 'decoy' and not (daemon / 'new').exists()
+    assert (parent / 'sibling').read_text() == 'allowed'
+    assert str(daemon) not in profile and str(parent) not in profile
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='macOS Seatbelt profile')
+def test_tests_real_seatbelt_keeps_metadata_ancestors_in_place(tmp_path):
+    m = load('lordd_tests_metadata_ancestors')
+    work = tmp_path / 'work'; work.mkdir()
+    extra = tmp_path / 'extra'; extra.mkdir()
+    parent = extra / 'metadata'; parent.mkdir()
+    target = parent / 'git'; target.mkdir()
+    (target / 'canary').write_text('protected')
+    (work / '.git').symlink_to(target, target_is_directory=True)
+    profile, params = m.tests_profile(str(work), [str(extra)], {'TMPDIR': str(tmp_path / 'temp')})
+    code = '''import pathlib, sys
+parent = pathlib.Path(sys.argv[1])
+try: parent.rename(parent.with_name('moved'))
+except PermissionError: pass
+else: raise AssertionError('metadata ancestor moved past the protected path')
+(parent.parent / 'sibling').write_text('allowed')
+'''
+    result = subprocess.run(['/usr/bin/sandbox-exec', '-p', profile, *params, PYTHON, '-c', code, str(parent)],
+        cwd=work, capture_output=True, text=True, timeout=8)
+    assert result.returncode == 0, result.stderr
+    assert (target / 'canary').read_text() == 'protected'
+
+
+def test_tests_profile_denies_mutating_fcntls_after_grants(tmp_path):
+    m = load('lordd_tests_fcntl_rule')
+    profile, _ = m.tests_profile(str(tmp_path), [str(tmp_path / 'extra')], {})
+    rule = '(deny system-fcntl (fcntl-command 80 110))'
+    assert rule in profile
+    assert profile.index(rule) > profile.rindex('(lord-writable-root (param ')
+    assert profile.index(rule) > profile.rindex('(allow file-write*')
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='macOS Seatbelt profile')
+def test_tests_real_seatbelt_denies_fcntl_on_read_only_descriptor(tmp_path):
+    m = load('lordd_tests_real_fcntl')
+    work = tmp_path / 'work'; work.mkdir()
+    control, canary = tmp_path / 'control', tmp_path / 'canary'
+    for path in (control, canary): path.write_text('must survive\n')
+    profile, params = m.tests_profile(str(work), [], {'TMPDIR': str(work)})
+    code = '''import ctypes, json, os, struct, sys
+path, mode = sys.argv[1:]
+fd = os.open(path, os.O_RDWR if mode == 'control' else os.O_RDONLY)
+libc = ctypes.CDLL(None, use_errno=True)
+libc.fcntl.argtypes = [ctypes.c_int, ctypes.c_int]
+libc.fgetattrlist.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_ulong]
+attributes = ctypes.create_string_buffer(struct.pack('HHIIIII', 5, 0, 0x00080000, 0, 0, 0, 0))
+generation = (ctypes.c_uint32 * 2)()
+assert libc.fgetattrlist(fd, attributes, generation, ctypes.sizeof(generation), 0x20) == 0, ctypes.get_errno()
+assert generation[0] == ctypes.sizeof(generation)
+result = libc.fcntl(fd, 80, ctypes.c_uint32(generation[1]))
+print(json.dumps({'result': result, 'errno': ctypes.get_errno() if result == -1 else 0}))
+os.close(fd)
+'''
+    positive = subprocess.run([PYTHON, '-c', code, str(control), 'control'], cwd=work, capture_output=True, text=True, timeout=8)
+    assert positive.returncode == 0, positive.stderr
+    assert json.loads(positive.stdout) == {'result': 0, 'errno': 0}
+    assert control.read_bytes() == b'', 'F_MAKECOMPRESSED positive control must truncate'
+    result = subprocess.run(['/usr/bin/sandbox-exec', '-p', profile, *params, PYTHON, '-c', code, str(canary), 'readonly'],
+        cwd=work, capture_output=True, text=True, timeout=8)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {'result': -1, 'errno': 1}
+    assert canary.read_text() == 'must survive\n'
 
 
 def test_tests_profile_uses_parameters_and_protects_resolved_metadata(tmp_path, monkeypatch):
