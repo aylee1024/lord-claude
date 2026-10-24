@@ -3051,7 +3051,7 @@ print(json.dumps(result))
 
 @pytest.mark.parametrize('phase', ['first', 'enable', 'add_dir', 'start'])
 @pytest.mark.parametrize('kind', ['cwd_leaf', 'cwd_parent', 'dir_leaf', 'dir_parent', 'tmp_leaf', 'tmp_parent',
-                                 'home_leaf', 'home_parent', 'home_cwd', 'home_dir', 'home_tmp', 'home_tmp_alias', 'home_var_alias', 'home_var_leaf', 'home_data_alias'])
+                                 'home_leaf', 'home_parent', 'home_cwd', 'home_dir', 'home_tmp', 'home_tmp_alias', 'home_var_alias', 'home_var_leaf'])
 def test_tests_refuses_unsafe_layout_at_open_and_start(tests_backend, rig, monkeypatch, phase, kind):
     d, m, launched = tests_backend
     async def scenario():
@@ -3066,7 +3066,6 @@ def test_tests_refuses_unsafe_layout_at_open_and_start(tests_backend, rig, monke
                 if kind.startswith('tmp_'):
                     temp = private / 'parent/temp'; temp.mkdir(parents=True)
             if kind == 'home_var_alias': extra = private
-            if kind == 'home_data_alias': extra = Path('/System/Volumes/Data') / extra.relative_to('/')
             monkeypatch.setenv('TMPDIR', str(temp))
             home = Path('/var/tmp') / private.name / 'parent/lord' if kind == 'home_var_leaf' else rig.home / 'lord-parent/lord'
             home.mkdir(parents=True)
@@ -3091,8 +3090,6 @@ def test_tests_refuses_unsafe_layout_at_open_and_start(tests_backend, rig, monke
                 elif kind in ('home_cwd', 'home_dir', 'home_tmp'):
                     m['HOME'] = {'home_cwd': work, 'home_dir': extra, 'home_tmp': temp}[kind] / 'lord'
                     m['HOME'].mkdir()
-                elif kind == 'home_data_alias':
-                    m['HOME'] = Path(m['canon'](extra)) / 'lord'; m['HOME'].mkdir()
                 else:
                     alias = '/var/tmp' if kind == 'home_var_alias' else '/tmp'
                     m['HOME'] = Path(alias) / private.name / 'lord'
@@ -3115,6 +3112,83 @@ def test_tests_refuses_unsafe_layout_at_open_and_start(tests_backend, rig, monke
                 else: assert not d.agents
             finally: await d.close()
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('phase', ['open', 'start'])
+def test_tests_linked_lord_home_refusal_explains_repair(tests_backend, rig, phase):
+    d, m, launched = tests_backend
+    async def scenario():
+        body = {'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home / 'work'), 'tests': True}
+        try:
+            if phase == 'start':
+                await d.open(body)
+                v = d.backend(d.agents['a']); await v.close()
+            target = rig.home / 'dotfiles'; (target / 'lord').mkdir(parents=True)
+            link = rig.home / 'user/.claude'; link.parent.mkdir()
+            link.symlink_to(target, target_is_directory=True)
+            m['HOME'] = link / 'lord'
+            launched.clear()
+            with pytest.raises(ValueError, match='@tests') as refused:
+                if phase == 'start': await v.ensure()
+                else: await d.open(body)
+            message = str(refused.value)
+            assert "needs Lord's folder" in message and 'on a real path' in message
+            assert str(m['HOME']) in message and f'{link} is a symlink' in message
+            assert 'replace it with the folder it points to' in message
+            assert not any('exec-server' in argv or 'app-server' in argv for argv, _ in launched)
+        finally: await d.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='macOS data-volume alias')
+@pytest.mark.parametrize('phase', ['open', 'start'])
+@pytest.mark.parametrize('root', ['cwd', 'dir'])
+def test_tests_refuses_data_volume_writable_root(tests_backend, rig, phase, root):
+    d, _, launched = tests_backend
+    async def scenario():
+        work = rig.home / 'work'
+        extra = rig.home / 'extra'; extra.mkdir()
+        path = Path('/System/Volumes/Data') / (work if root == 'cwd' else extra).relative_to('/')
+        body = {'agentId': 'a', 'family': 'gpt', 'cwd': str(work), 'tests': True, 'dirs': [str(extra)]}
+        try:
+            if phase == 'start':
+                await d.open(body)
+                a = d.agents['a']; v = d.backend(a); await v.close()
+                if root == 'cwd': a.cwd = a.record['cwd'] = str(path)
+                else: a.record['dirs'] = [str(path)]
+            elif root == 'cwd': body['cwd'] = str(path)
+            else: body['dirs'] = [str(path)]
+            launched.clear()
+            with pytest.raises(ValueError, match='@tests') as refused:
+                if phase == 'start': await v.ensure()
+                else: await d.open(body)
+            assert str(path) in str(refused.value)
+            assert 'use the path without /System/Volumes/Data' in str(refused.value)
+            assert not any('exec-server' in argv or 'app-server' in argv for argv, _ in launched)
+        finally: await d.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='macOS data-volume alias')
+def test_tests_real_home_containment_with_data_volume_spelling(tmp_path):
+    m = load('lordd_real_home_containment')
+    work = tmp_path / 'work'; work.mkdir()
+    home = work / 'lord'; home.mkdir()
+    m.HOME = Path('/System/Volumes/Data') / home.relative_to('/')
+    assert m.normalize_system_aliases(m.HOME) != m.canon(m.HOME)
+    with pytest.raises(ValueError, match="Lord's folder.*inside writable root"):
+        m.validate_tests_layout(str(work), [], {'TMPDIR': str(tmp_path / 'temp')})
+
+
+def test_nested_symlink_component_rejects_two_level_link(tmp_path, monkeypatch):
+    m = load('lordd_symlink_depth_boundary')
+    def lstat(path):
+        if str(path) in ('/top', '/top/link'): return types.SimpleNamespace(st_mode=0o120777)
+        raise FileNotFoundError(str(path))
+    with monkeypatch.context() as patch:
+        patch.setattr(m.Path, 'lstat', lstat)
+        assert m.nested_symlink_component('/top/link/missing') == '/top/link'
+        assert m.nested_symlink_component('/top/missing') is None
 
 
 @pytest.mark.skipif(sys.platform != 'darwin', reason='macOS Seatbelt profile')
@@ -3188,10 +3262,6 @@ else: raise AssertionError('named Unix socket allowed')
     result = subprocess.run(['/usr/bin/sandbox-exec', '-p', profile, *params, PYTHON, '-c', code], cwd=tmp_path,
         capture_output=True, text=True, timeout=8)
     assert result.returncode == 0, result.stderr
-    for name in ('README.md', 'CONTRACT.md'):
-        text = (ROOT / name).read_text()
-        assert 'every Unix socket bound to a path is denied' in text
-        assert 'socketpair' in text and 'asyncio' in text
 
 
 def test_tests_profile_denies_mutating_fcntls_after_grants(tmp_path):

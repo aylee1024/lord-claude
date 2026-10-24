@@ -208,7 +208,11 @@ def nested_symlink_component(path):
         if stat.S_ISLNK(mode) and len(component.parents) >= 2: return str(component)
 
 def tests_root(path, label):
+    if label in ('cwd', '@dir') and inside(os.path.abspath(Path(path).expanduser()), ('/System/Volumes/Data',)):
+        raise ValueError(f'@tests {label} {path} uses /System/Volumes/Data; use the path without /System/Volumes/Data')
     if link := nested_symlink_component(path):
+        if label == "Lord's folder":
+            raise ValueError(f"@tests needs Lord's folder {path} on a real path: {link} is a symlink; replace it with the folder it points to")
         fix = 'use the real path; set TMPDIR to a real folder' if label == 'TMPDIR' else 'use the real path'
         raise ValueError(f'@tests {label} {path} contains symlink component {link}; {fix}')
     return normalize_system_aliases(path)

@@ -37,7 +37,7 @@ You can also put options on their own lines at the start of a task or message:
 | `@effort <level>` | Reasoning effort, `low` to `ultra`. The nearest level the model supports is used |
 | `@readonly` | Cannot change your files: gpt writes nothing, grok writes only temp folders and `~/.grok` (gpt and grok only) |
 | `@net` | Turn on network for gpt; grok and gemini always have it |
-| `@tests` | gpt's test sandbox: loopback TCP, sysctl and psutil; writes confined. No direct internet; loopback reaches every local service, so a local proxy can pass traffic on. Not with `@readonly`, `@nosandbox`, `@net`, `@tools`. Refuses nested symlinks in working, `@dir`, temp or Lord-folder paths, and writable roots containing Lord's folder; use real paths and set TMPDIR to a real folder |
+| `@tests` | gpt's test sandbox: loopback TCP, sysctl and psutil; writes confined. No direct internet; loopback reaches every local service, so a local proxy can pass traffic on. Not with `@readonly`, `@nosandbox`, `@net`, `@tools`. Refuses nested symlinks in working, `@dir`, temp or Lord-folder paths, and writable roots containing Lord's folder; use real paths and set TMPDIR to a real folder. For cwd and `@dir`, use the path without `/System/Volumes/Data` |
 | `@nosandbox` | Run gpt with no sandbox: it can run any command and write anywhere, as Claude Code's own agents can when its sandbox is off. For commands that need unrestricted access. Not with `@readonly` |
 | `@cwd <folder>` | The folder the agent works in |
 | `@dir <folder>` | An extra folder gpt may write to |
@@ -64,6 +64,8 @@ gpt permissions measured on macOS with codex 0.164.0 (default `workspace-write`,
 `@tests` loopback reaches every local TCP service on the machine. `/bin/ps` stays blocked because it is setuid; psutil works. Under `@tests`, every Unix socket bound to a path is denied to block control sockets in temp folders such as tmux's, which could let commands act outside the sandbox; `socketpair` and asyncio's internal pairs still work, as do `Pool` with spawn or fork and `ProcessPoolExecutor`, while `multiprocessing.Manager` and forkserver fail. Writes also cover `@dir` folders; `.git`, `.codex` and `.agents` at each writable project root stay read-only, including first-time creation, as in workspace-write. Launch and turn settings say `sandbox tests`.
 
 Where each agent can write: gpt in its folder, `@dir` folders and temp folders (anywhere with `@nosandbox`); grok in its folder, temp folders and `~/.grok`; gemini anywhere, because agy has no sandbox. A sandbox limits one agent, not the agents it starts, so use `@readonly` when an agent must not change anything. A read-only agent cannot start or message other agents.
+
+In all gpt modes, Lord starts codex and codex starts git and other programs by name from the Claude Code session's `PATH`, outside the sandbox; this predates 2.2.1. Start Claude Code with no folders on `PATH` that an agent can write, such as an activated project virtual environment, since a sandboxed command can replace a program there that later runs unconfined.
 
 Launch Lord agents without a `name`: a named launch would start a separate Claude process instead of the vendor, so Lord refuses it. Message an agent by the id its launch returns; it keeps its working folder across messages.
 
