@@ -2016,10 +2016,11 @@ def test_codex_without_tools_lists_no_skills_and_a_read_only_agent_starts_no_hel
     rig.open('gpt', readonly=True)
     config = [e['params'] for e in rig.audit() if e.get('method') == 'thread/start'][-1]['config']
     assert config['skills'] == {'include_instructions': False, 'bundled': {'enabled': False}}
-    assert config['features'] == {'multi_agent': False}
+    # codex picks helpers by agents.enabled, then multi_agent_v2, then the model catalog, then multi_agent.
+    assert config['features'] == {'multi_agent': False, 'multi_agent_v2': False} and config['agents'] == {'enabled': False}
     rig.open('gpt', agent='b', tools=True)
     config = [e['params'] for e in rig.audit() if e.get('method') == 'thread/start'][-1]['config']
-    assert 'skills' not in config and 'features' not in config
+    assert 'skills' not in config and 'features' not in config and 'agents' not in config
 
 
 def test_helper_agent_steps_reach_the_parents_log_and_record_but_never_its_rows(rig):
@@ -2085,8 +2086,10 @@ def test_a_spent_codex_allowance_is_shown_and_refused_until_its_reset(rig):
     failed = rig.turn('SPENT')[-1]
     assert failed['type'] == 'error' and failed['record']['ended_how'] == 'error (usageLimitExceeded)'
     allowance = rig.request('/allowance')
-    reset = allowance['gpt']['primary']['resetsAt']
-    assert allowance['gpt']['primary'] == {'usedPercent': 100, 'windowDurationMins': 10080, 'resetsAt': reset} and allowance['gpt']['seen']
+    reset = allowance['gpt']['codex']['primary']['resetsAt']
+    assert allowance['gpt']['codex']['primary'] == {'usedPercent': 100, 'windowDurationMins': 10080, 'resetsAt': reset} and allowance['gpt']['codex']['seen']
+    # Another quota bucket's report is kept apart.
+    assert allowance['gpt']['reserve']['primary']['usedPercent'] == 50
     assert allowance['refused'][0]['family'] == 'gpt' and allowance['refused'][0]['until'] == time.strftime('%Y-%m-%dT%H:%M:%S+00:00', time.gmtime(reset))
     conn, file, status, _ = rig.connect('/open', {'agentId': 'b', 'family': 'gpt', 'cwd': str(rig.home)})
     try: assert status == 400 and 'gpt quota reached' in json.loads(file.read())['error']
@@ -2118,9 +2121,10 @@ def test_each_turn_has_a_record_a_kept_answer_and_a_footer_and_prune_removes_the
 
 def test_open_and_every_turn_state_the_effective_settings_with_their_defaults(rig):
     opened = rig.open('gpt', dirs=[str(rig.home)], wall_s=900)
-    assert opened['memory_gb'] == 12.0 and opened['wall_s'] == 900 and opened['hang_s'] is None and opened['nice'] == 0
+    # The niceness reported is the one the vendor runs at: the daemon's own, here the test's.
+    assert opened['memory_gb'] == 12.0 and opened['wall_s'] == 900 and opened['hang_s'] is None and opened['nice'] == os.getpriority(os.PRIO_PROCESS, 0)
     assert opened['dirs'] == [str(rig.home.resolve())] and opened['sandbox'] == 'workspace-write' and opened['network'] is False
-    assert opened['line'].startswith(f'cwd {rig.home.resolve()} · dirs {rig.home.resolve()} · sandbox workspace-write · network off · tools off · nice 0 · memory 12.0 GB')
+    assert opened['line'].startswith(f"cwd {rig.home.resolve()} · dirs {rig.home.resolve()} · sandbox workspace-write · network off · tools off · nice {opened['nice']} · memory 12.0 GB")
     rig.turn('PING')
     line = next(l for l in (rig.home / 'logs/a.log').read_text().splitlines() if ' turn: ' in l)
     assert line.endswith(f"turn: gpt {opened['model']} effort {opened['effort']} · {opened['line']}")
@@ -2237,3 +2241,70 @@ def test_an_interrupt_while_a_retry_is_being_sent_still_stops_codexs_turn():
         await asyncio.gather(a.retry_task, return_exceptions=True)
         return requests, a.state
     assert asyncio.run(main()) == (['turn/start', 'turn/interrupt'], 'idle')
+
+
+
+def test_helpers_of_codexs_older_helper_mode_are_logged_too(rig):
+    rig.open('gpt')
+    assert rig.turn('HELPER1')[-1]['type'] == 'done'
+    log = (rig.home / 'logs/a.log').read_text()
+    record = json.loads((rig.home / 'logs/a.json').read_text())
+    thread = record['helpers'][0]['thread']
+    assert f'[{thread}] $ /bin/zsh -lc "cat notes.md"' in log and record['helpers'][0]['model'] == 'gpt-6-luna'
+
+
+def test_an_interrupted_grok_turn_is_recorded_as_interrupted(rig):
+    rig.open('grok')
+    stream = rig.stream('/turn', {'agentId': 'a', 'text': 'SLOW'})
+    assert next(stream)['type'] == 'activity'
+    rig.request('/interrupt', {'agentId': 'a'})
+    list(stream)
+    assert json.loads((rig.home / 'logs/a.json').read_text())['turns'][-1]['ended_how'] == 'interrupted'
+
+
+def test_a_malformed_record_or_allowance_file_never_stops_a_turn(tmp_path):
+    m = load('lordd_malformed')
+    a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6.1-sol'})
+    a.state = 'running'
+    a.record_path.parent.mkdir(parents=True, exist_ok=True)
+    for text in ('{"turns": [1]}', '{"turns": 3}', '[]', '{"turns": [{"turn": "x"}]}'):
+        a.record_path.write_text(text)
+        assert a.turn_record('done', {'text': 'ok'})['ended_how'] == 'done'
+    (m.HOME / 'allowance.json').write_text('[]')
+    d = object.__new__(m.Daemon); d.log = lambda text: None
+    d.allowance({'limitId': 'codex', 'primary': {'usedPercent': 1}})
+    assert m.allowance_buckets()['codex']['primary'] == {'usedPercent': 1}
+
+
+def test_the_read_list_stops_growing_at_its_limit(tmp_path):
+    m = load('lordd_reads_limit')
+    m.READS_LIMIT = 60
+    a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6.1-sol'})
+    for n in range(10): a.read_paths([('read', f'/w/file{n}.py')])
+    lines = a.reads_path.read_text().splitlines()
+    assert lines[-1] == m.READS_FULL and len(lines) < 10
+    a.read_paths([('read', '/w/later.py')])
+    assert a.reads_path.read_text().splitlines() == lines
+
+
+def test_the_mcp_helper_runs_from_lords_folder(tmp_path):
+    home = tmp_path / 'lord-home'
+    proc = subprocess.Popen([PYTHON, str(DAEMON), '--mcp', 'a'], cwd=str(ROOT), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            env={**os.environ, 'LORD_HOME': str(home), 'LORD_DAEMON_SOCKET': str(home / 'x.sock')})
+    try:
+        proc.stdin.write(b'{"jsonrpc":"2.0","id":1,"method":"ping"}\n'); proc.stdin.flush()
+        assert json.loads(proc.stdout.readline())['id'] == 1
+        out = subprocess.run(['/usr/sbin/lsof', '-a', '-p', str(proc.pid), '-d', 'cwd', '-Fn'], capture_output=True, text=True).stdout
+        assert f'n{home.resolve()}' in out.splitlines()
+    finally:
+        proc.stdin.close(); proc.wait(timeout=10)
+
+
+def test_the_niceness_reported_is_the_one_the_vendor_runs_at(monkeypatch):
+    m = load('lordd_nice_reported')
+    d = object.__new__(m.Daemon); d.config = {'gpt': {}}
+    a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '/w', 'model': 'gpt-6.1-sol', 'nice': 3})
+    monkeypatch.setattr(m.os, 'getpriority', lambda *args: 8)
+    assert d.settings(a)['nice'] == 8
+    a.record['nice'] = 12
+    assert d.settings(a)['nice'] == 12

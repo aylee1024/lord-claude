@@ -58,8 +58,9 @@ agent's latest non-empty final answer, redacted, removed with the record), `logs
 `commands`, `retries`, `helpers`, `usage` or `error`, `answer`), `logs/<agentId>.answers/<n>.md` (each turn's answer or
 `lord: error:` line, redacted; turn n-100's is deleted as turn n is written), `logs/<agentId>.reads.txt` (gpt only: one line
 per path first read, listed, searched or edited, from codex's `commandActions` and `fileChange`, a helper's tagged with its
-path), all removed with the record; `allowance.json` (codex's last `account/rateLimits/updated`, merged as codex sends
-it, with `seen`; one file every daemon replaces), `lordd.log` (1 MB, one rotation). Two global side effects: an agy MCP entry `lord` while a daemon runs (added
+path; it stops at 4 MB with a last line saying so), all removed with the record; `allowance.json` (`{gpt: {<limitId>:
+snapshot}}`, codex's last `account/rateLimits/updated` for each quota bucket, merged within the bucket as codex sends it,
+with `seen`; one file every daemon replaces; a malformed file reads as empty), `lordd.log` (1 MB, one rotation). Two global side effects: an agy MCP entry `lord` while a daemon runs (added
 or updated at each gemini agent start, removed when a daemon exits with no daemon of another version running; agy has
 no per-run MCP option) and the `lord-workspace` and `lord-readonly` profiles between `# lord: begin` and `# lord: end` in
 `$GROK_HOME/sandbox.toml` (default `~/.grok`), rewritten only when they differ.
@@ -79,7 +80,7 @@ can reach them; grok's Lord profiles deny reading it); without it the reply is 4
 | POST | /tool_result | `{agentId, callId, text, isError}` | `{ok}` |
 | POST | /steer | `{agentId, text}` | `{ok, steered}` (codex `turn/steer` while a turn runs; logged as `message injected into the running turn:`) |
 | POST | /queue | `{agentId, text}` | `{ok, queued}`: while a turn runs, the text becomes the next turn, started when this one ends in the same stream (joined to any message already queued, and a `/turn` arriving meanwhile joins it), its done text prefixed `Result of the task, before the message sent while it ran:`; logged as `message queued for the next turn:` |
-| GET | /allowance | - | `{gpt, refused}`: `allowance.json`'s codex report, and each quota reset Lord refuses turns until |
+| GET | /allowance | - | `{gpt, refused}`: `allowance.json`'s codex buckets, and each quota reset Lord refuses turns until |
 | POST | /interrupt, /close | `{agentId}` | `{ok}` (codex `turn/interrupt`, then the codex process is stopped once a started turn ends, since codex leaves the running command alive; grok `session/cancel`; agy process kill; close also stops the process) |
 | POST | /mcp | `{agentId, name, arguments, token}` | the lord tool call of a vendor's MCP server; the per-agent token is required |
 | POST | /prune | `{days}` | `{ok, pruned}`; also at daemon start and hourly: journal records unused for `prune_days`; codex threads archived, vendor history otherwise kept |
@@ -108,9 +109,11 @@ waits undelivered, for up to `keep_undelivered_s` (a day).
   `workspace-write` (writable roots = cwd + `dirs`), `read-only`, or `danger-full-access` with `nosandbox`, network per `net`, the lord MCP server, and the
   user's codex MCP servers, codex plugins and notifier disabled unless `tools`; without `tools` also
   `skills: {include_instructions: false, bundled: {enabled: false}}` (codex lists skills from its skills folder and plugin
-  caches, the remote ones included, which the plugin switch-off misses), and for `readonly` `features: {multi_agent: false}`
-  (no helper agents). A codex helper (`subAgentActivity` with `agentThreadId`, `agentPath`, `model`, `reasoningEffort`, from
-  the agent's thread or another helper's) is mapped to its agent: the helper's completed steps go to the agent's log as
+  caches, the remote ones included, which the plugin switch-off misses), and for `readonly` `features: {multi_agent: false, multi_agent_v2: false}` and `agents: {enabled: false}`
+  (no helper agents: codex picks its helper mode from `agents.enabled`, then `multi_agent_v2`, then the model catalog,
+  then `multi_agent`; a thread's `config` is merged key by key over the user's `config.toml`). A codex helper (`subAgentActivity` with `agentThreadId`, `agentPath`, `model`, `reasoningEffort`, or in
+  codex's older helper mode a `collabAgentToolCall` `spawnAgent` with `receiverThreadIds`, from the agent's thread or
+  another helper's) is mapped to its agent: the helper's completed steps go to the agent's log as
   `[<agentPath>] <line>` and to its read list, never to rows or events. `webSearch` lines name `action`'s query, queries,
   url or pattern; a search with none yet gets its row when it completes.
 - grok: `grok --sandbox <write_sandbox|readonly_sandbox> agent --always-approve stdio` per agent, defaults
@@ -198,7 +201,9 @@ goes as an `@model` first line); `send_message(to, text)` becomes SendMessage; `
   defaults. The answer (not a bare JSON value) and the `lord: error:` line end with the `record` line `[lord: <ended_how> ·
   <model> <effort> · <start> to <end> · <n> commands · <helpers> · <retries> · session <id>]`; `lastAnswer`, which a
   schema step reads, stays without it. A `SendMessage` to a running Lord agent is answered by the mod: `/steer`, else
-  `/queue`, with a reply saying which; the vendor's own SendMessage call still gets its result. A launch description
+  `/queue`, with a reply saying which; the vendor's own SendMessage call still gets its result. A message asking for
+  `@readonly` is never steered into an agent that is not read-only, and a message carrying any option line is never
+  queued (a queued turn starts in the daemon, past `/open`): Claude Code delivers those as the agent's next turn. A launch description
   that names the model (id or short name) is not labelled.
 - `turn.step`: index 0 opens and starts the turn; a later step after a lord tool continues it. In auto permission mode
   Claude Code delivers a subagent's report only through its `SubagentHandback` tool (its reminder is in the API form of

@@ -11,7 +11,7 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
   let streamFinished = false
   // Each /turn or /continue stream takes the next queued event list, else `events`; /row answers `replies.row`.
   const sequence: unknown[][] = []
-  const replies: { row: unknown; allowance?: unknown } = { row: { output: 'row output', stopped: false } }
+  const replies: { row: unknown; allowance?: unknown; steered?: boolean } = { row: { output: 'row output', stopped: false } }
   mock.env(on, { HOME: '/test', ...(socket ? { LORD_DAEMON_SOCKET: socket } : {}), ...env })
   let spawned = 'lord:gpt'
   const clock = mock.clock(on)
@@ -71,7 +71,7 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
       : path === '/health' ? { ok: true }
       : path === '/open' ? { vendorSession: 'v1', model: 'fake-gpt', effort: 'high' }
       // codex takes a message into its running turn; grok takes none, and the daemon queues it.
-      : path === '/steer' ? { ok: true, steered: spawned !== 'lord:grok' }
+      : path === '/steer' ? { ok: true, steered: replies.steered ?? spawned !== 'lord:grok' }
       : path === '/queue' ? { ok: true, queued: true }
       : path === '/allowance' ? replies.allowance ?? {}
       : { ok: true }
@@ -1219,10 +1219,12 @@ test('a description that already names the model is kept as written', async ($, 
 
 test('/lord shows codex\'s allowance and every reset Lord refuses turns until', async ($, on) => {
   const w = world(on)
-  w.replies.allowance = { gpt: { primary: { usedPercent: 40, windowDurationMins: 10080, resetsAt: 1793000000 }, secondary: { usedPercent: 5, windowDurationMins: 300, resetsAt: 1792000000 }, seen: '2026-10-24T02:00:00+00:00' },
+  w.replies.allowance = { gpt: { codex: { primary: { usedPercent: 40, windowDurationMins: 10080, resetsAt: 1793000000 }, secondary: { usedPercent: 5, windowDurationMins: 300, resetsAt: 1792000000 }, seen: '2026-10-24T02:00:00+00:00' },
+      reserve: { limitName: 'GPT reserve', primary: { usedPercent: 90, windowDurationMins: 10080, resetsAt: 1793000000 }, seen: '2026-10-24T01:00:00+00:00' } },
     refused: [{ family: 'gemini', model: 'gemini-4-argon', until: '2026-10-25T02:00:38+00:00', reason: 'Individual quota reached' }] }
   const listed: any = await $.command.run({ command: 'lord', args: '' })
   expect(listed.text).toContain('allowance: codex 7-day window 40% used, resets 2026-10-26 07:33Z; 5-hour window 5% used, resets 2026-10-14 17:46Z (as of 2026-10-24 02:00Z)')
+  expect(listed.text).toContain('allowance: codex (GPT reserve) 7-day window 90% used, resets 2026-10-26 07:33Z (as of 2026-10-24 01:00Z)')
   expect(listed.text).toContain('refused until 2026-10-25 02:00Z: gemini gemini-4-argon (Individual quota reached)')
 })
 
@@ -1253,4 +1255,15 @@ test('a repeated known option is refused whatever its value holds', async ($, on
   on('fs.read', (_, e) => CONFIGS(e.path))
   const denied: any = await $.tool.call({ tool: 'Agent', tool_use_id: 'L', subagent_type: 'lord:gpt', prompt: '@cwd /a folder\n@cwd /other folder\nwork', description: 'x' } as any)
   expect(denied.deny).toBe('lord: option line repeated: @cwd /other folder (only @dir may be given more than once)')
+})
+
+
+test('a message queued for gpt says why it was not taken into the turn', async ($, on) => {
+  const w = world(on, [{ type: 'tool', callId: 'call1', name: 'SendMessage', input: { to: 'other', message: 'hi', summary: 'hi' } }])
+  await spawn($)
+  await step($, 'running')
+  // codex between turns, or before it names the turn: /steer takes nothing.
+  w.replies.steered = false
+  const sent: any = await $.tool.call({ tool: 'SendMessage', tool_use_id: 'm1', to: 'a1', message: 'later', summary: 'x' } as any)
+  expect(sent.result.message).toStartWith('Queued for a1: gpt has no running step to take it into yet, so it reads this')
 })

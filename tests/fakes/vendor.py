@@ -117,6 +117,7 @@ async def turn(sid, text, request_id=None):
             send({'method': 'item/completed', 'params': {'threadId': sid, 'item': {**item, 'aggregatedOutput': '', 'exitCode': 0}}})
         if text == 'SPENT':
             send({'method': 'account/rateLimits/updated', 'params': {'rateLimits': {'limitId': 'codex', 'primary': {'usedPercent': 100, 'windowDurationMins': 10080, 'resetsAt': int(__import__('time').time()) + 86400}, 'secondary': None}}})
+            send({'method': 'account/rateLimits/updated', 'params': {'rateLimits': {'limitId': 'reserve', 'primary': {'usedPercent': 50, 'windowDurationMins': 10080, 'resetsAt': int(__import__('time').time()) + 3600}}}})
         kind = {'CYBER': 'cyberPolicy', 'BUSY': 'serverOverloaded', 'BUSY_EDIT': 'serverOverloaded', 'ERRFIRST': 'usageLimitExceeded', 'SPENT': 'usageLimitExceeded'}[text]
         message = {'cyberPolicy': 'This content was flagged for possible cybersecurity risk', 'serverOverloaded': 'Selected model is at capacity'}.get(kind, 'You have hit your usage limit')
         error = {'message': message, 'codexErrorInfo': kind}
@@ -232,6 +233,14 @@ async def turn(sid, text, request_id=None):
             answer = json.dumps(await asyncio.gather(mcp(session['server'], name, args), mcp(session['server'], name, args)))
         else:
             answer = json.dumps(await mcp(session['server'], name, args))
+    elif text == 'HELPER1' and FAMILY == 'gpt':
+        # codex's older helper mode announces a helper only by its spawnAgent call.
+        child = 'v1child-' + sid[:8]
+        call = {'type': 'collabAgentToolCall', 'id': 'c1', 'tool': 'spawnAgent', 'status': 'completed', 'senderThreadId': sid, 'receiverThreadIds': [child], 'prompt': 'look', 'model': 'gpt-6-luna', 'reasoningEffort': 'low', 'agentsStates': {}}
+        send({'method': 'item/completed', 'params': {'threadId': sid, 'item': call}})
+        item = {'type': 'commandExecution', 'id': 'k1', 'command': '/bin/zsh -lc "cat notes.md"', 'cwd': '/w', 'commandActions': [], 'aggregatedOutput': 'x', 'exitCode': 0}
+        send({'method': 'item/completed', 'params': {'threadId': child, 'item': item}})
+        answer = text
     elif text in ('HELPER', 'SEARCH') and FAMILY == 'gpt':
         if text == 'SEARCH':
             # codex names a web search's query only when it is done.

@@ -262,6 +262,13 @@ def transcript_path(family, session, cwd, folder):
     path = folder / 'sessions' / quote(cwd, safe='') / session if family == 'grok' else folder / 'antigravity-cli/conversations' / f'{session}.db'
     return str(path) if path.exists() else None
 
+def allowance_buckets():
+    # codex's reported allowance, by quota bucket; a file edited by hand or cut short is read as empty.
+    try: found = json.loads((HOME / 'allowance.json').read_text(encoding='utf-8'))
+    except (OSError, ValueError): return {}
+    gpt = found.get('gpt') if isinstance(found, dict) else None
+    return {k: v for k, v in gpt.items() if isinstance(v, dict)} if isinstance(gpt, dict) else {}
+
 def settings_line(s):
     # The effective settings as one log line and one line of the plugin's launch notice.
     return ' · '.join([f"cwd {s['cwd']}", f"dirs {', '.join(s['dirs']) or 'none'}", f"sandbox {s['sandbox']}",
@@ -270,14 +277,18 @@ def settings_line(s):
                        f"wall {s['wall_s'] or 'none'}{' s' if s['wall_s'] else ''}"])
 
 def helper_seen(a, item):
-    # A codex helper agent starting, from its parent's (or a helper's) subAgentActivity item: its later events arrive
-    # under its own thread id.
-    thread = item.get('agentThreadId') if item.get('type') == 'subAgentActivity' else None
-    if not thread or thread == a.vendorSession: return
-    known = a.helpers.setdefault(thread, {'thread': thread, 'path': str(item.get('agentPath') or thread), 'model': None, 'effort': None,
-                                          'started': datetime.now(timezone.utc).isoformat(timespec='seconds'), 'commands': 0})
-    known['model'] = known['model'] or item.get('model')
-    known['effort'] = known['effort'] or item.get('reasoningEffort')
+    # A codex helper agent starting, from its parent's (or a helper's) item: subAgentActivity in codex's current helper
+    # mode, a spawnAgent call (its new thread in receiverThreadIds) in the older one. Its later events arrive under its
+    # own thread id.
+    if item.get('type') == 'subAgentActivity': threads, path = [item.get('agentThreadId')], item.get('agentPath')
+    elif item.get('type') == 'collabAgentToolCall' and item.get('tool') == 'spawnAgent': threads, path = item.get('receiverThreadIds') or [], None
+    else: return
+    for thread in threads:
+        if not isinstance(thread, str) or not thread or thread == a.vendorSession: continue
+        known = a.helpers.setdefault(thread, {'thread': thread, 'path': str(path or thread), 'model': None, 'effort': None,
+                                              'started': datetime.now(timezone.utc).isoformat(timespec='seconds'), 'commands': 0})
+        known['model'] = known['model'] or item.get('model')
+        known['effort'] = known['effort'] or item.get('reasoningEffort')
 
 # codex's error kinds where the vendor declined the content: the session is intact and a reworded message resumes it.
 REFUSALS = ('cyberPolicy', 'misalignmentPolicyViolation')
@@ -417,6 +428,10 @@ def usage(value):
 
 REDACT = Redactor()
 
+# The read list stops at the activity log's size, with a last line saying so.
+READS_LIMIT = 4 * 1024 * 1024
+READS_FULL = '[the read list stopped at 4 MB; later reads are in the activity log]'
+
 class Agent:
     def __init__(self, record):
         self.record = record
@@ -457,8 +472,13 @@ class Agent:
             try: self.reads = set(self.reads_path.read_text(encoding='utf-8').splitlines())
             except OSError: self.reads = set()
         lines = [line for line in (f'{kind} {path}' + (f' ({helper})' if helper else '') for kind, path in found) if line not in self.reads]
-        if not lines: return
+        if not lines or READS_FULL in self.reads: return
         self.reads.update(lines)
+        try: full = self.reads_path.stat().st_size >= READS_LIMIT
+        except OSError: full = False
+        if full:
+            lines = [READS_FULL]
+            self.reads.add(READS_FULL)
         self.reads_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with self.reads_path.open('a', encoding='utf-8') as file: file.write(''.join(REDACT(line)[:2000] + '\n' for line in lines))
 
@@ -489,12 +509,15 @@ class Agent:
         # The turn as a program reads it: logs/<agentId>.json (the settings and every turn, the last 100 with their
         # answers in <agentId>.answers/), and the plugin's one-line footer on the answer.
         ended = datetime.now(timezone.utc).isoformat(timespec='seconds')
-        how = 'done' if kind == 'done' else 'interrupted' if value.get('message') == 'interrupted' else f"error ({value.get('cause') or 'vendor'})"
+        how = 'done' if kind == 'done' else 'interrupted' if value.get('message') == 'interrupted' or self.cancel_requested else f"error ({value.get('cause') or 'vendor'})"
         settings = getattr(self, 'settings', None) or {}
         transcript = transcript_path(self.family, self.vendorSession, self.cwd, settings.get('codex_folder'))
-        try: turns = json.loads(self.record_path.read_text(encoding='utf-8')).get('turns', [])
-        except (OSError, ValueError, AttributeError): turns = []
-        number = (turns[-1].get('turn', len(turns)) if turns else 0) + 1
+        try: turns = json.loads(self.record_path.read_text(encoding='utf-8'))['turns']
+        except (OSError, ValueError, KeyError, TypeError): turns = []
+        # A record edited by hand or cut short is read for what it still holds, never a reason the turn cannot end.
+        turns = [turn for turn in turns if isinstance(turn, dict)] if isinstance(turns, list) else []
+        last = turns[-1].get('turn') if turns else 0
+        number = (last if isinstance(last, int) and not isinstance(last, bool) else len(turns)) + 1
         answer = self.answers_path / f'{number}.md'
         text = value.get('text') if kind == 'done' else 'lord: error: ' + str(value.get('message'))
         started = getattr(self, 'turn_started', None) or ended
@@ -1012,8 +1035,12 @@ class Daemon:
                 # Skills come from more places than the plugins listed in config.toml (a remote plugin cache, the
                 # skills folder); with these off, codex lists none and each request is about 3,700 tokens shorter.
                 if not a.record.get('tools'): lean['skills'] = {'include_instructions': False, 'bundled': {'enabled': False}}
-                # A read-only agent starts no codex helper agents.
-                if a.record.get('readonly'): lean['features'] = {'multi_agent': False}
+                # A read-only agent starts no codex helper agents. codex picks its helper mode from agents.enabled,
+                # then multi_agent_v2, then the model catalog (which turns helpers on for current models), and only
+                # then from the multi_agent feature, so all three are set.
+                if a.record.get('readonly'):
+                    lean['features'] = {'multi_agent': False, 'multi_agent_v2': False}
+                    lean['agents'] = {'enabled': False}
                 params = {'cwd': a.cwd, 'model': a.model, 'approvalPolicy': 'never',
                           # @nosandbox: codex runs commands unconfined, as Claude Code's own agents do without its sandbox.
                           'sandbox': 'read-only' if a.record.get('readonly') else 'danger-full-access' if a.record.get('nosandbox') else 'workspace-write',
@@ -1286,7 +1313,8 @@ class Daemon:
             grok_home() if family == 'grok' else self.vendor_home / '.gemini'
         return {'model': a.model, 'effort': a.effort, 'cwd': a.cwd, 'dirs': r.get('dirs', []),
                 'sandbox': 'read-only' if r.get('readonly') else 'none' if r.get('nosandbox') or family == 'gemini' else 'workspace-write',
-                'network': bool(r.get('net')) if family == 'gpt' else True, 'tools': bool(r.get('tools')), 'nice': r.get('nice', 0),
+                'network': bool(r.get('net')) if family == 'gpt' else True, 'tools': bool(r.get('tools')),
+                'nice': max(r.get('nice', 0), os.getpriority(os.PRIO_PROCESS, 0)),
                 'memory_gb': round(ceiling / 1048576, 1), 'hang_s': hang or None, 'wall_s': r.get('wall_s') or None,
                 **({'codexHome': str(folder)} if family == 'gpt' else {}), 'codex_folder': str(folder)}
 
@@ -1303,22 +1331,21 @@ class Daemon:
     def allowance(self, snapshot):
         # codex's account limits as it last reported them (it sends them unasked during turns), merged as codex says:
         # an update carries only what changed. Kept in allowance.json, one file every daemon replaces.
+        # Each quota bucket (limitId) is kept apart: a model metered under another limit reports its own windows.
         if not isinstance(snapshot, dict): return
-        try: found = json.loads((HOME / 'allowance.json').read_text(encoding='utf-8'))
-        except (OSError, ValueError): found = {}
-        gpt = {**(found.get('gpt') or {}), **{k: v for k, v in snapshot.items() if v is not None}, 'seen': datetime.now(timezone.utc).isoformat(timespec='seconds')}
+        buckets = allowance_buckets()
+        key = str(snapshot.get('limitId') or 'codex')
+        buckets[key] = {**buckets.get(key, {}), **{k: v for k, v in snapshot.items() if v is not None}, 'seen': datetime.now(timezone.utc).isoformat(timespec='seconds')}
         try:
             scratch = HOME / f'allowance.json.{os.getpid()}'
-            scratch.write_text(dumps({**found, 'gpt': gpt}), encoding='utf-8')
+            scratch.write_text(dumps({'gpt': buckets}), encoding='utf-8')
             scratch.replace(HOME / 'allowance.json')
         except OSError as error: self.log(f'allowance.json not written: {error}')
 
     def gpt_quota(self, a, message):
         # A spent codex allowance is refused until the window that ran out resets, as codex last reported it.
-        try: gpt = json.loads((HOME / 'allowance.json').read_text(encoding='utf-8')).get('gpt') or {}
-        except (OSError, ValueError): gpt = {}
-        resets = [w.get('resetsAt') for w in (gpt.get('primary'), gpt.get('secondary')) if isinstance(w, dict)
-                  and isinstance(w.get('resetsAt'), (int, float)) and (w.get('usedPercent') or 0) >= 100]
+        resets = [w.get('resetsAt') for bucket in allowance_buckets().values() for w in (bucket.get('primary'), bucket.get('secondary'))
+                  if isinstance(w, dict) and isinstance(w.get('resetsAt'), (int, float)) and (w.get('usedPercent') or 0) >= 100]
         if not resets: return a.note('usage limit reached; codex named no reset time, so new turns are not refused')
         reset = max(resets)
         self.save_quota(('gpt', a.model), (reset / 1000 if reset > 1e12 else reset, message))
@@ -1425,10 +1452,8 @@ class Daemon:
 
     def allowances(self):
         # Each vendor's allowance as last reported: codex's windows, and the quota resets Lord refuses turns until.
-        try: gpt = json.loads((HOME / 'allowance.json').read_text(encoding='utf-8')).get('gpt')
-        except (OSError, ValueError): gpt = None
         self.load_quota()
-        return {'gpt': gpt, 'refused': [{'family': f, 'model': m, 'until': datetime.fromtimestamp(q[0], timezone.utc).isoformat(timespec='seconds'), 'reason': q[1]}
+        return {'gpt': allowance_buckets(), 'refused': [{'family': f, 'model': m, 'until': datetime.fromtimestamp(q[0], timezone.utc).isoformat(timespec='seconds'), 'reason': q[1]}
                                         for (f, m), q in self.quota.items() if q[0] > time.time()]}
 
     async def mcp_call(self, a, name, args, token):
@@ -1494,7 +1519,7 @@ class Daemon:
                 if steered:
                     await self.backend(a).rpc('turn/steer', {'threadId': a.vendorSession, 'expectedTurnId': a.turn_id,
                         'input': [{'type': 'text', 'text': body['text']}]})
-                    a.note('message injected into the running turn: ' + body['text'])
+                    a.note('message injected into the running turn: ' + body['text'][:300])
                 return {'ok': True, 'steered': steered}
             elif path == '/queue':
                 # A message for a running agent whose vendor takes none mid-turn: it becomes the next turn, started as
@@ -1502,7 +1527,7 @@ class Daemon:
                 if a.state not in ('running', 'waiting_tool'): return {'ok': True, 'queued': False}
                 text = body['text'] if not a.followup else a.followup['text'] + '\n\n' + body['text']
                 a.followup = {**(a.followup or {'agentId': a.agentId}), 'text': text, 'queued': True}
-                a.note('message queued for the next turn: ' + body['text'])
+                a.note('message queued for the next turn: ' + body['text'][:300])
                 return {'ok': True, 'queued': True}
             elif path in ('/interrupt', '/close'):
                 await self.interrupt(a)

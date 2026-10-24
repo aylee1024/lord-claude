@@ -403,7 +403,7 @@ async function message($: EngineInterface, to: string, text: string): Promise<st
   if (parsed.error || Object.keys(parsed).some(key => key !== 'text')) return undefined
   try {
     if (JSON.parse(await request($, '/queue', { agentId: to, text: parsed.text }, await daemonOf($, agent))).queued)
-      return `Queued for ${to}: ${agent.family} takes no message mid-turn, so it reads this as soon as its current turn ends and works on it before reporting; its answer will carry both results.`
+      return `Queued for ${to}: ${agent.family === 'gpt' ? 'gpt has no running step to take it into yet' : `${agent.family} takes no message mid-turn`}, so it reads this as soon as its current turn ends and works on it before reporting; its answer will carry both results.`
   } catch {}
   return undefined
 }
@@ -483,13 +483,14 @@ async function* vendorTurn($: EngineInterface, path: string, body: unknown, stre
   throw new Error('daemon stream ended without done or tool')
 }
 
-// codex's allowance windows as it last reported them, and every reset Lord refuses turns until.
+// codex's allowance windows as it last reported them, one line per quota bucket, and every reset Lord refuses turns until.
 function allowanceLines(allowance: any): string[] {
   const lines: string[] = []
-  const gpt = allowance?.gpt
   const when = (at: unknown) => typeof at === 'number' ? new Date(at > 1e12 ? at : at * 1000).toISOString().slice(0, 16).replace('T', ' ') + 'Z' : '?'
-  const windows = [gpt?.primary, gpt?.secondary].filter((w: any) => w && typeof w === 'object')
-  if (windows.length) lines.push(`allowance: codex ${windows.map((w: any) => `${w.windowDurationMins >= 1440 ? Math.round(w.windowDurationMins / 1440) + '-day' : Math.round(w.windowDurationMins / 60) + '-hour'} window ${w.usedPercent}% used, resets ${when(w.resetsAt)}`).join('; ')}${gpt.credits?.balance ? `; credits ${gpt.credits.balance}` : ''} (as of ${String(gpt.seen ?? '?').slice(0, 16).replace('T', ' ')}Z)`)
+  for (const [id, gpt] of Object.entries<any>(allowance?.gpt && typeof allowance.gpt === 'object' ? allowance.gpt : {})) {
+    const windows = [gpt?.primary, gpt?.secondary].filter((w: any) => w && typeof w === 'object')
+    if (windows.length) lines.push(`allowance: codex${id === 'codex' ? '' : ` (${gpt.limitName ?? id})`} ${windows.map((w: any) => `${w.windowDurationMins >= 1440 ? Math.round(w.windowDurationMins / 1440) + '-day' : Math.round(w.windowDurationMins / 60) + '-hour'} window ${w.usedPercent}% used, resets ${when(w.resetsAt)}`).join('; ')}${gpt.credits?.balance ? `; credits ${gpt.credits.balance}` : ''} (as of ${String(gpt.seen ?? '?').slice(0, 16).replace('T', ' ')}Z)`)
+  }
   for (const r of allowance?.refused ?? []) lines.push(`refused until ${String(r.until).slice(0, 16).replace('T', ' ')}Z: ${r.family} ${r.model} (${r.reason})`)
   return lines
 }
