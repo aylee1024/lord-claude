@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import shutil
 import signal
+import stat
 import sys
 import time
 
@@ -191,14 +192,47 @@ EXEC_START_TIMEOUT = 10
 def codex_daemon_directory():
     return Path('/tmp').resolve(strict=True) / f'codex-daemon-{os.geteuid()}'
 
+def normalize_system_aliases(path):
+    path = Path(os.path.abspath(Path(path).expanduser()))
+    if len(path.parts) == 1: return str(path)
+    top = Path(path.anchor) / path.parts[1]
+    try: mode = top.lstat().st_mode
+    except FileNotFoundError: return str(path)
+    return str(top.resolve(strict=True) / path.relative_to(top)) if stat.S_ISLNK(mode) else str(path)
+
+def nested_symlink_component(path):
+    path = Path(os.path.abspath(Path(path).expanduser()))
+    for component in (path, *path.parents):
+        try: mode = component.lstat().st_mode
+        except OSError: continue
+        if stat.S_ISLNK(mode) and len(component.parents) >= 2: return str(component)
+
+def tests_root(path, label):
+    if link := nested_symlink_component(path):
+        fix = 'use the real path; set TMPDIR to a real folder' if label == 'TMPDIR' else 'use the real path'
+        raise ValueError(f'@tests {label} {path} contains symlink component {link}; {fix}')
+    return normalize_system_aliases(path)
+
+def tests_paths(cwd, dirs, env):
+    roots = [tests_root(cwd, 'cwd'), *(tests_root(path, '@dir') for path in dirs)]
+    return roots, tests_root(env.get('TMPDIR') or '/tmp', 'TMPDIR'), tests_root('/private/tmp', 'temp root')
+
+def validate_tests_layout(cwd, dirs, env):
+    roots, tmp, private_tmp = tests_paths(cwd, dirs, env)
+    logical = tests_root(HOME, "Lord's folder")
+    for path in (logical, canon(HOME)):
+        if root := next((root for root in [*roots, tmp, private_tmp] if inside(path, [root, canon(root)])), None):
+            raise ValueError(f"@tests Lord's folder {HOME} is inside writable root {root}; choose writable roots that do not contain Lord's folder")
+
 def tests_profile(cwd, dirs, env):
     folder = HERE.parent / 'sandbox'
     profile = '\n'.join((folder / name).read_text() for name in ('seatbelt_base_policy.sbpl', 'seatbelt_preferences_policy.sbpl', 'tests.sbpl'))
-    params = {'TMP': canon(env.get('TMPDIR') or '/tmp'), 'PRIVATE_TMP': '/private/tmp',
-              'KEY': canon(HOME / 'control.header'), 'LORD_HOME': canon(HOME), 'LORD_HOME_LOGICAL': os.path.abspath(HOME)}
+    roots, tmp, private_tmp = tests_paths(cwd, dirs, env)
+    params = {'TMP': tmp, 'PRIVATE_TMP': private_tmp,
+              'KEY': canon(HOME / 'control.header'), 'LORD_HOME': canon(HOME), 'LORD_HOME_LOGICAL': normalize_system_aliases(HOME)}
     daemon = codex_daemon_directory()
     params['CODEX_DAEMON'] = str(daemon)
-    roots = list(dict.fromkeys(canon(root) for root in [cwd, *dirs]))
+    roots = list(dict.fromkeys(roots))
     protected = set()
     for i, root in enumerate(roots):
         name = f'ROOT_{i}'
@@ -214,7 +248,7 @@ def tests_profile(cwd, dirs, env):
     profile += '\n(lord-protect-home (param "LORD_HOME"))\n(lord-protect-home (param "LORD_HOME_LOGICAL"))\n(lord-protect-daemon (param "CODEX_DAEMON"))'
     writable = [*roots, params['TMP'], params['PRIVATE_TMP']]
     ancestors = set(writable) | {str(path) for path in daemon.parents}
-    for path in protected | {params['KEY'], params['LORD_HOME'], params['LORD_HOME_LOGICAL']}:
+    for path in protected | {params['KEY'], params['LORD_HOME'], params['LORD_HOME_LOGICAL'], params['TMP']}:
         ancestors.update(str(parent) for parent in Path(path).parents if inside(str(parent), writable))
     for i, path in enumerate(sorted(ancestors)):
         name = f'ANCESTOR_{i}'
@@ -737,6 +771,7 @@ class Vendor:
                 raise
 
     async def start_exec(self, command, env, nice):
+        validate_tests_layout(self.agent.cwd, self.agent.record.get('dirs', []), env)
         self.exec_token, self.environment_id = uuid.uuid4().hex, 'lord-' + uuid.uuid4().hex
         self.exec_descendants = set()
         self.d.redact.secrets.add(self.exec_token)
@@ -1271,14 +1306,17 @@ class Daemon:
                 raise ValueError({'grok': "@dir is not available for grok: its sandbox confines writes to the working folder; use @cwd",
                                   'gemini': '@dir is not needed for gemini: agy has no sandbox and can write outside its folder'}[family])
             if not Path(body['cwd']).expanduser().is_absolute(): raise ValueError('the working folder must be an absolute path')
-            cwd = str(Path(body['cwd']).expanduser().resolve(strict=True))
-            # A folder that holds the home folder, by its usual path or through macOS's data volume (/System/Volumes).
-            if inside(canon(str(Path.home())), (canon(cwd),)) or (sys.platform == 'darwin' and inside('/System/Volumes/Data', (cwd,))):
-                raise ValueError('refusing / or a folder holding your home folder as a working folder: start Claude Code in a project folder, or put "@cwd <folder>" on the first line of the task')
             a = self.agents.get(aid)
             if body.get('tests') or (a and a.record.get('tests')):
                 for clash in ('readonly', 'nosandbox', 'net', 'tools'):
                     if body.get(clash) or (a and a.record.get(clash)): raise ValueError(f'@tests cannot be used with @{clash}')
+                if relative := [x for x in body.get('dirs') or [] if not Path(x).expanduser().is_absolute()]:
+                    raise ValueError(f'@dir {relative[0]} is not an absolute path')
+                validate_tests_layout(a.cwd if a else body['cwd'], [*(a.record.get('dirs', []) if a else []), *(body.get('dirs') or [])], subscription_env())
+            cwd = str(Path(body['cwd']).expanduser().resolve(strict=True))
+            # A folder that holds the home folder, by its usual path or through macOS's data volume (/System/Volumes).
+            if inside(canon(str(Path.home())), (canon(cwd),)) or (sys.platform == 'darwin' and inside('/System/Volumes/Data', (cwd,))):
+                raise ValueError('refusing / or a folder holding your home folder as a working folder: start Claude Code in a project folder, or put "@cwd <folder>" on the first line of the task')
             if a and body.get('pin_cwd') and not os.path.samefile(cwd, a.cwd): raise ValueError(f'@cwd is fixed at the first turn ({a.cwd})')
             if isinstance(body.get('path'), str) and body['path']:
                 global SESSION_PATH

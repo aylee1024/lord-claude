@@ -2612,6 +2612,7 @@ def test_the_sweep_names_an_agents_files_exactly_and_works_under_the_journal_loc
 
 @pytest.fixture
 def tests_backend(rig, monkeypatch):
+    (rig.home / 'work').mkdir()
     d = local_daemon(rig, monkeypatch)
     # local_daemon loads a fresh module without registering it in sys.modules.
     m = d.open.__func__.__globals__
@@ -2633,7 +2634,7 @@ def test_tests_wiring_settings_environment_and_resume(tests_backend, rig):
     d, m, launched = tests_backend
     async def scenario():
         try:
-            opened = await d.open({'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home), 'tests': True, 'nice': 12})
+            opened = await d.open({'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home / 'work'), 'tests': True, 'nice': 12})
             assert opened['sandbox'] == 'tests' and 'sandbox tests' in opened['line'] and opened['network'] is False
             a = d.agents['a']; v = d.backend(a)
             await d.begin(a, {'text': 'PING'})
@@ -2646,7 +2647,7 @@ def test_tests_wiring_settings_environment_and_resume(tests_backend, rig):
             argv = next(argv for argv, _ in launched if '/usr/bin/sandbox-exec' in argv)
             step = 12 - os.getpriority(os.PRIO_PROCESS, 0)
             assert argv[:4] == ('/usr/bin/nice', '-n', str(step), '/usr/bin/sandbox-exec') if step > 0 else argv[0] == '/usr/bin/sandbox-exec'
-            assert ex['cwd'] == str(rig.home.resolve()) and ex['nice'] == max(12, os.getpriority(os.PRIO_PROCESS, 0))
+            assert ex['cwd'] == str((rig.home / 'work').resolve()) and ex['nice'] == max(12, os.getpriority(os.PRIO_PROCESS, 0))
             assert ex['mcp_env'] == {} and ex['env'] == {}
             assert ex['codex_home'] == next(e['codex_home'] for e in audit if e.get('launch') and e['pid'] == v.process.pid)
             args = ex['argv']
@@ -2689,7 +2690,7 @@ def test_tests_rejects_inherited_clashes(tests_backend, rig, clash, first_tests)
     d, _, _ = tests_backend
     async def scenario():
         try:
-            body = {'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home)}
+            body = {'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home / 'work')}
             await d.open({**body, **({'tests': True} if first_tests else {clash: True})})
             with pytest.raises(ValueError, match='@tests.*@' + clash):
                 await d.open({**body, **({clash: True} if first_tests else {'tests': True})})
@@ -2701,7 +2702,7 @@ def test_tests_later_enable_is_sticky_and_start_options_restart_both(tests_backe
     d, _, _ = tests_backend
     async def scenario():
         try:
-            body = {'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home)}
+            body = {'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home / 'work')}
             await d.open(body)
             v = d.backend(d.agents['a']); original = v.process
             await d.open({**body, 'tests': True})
@@ -2726,7 +2727,7 @@ def test_tests_exec_server_tree_dies_with_vendor(tests_backend, rig, stop):
     d, m, _ = tests_backend
     async def scenario():
         try:
-            await d.open({'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home), 'tests': True})
+            await d.open({'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home / 'work'), 'tests': True})
             a = d.agents['a']; v = d.backend(a)
             app, ex = v.process, v.exec_process
             child = next(e['child'] for e in rig.audit() if e.get('exec_launch'))
@@ -2781,7 +2782,7 @@ def test_tests_failed_start_is_bounded_and_reaps_both(tests_backend, rig, failur
         try:
             started = time.monotonic()
             with pytest.raises(RuntimeError, match='exec-server|environment refused') as failed:
-                await d.open({'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home), 'tests': True})
+                await d.open({'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home / 'work'), 'tests': True})
             expected = {'--exec-eof': 'closed stdout', '--exec-invalid': 'not a URL', '--exec-silent': 'within 1 s', '--fail-environment': 'environment refused'}
             assert expected[failure] in str(failed.value)
             assert time.monotonic() - started < 4
@@ -2798,7 +2799,7 @@ def test_tests_failed_start_is_bounded_and_reaps_both(tests_backend, rig, failur
 def test_tests_exec_start_preserves_vendor_home_and_creates_no_lord_files(tests_backend, rig, own_home):
     d, m, _ = tests_backend
     async def scenario():
-        a = types.SimpleNamespace(agentId='a', cwd=str(rig.home), record={})
+        a = types.SimpleNamespace(agentId='a', cwd=str(rig.home / 'work'), record={})
         v = m['Vendor'](d, 'gpt', a)
         env = m['subscription_env']()
         if own_home: env['CODEX_HOME'] = str(d.journal.parent / 'codex')
@@ -2843,7 +2844,7 @@ print(json.dumps(result))
 def test_tests_close_during_spawn_reaps_the_late_process(tests_backend, rig, monkeypatch, spawn):
     d, _, _ = tests_backend
     async def scenario():
-        await d.open({'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home), 'tests': True})
+        await d.open({'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home / 'work'), 'tests': True})
         v = d.backend(d.agents['a'])
         await v.close()
         entered, release = asyncio.Event(), asyncio.Event()
@@ -2881,7 +2882,7 @@ def test_tests_close_during_spawn_reaps_the_late_process(tests_backend, rig, mon
 def test_tests_attach_retry_cannot_start_after_daemon_shutdown(tests_backend, rig, monkeypatch):
     d, _, launched = tests_backend
     async def scenario():
-        await d.open({'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home), 'tests': True})
+        await d.open({'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home / 'work'), 'tests': True})
         a = d.agents['a']; v = d.backend(a)
         await v.close()
         entered, release = asyncio.Event(), asyncio.Event()
@@ -3048,6 +3049,151 @@ print(json.dumps(result))
     assert str(home) not in profile and str(real) not in profile
 
 
+@pytest.mark.parametrize('phase', ['first', 'enable', 'add_dir', 'start'])
+@pytest.mark.parametrize('kind', ['cwd_leaf', 'cwd_parent', 'dir_leaf', 'dir_parent', 'tmp_leaf', 'tmp_parent',
+                                 'home_leaf', 'home_parent', 'home_cwd', 'home_dir', 'home_tmp', 'home_tmp_alias', 'home_var_alias', 'home_var_leaf', 'home_data_alias'])
+def test_tests_refuses_unsafe_layout_at_open_and_start(tests_backend, rig, monkeypatch, phase, kind):
+    d, m, launched = tests_backend
+    async def scenario():
+        with contextlib.ExitStack() as stack:
+            work = rig.home / 'cwd-parent/project'; work.mkdir(parents=True)
+            extra = rig.home / 'dir-parent/extra'; extra.mkdir(parents=True)
+            temp = rig.home / 'tmp-parent/temp'; temp.mkdir(parents=True)
+            private = None
+            if kind.startswith(('tmp_', 'home_var_')) or kind == 'home_tmp_alias':
+                location = '/private/var/tmp' if kind.startswith('home_var_') else '/private/tmp'
+                private = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix='lord-r5-', dir=location)))
+                if kind.startswith('tmp_'):
+                    temp = private / 'parent/temp'; temp.mkdir(parents=True)
+            if kind == 'home_var_alias': extra = private
+            if kind == 'home_data_alias': extra = Path('/System/Volumes/Data') / extra.relative_to('/')
+            monkeypatch.setenv('TMPDIR', str(temp))
+            home = Path('/var/tmp') / private.name / 'parent/lord' if kind == 'home_var_leaf' else rig.home / 'lord-parent/lord'
+            home.mkdir(parents=True)
+            m['HOME'] = home
+            d.journal, d.legacy_journal = home / 'journal.jsonl', home / 'sessions.jsonl'
+            body = {'agentId': 'a', 'family': 'gpt', 'cwd': str(work), 'dirs': [str(extra)]}
+            addition = rig.home / 'addition'; addition.mkdir()
+            v = None
+            try:
+                if phase != 'first':
+                    initial = {**body, 'tests': phase != 'enable'}
+                    if phase == 'add_dir' and kind.startswith('dir_'): initial['dirs'] = []
+                    await d.open(initial)
+                    v = d.backend(d.agents['a'])
+                    if phase == 'start': await v.close()
+                root = {'cwd': work, 'dir': extra, 'tmp': temp, 'home': home}[kind.split('_')[0]]
+                link = None
+                if kind.endswith(('_leaf', '_parent')):
+                    link = root if kind.endswith('_leaf') else root.parent
+                    moved = link.with_name(link.name + '-real')
+                    link.rename(moved); link.symlink_to(moved, target_is_directory=True)
+                elif kind in ('home_cwd', 'home_dir', 'home_tmp'):
+                    m['HOME'] = {'home_cwd': work, 'home_dir': extra, 'home_tmp': temp}[kind] / 'lord'
+                    m['HOME'].mkdir()
+                elif kind == 'home_data_alias':
+                    m['HOME'] = Path(m['canon'](extra)) / 'lord'; m['HOME'].mkdir()
+                else:
+                    alias = '/var/tmp' if kind == 'home_var_alias' else '/tmp'
+                    m['HOME'] = Path(alias) / private.name / 'lord'
+                    m['HOME'].mkdir()
+                before = dict(d.agents['a'].record) if phase != 'first' else None
+                launched.clear()
+                with pytest.raises(ValueError, match='@tests') as refused:
+                    if phase == 'start': await v.ensure()
+                    else:
+                        request = {**body, 'tests': True}
+                        if phase == 'add_dir': request['dirs'] = [str(extra if kind.startswith('dir_') else addition)]
+                        await d.open(request)
+                message = str(refused.value)
+                if link:
+                    assert str(root) in message and str(link) in message and 'real path' in message
+                    if kind.startswith('tmp_'): assert 'set TMPDIR to a real folder' in message
+                else: assert "Lord's folder" in message and 'writable root' in message and str(m['HOME']) in message
+                assert not any('exec-server' in argv or 'app-server' in argv for argv, _ in launched)
+                if before is not None: assert d.agents['a'].record == before
+                else: assert not d.agents
+            finally: await d.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='macOS Seatbelt profile')
+@pytest.mark.parametrize('location', ['private_tmp', 'cwd'])
+def test_tests_nested_tmp_swap_is_denied(tmp_path, monkeypatch, location):
+    m = load('lordd_nested_tmp_swap')
+    work = tmp_path / 'work'; work.mkdir()
+    victim = tmp_path / 'victim'; victim.mkdir()
+    with contextlib.ExitStack() as stack:
+        top = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix='lord-r5-', dir='/private/tmp'))) if location == 'private_tmp' else work / '.tmp'
+        temp = top / 'sub/T'; temp.mkdir(parents=True)
+        monkeypatch.setattr(m, 'codex_daemon_directory', lambda: tmp_path / 'daemon/d')
+        profile, params = m.tests_profile(str(work), [], {'TMPDIR': str(temp)})
+        code = '''import os, pathlib, sys
+parent, victim = map(pathlib.Path, sys.argv[1:])
+try: parent.rename(parent.with_name('moved'))
+except PermissionError: print('denied')
+else:
+ parent.mkdir(); (parent / 'T').symlink_to(victim, target_is_directory=True)
+ print('swapped')
+'''
+        result = subprocess.run(['/usr/bin/sandbox-exec', '-p', profile, *params, PYTHON, '-c', code, str(temp.parent), str(victim)],
+            cwd=work, capture_output=True, text=True, timeout=8)
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == 'denied'
+        assert temp.is_dir() and not temp.is_symlink()
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='macOS Seatbelt profile')
+@pytest.mark.parametrize('alias', ['/tmp', '/var', 'home'])
+def test_tests_top_level_aliases_and_default_layout_are_accepted(tests_backend, rig, monkeypatch, alias):
+    d, m, launched = tests_backend
+    async def scenario():
+        with contextlib.ExitStack() as stack:
+            user = rig.home / 'user'
+            home = user / '.claude/lord'
+            if alias == 'home':
+                private = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix='lord-r5-', dir='/private/var/tmp')))
+                home = Path('/var/tmp') / private.name / 'lord'
+            home.mkdir(parents=True)
+            work = user / 'project'; work.mkdir(parents=True)
+            m['HOME'] = home
+            d.journal, d.legacy_journal = home / 'journal.jsonl', home / 'sessions.jsonl'
+            real_temp = Path('/private/var/tmp' if alias == '/var' else '/private/tmp')
+            logical = '/var/tmp' if alias == '/var' else '/tmp'
+            monkeypatch.setenv('TMPDIR', logical)
+            try:
+                opened = await d.open({'agentId': 'a', 'family': 'gpt', 'cwd': str(work), 'tests': True})
+                assert opened['sandbox'] == 'tests'
+                argv = next(argv for argv, _ in launched if '/usr/bin/sandbox-exec' in argv)
+                values = dict(arg[2:].split('=', 1) for arg in argv if arg.startswith('-D'))
+                assert values['TMP'] == str(real_temp)
+                assert values['LORD_HOME_LOGICAL'] == str(home.resolve())
+                await d.backend(d.agents['a']).close()
+            finally: await d.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='macOS Seatbelt profile')
+def test_tests_unix_socket_documentation_distinguishes_pairs(tmp_path):
+    m = load('lordd_unix_socket_pairs')
+    profile, params = m.tests_profile(str(tmp_path), [], {'TMPDIR': str(tmp_path / 'temp')})
+    code = '''import asyncio, socket
+a, b = socket.socketpair(); a.send(b'x'); assert b.recv(1) == b'x'; a.close(); b.close()
+async def main(): await asyncio.sleep(0)
+asyncio.run(main())
+try: socket.socket(socket.AF_UNIX).bind('named.sock')
+except PermissionError: pass
+else: raise AssertionError('named Unix socket allowed')
+'''
+    result = subprocess.run(['/usr/bin/sandbox-exec', '-p', profile, *params, PYTHON, '-c', code], cwd=tmp_path,
+        capture_output=True, text=True, timeout=8)
+    assert result.returncode == 0, result.stderr
+    for name in ('README.md', 'CONTRACT.md'):
+        text = (ROOT / name).read_text()
+        assert 'every Unix socket bound to a path is denied' in text
+        assert 'socketpair' in text and 'asyncio' in text
+
+
 def test_tests_profile_denies_mutating_fcntls_after_grants(tmp_path):
     m = load('lordd_tests_fcntl_rule')
     profile, _ = m.tests_profile(str(tmp_path), [str(tmp_path / 'extra')], {})
@@ -3173,7 +3319,7 @@ def test_tests_refuses_tools_in_both_orders(tests_backend, rig, first):
     d, _, _ = tests_backend
     async def scenario():
         try:
-            body = {'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home)}
+            body = {'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home / 'work')}
             if first != 'together': await d.open({**body, first: True})
             before = dict(d.agents['a'].record) if first != 'together' else None
             options = {'tests': True, 'tools': True} if first == 'together' else {'tools' if first == 'tests' else 'tests': True}
@@ -3195,7 +3341,7 @@ def test_tests_dir_cannot_open_lord_home_for_writes(tmp_path):
     own = home / 'exec/a/tmp/arg0-macos'; own.mkdir(parents=True)
     other = home / 'exec/b/tmp/arg0-macos'; other.mkdir(parents=True)
     work = tmp_path / 'work'; work.mkdir()
-    profile, params = m.tests_profile(str(work), [str(home)], {'TMPDIR': str(home)})
+    profile, params = m.tests_profile(str(work), [str(real)], {'TMPDIR': str(real)})
     code = '''import json, pathlib, sys
 home, own, other = map(pathlib.Path, sys.argv[1:])
 result = {}
