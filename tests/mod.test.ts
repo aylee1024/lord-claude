@@ -373,7 +373,7 @@ test('directives in a live message are removed before steering and select the ne
   const w = world(on, [{ type: 'tool', callId: 'call1', name: 'SendMessage', input: { to: 'other', message: 'hi', summary: 'hi' } }])
   await spawn($)
   await step($, 'running')
-  await $.session.send({ to: 'a1', text: '@model later\n@readonly\n@net\nchange course', origin: { kind: 'model' } })
+  await $.session.send({ to: 'a1', text: '@model later\n@net\nchange course', origin: { kind: 'model' } })
   expect(w.requests.find(x => x.path === '/steer')?.body).toEqual({ agentId: 'a1', text: 'change course' })
   expect(w.deliveries).toEqual([])
   await step($, 'next task')
@@ -1224,4 +1224,33 @@ test('/lord shows codex\'s allowance and every reset Lord refuses turns until', 
   const listed: any = await $.command.run({ command: 'lord', args: '' })
   expect(listed.text).toContain('allowance: codex 7-day window 40% used, resets 2026-10-26 07:33Z; 5-hour window 5% used, resets 2026-10-14 17:46Z (as of 2026-10-24 02:00Z)')
   expect(listed.text).toContain('refused until 2026-10-25 02:00Z: gemini gemini-4-argon (Individual quota reached)')
+})
+
+
+test('a message asking for @readonly is never put into a running turn that can write, nor queued past /open', async ($, on) => {
+  const w = world(on, [{ type: 'tool', callId: 'call1', name: 'SendMessage', input: { to: 'other', message: 'hi', summary: 'hi' } }])
+  await spawn($, 'lord:grok')
+  await step($, 'running')
+  await $.tool.call({ tool: 'SendMessage', tool_use_id: 'm1', to: 'a1', message: '@readonly\nreview the files', summary: 'x' } as any)
+  expect(w.requests.filter(x => x.path === '/steer' || x.path === '/queue')).toEqual([])
+  // Claude Code delivers it instead, as the agent's next turn, which applies @readonly.
+  expect(w.toolCalls.filter(x => x.tool === 'SendMessage' && x.tool_use_id === 'm1').length).toBe(1)
+  await $.tool.call({ tool: 'SendMessage', tool_use_id: 'm2', to: 'a1', message: '@effort low\nand this', summary: 'x' } as any)
+  expect(w.requests.filter(x => x.path === '/queue')).toEqual([])
+})
+
+test('a gpt message asking for @readonly is not injected into a writable turn', async ($, on) => {
+  const w = world(on, [{ type: 'tool', callId: 'call1', name: 'SendMessage', input: { to: 'other', message: 'hi', summary: 'hi' } }])
+  await spawn($)
+  await step($, 'running')
+  await $.session.send({ to: 'a1', text: '@readonly\nlook only', origin: { kind: 'model' } })
+  expect(w.requests.filter(x => x.path === '/steer')).toEqual([])
+  expect(w.deliveries).toEqual(['@readonly\nlook only'])
+})
+
+test('a repeated known option is refused whatever its value holds', async ($, on) => {
+  world(on)
+  on('fs.read', (_, e) => CONFIGS(e.path))
+  const denied: any = await $.tool.call({ tool: 'Agent', tool_use_id: 'L', subagent_type: 'lord:gpt', prompt: '@cwd /a folder\n@cwd /other folder\nwork', description: 'x' } as any)
+  expect(denied.deny).toBe('lord: option line repeated: @cwd /other folder (only @dir may be given more than once)')
 })

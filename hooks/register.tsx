@@ -55,8 +55,10 @@ function task(text: string): Task {
   const seen = new Set<string>()
   while (lines.length) {
     const line = lines[0].trim()
-    // An option line is @word with at most one value; a longer line starting with @ (a mention) is task text.
-    const word = /^@([a-z]+)(?:\s+\S+)?\s*$/.exec(line)?.[1]
+    // An option line is @word with at most one value, or a known option with any value; a longer line starting
+    // with @ (a mention) is task text.
+    const known = /^@([a-z]+)(?:\s|$)/.exec(line)?.[1]
+    const word = known && KNOWN.has(known) ? known : /^@([a-z]+)(?:\s+\S+)?\s*$/.exec(line)?.[1]
     if (word && word !== 'dir' && seen.has(word)) { result.error = `option line repeated: ${line} (only @dir may be given more than once)`; break }
     const model = /^@model\s+(\S+)\s*$/.exec(line)
     if (model) result.model = model[1]
@@ -84,6 +86,7 @@ function task(text: string): Task {
 }
 
 const OPTIONS = '@model, @effort, @cwd, @dir, @readonly, @net, @nosandbox, @tools, @memory, @hang, @wall, @nice'
+const KNOWN = new Set(OPTIONS.split(', ').map(option => option.slice(1)))
 
 function merge(base: Task, more: Partial<Task>): Task {
   return { ...base, ...more, dirs: more.dirs ? [...new Set([...(base.dirs ?? []), ...more.dirs])] : base.dirs,
@@ -375,8 +378,9 @@ async function steer($: EngineInterface, agentId: string, text: string): Promise
   const agent = await lordAgent($, agentId)
   if (!agent?.running) return false
   const parsed = task(text)
-  // Directives alter the next turn's session options rather than an in-flight request.
-  if (parsed.error) return false
+  // Directives alter the next turn's session options rather than an in-flight request. A message asking for
+  // @readonly is never put into a turn that can write: it waits for a turn that starts read-only.
+  if (parsed.error || (parsed.readonly && !agent.readonly)) return false
   const { text: _, ...options } = parsed
   agent.pending = merge({ text: '', ...agent.pending }, options)
   await keep($, agentId)
@@ -394,7 +398,9 @@ async function message($: EngineInterface, to: string, text: string): Promise<st
   if (!agent?.running) return undefined
   if (await steer($, to, text)) return `Injected into ${to}'s running turn: ${agent.family} reads it at its next step.`
   const parsed = task(text)
-  if (parsed.error) return undefined
+  // A queued message starts its turn in the daemon, past the /open that applies option lines; one carrying any is
+  // left to Claude Code, whose next turn of the agent applies them.
+  if (parsed.error || Object.keys(parsed).some(key => key !== 'text')) return undefined
   try {
     if (JSON.parse(await request($, '/queue', { agentId: to, text: parsed.text }, await daemonOf($, agent))).queued)
       return `Queued for ${to}: ${agent.family} takes no message mid-turn, so it reads this as soon as its current turn ends and works on it before reporting; its answer will carry both results.`

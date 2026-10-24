@@ -447,7 +447,8 @@ class Agent:
         self.helpers = {}
 
     def files(self):
-        return [self.log_path, self.log_path.with_suffix('.log.1'), self.answer_path, self.record_path, self.reads_path]
+        return [self.log_path, self.log_path.with_suffix('.log.1'), self.answer_path, self.record_path, self.reads_path,
+                self.record_path.with_name(self.record_path.name + '.tmp')]
 
     def read_paths(self, found, helper=None):
         # Each path once, in the order first seen, so a reviewer can show what the agent and its helpers read.
@@ -510,8 +511,8 @@ class Agent:
             if text and text.strip():
                 self.answers_path.mkdir(parents=True, exist_ok=True, mode=0o700)
                 answer.write_text(REDACT(text), encoding='utf-8')
-                stale = self.answers_path / f'{number - 100}.md'
-                stale.unlink(missing_ok=True)
+            # Every turn advances the number, so removing the answer 100 turns back keeps only the recorded turns'.
+            (self.answers_path / f'{number - 100}.md').unlink(missing_ok=True)
             scratch = self.record_path.with_name(self.record_path.name + '.tmp')
             scratch.write_text(dumps(document) + '\n', encoding='utf-8')
             scratch.replace(self.record_path)
@@ -848,6 +849,7 @@ class Vendor:
         a.note(f"[{helper['path']}] {line}")
         a.read_paths(codex_reads(item), helper['path'])
         if item.get('type') == 'commandExecution': helper['commands'] = helper.get('commands', 0) + 1
+        if item.get('type') == 'fileChange': a.edited = True
 
     async def close(self):
         self.stopping, self.ready = True, False
@@ -1291,7 +1293,9 @@ class Daemon:
     async def retry(self, a, delay):
         # A turn that met "at capacity" before changing anything, sent again on the same session after a wait. The
         # session already holds the task, so the retry asks it to go on rather than sending the task twice.
-        await asyncio.sleep(delay)
+        a.retry_waiting = True
+        try: await asyncio.sleep(delay)
+        finally: a.retry_waiting = False
         if a.cancel_requested or a.state not in ('running', 'waiting_tool'): return
         self.backend(a).last = time.monotonic()
         await self.run_turn(a, {**a.turn_body, 'text': 'Continue with the task above: the last attempt stopped because the model was at capacity.'})
@@ -1380,8 +1384,9 @@ class Daemon:
             for future in list(a.calls.values()):
                 if not future.done(): future.set_result({'content': [{'type': 'text', 'text': 'interrupted'}], 'isError': True})
             started = a.family == 'gpt' and a.turn_id
-            if a.retry_task and not a.retry_task.done():
-                # Waiting to retry after "at capacity": no vendor turn is running.
+            if a.retry_task and getattr(a, 'retry_waiting', False):
+                # Waiting to retry after "at capacity": no vendor turn is running. Once the retry is being sent, it is
+                # stopped as any turn is (run_turn interrupts it when codex names the turn).
                 a.retry_task.cancel()
                 a.emit('error', message='interrupted', retryable=False)
             if a.family == 'gpt':
@@ -1571,8 +1576,11 @@ class Daemon:
                                 event, pending = pending.result(), None
                             if event['type'] in ('done', 'error') and a.followup:
                                 body, a.followup = a.followup, None
-                                a.earlier = event['text'] if event['type'] == 'done' else 'It failed: ' + event['message']
-                                a.earlier_done = event['type'] == 'done'
+                                result = event['text'] if event['type'] == 'done' else 'It failed: ' + event['message']
+                                # Each queued message's result joins those held before it, for the one answer at the end;
+                                # any answer among them keeps the delivery an answer.
+                                a.earlier_done = event['type'] == 'done' or (bool(a.earlier) and a.earlier_done)
+                                a.earlier = f'{a.earlier}\n\nThen:\n{result}' if a.earlier else result
                                 a.earlier_queued = bool(body.get('queued'))
                                 try:
                                     await self.begin_locked(a, body)

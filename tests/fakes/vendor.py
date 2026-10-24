@@ -101,6 +101,13 @@ async def turn(sid, text, request_id=None):
               'error': {'message': 'unexpected status 401 Unauthorized: Missing bearer or basic authentication in header'}}})
         send({'method': 'turn/completed', 'params': {'threadId': sid, 'turn': {'id': tid, 'status': 'failed'}}})
         return
+    if text == 'HELPER_BUSY' and FAMILY == 'gpt':
+        # A helper edits a file, then the parent's model is at capacity.
+        child = 'child-' + sid[:8]
+        send({'method': 'item/started', 'params': {'threadId': sid, 'item': {'type': 'subAgentActivity', 'id': 'h1', 'kind': 'started', 'agentThreadId': child, 'agentPath': '/root/fix', 'model': 'gpt-6-luna'}}})
+        send({'method': 'item/completed', 'params': {'threadId': child, 'item': {'type': 'fileChange', 'id': 'k2', 'changes': [{'path': '/w/out.txt', 'kind': 'add', 'diff': '+y'}]}}})
+        send({'method': 'turn/completed', 'params': {'threadId': sid, 'turn': {'id': tid, 'status': 'failed', 'error': {'message': 'Selected model is at capacity', 'codexErrorInfo': 'serverOverloaded'}}}})
+        return
     if text in ('CYBER', 'BUSY', 'BUSY_EDIT', 'ERRFIRST', 'SPENT') and FAMILY == 'gpt':
         # A failed turn as codex classifies it (codexErrorInfo); BUSY and BUSY_EDIT fail as "at capacity", BUSY_EDIT
         # after a file edit; ERRFIRST sends the error before the turn's completion, which then carries none.
@@ -242,9 +249,9 @@ async def turn(sid, text, request_id=None):
                 send({'method': 'item/completed', 'params': {'threadId': child, 'item': item}})
             send({'method': 'turn/completed', 'params': {'threadId': child, 'turn': {'id': 'ct', 'status': 'completed'}}})
         answer = text
-    elif text == 'WAIT1':
+    elif text.startswith('WAIT1'):
         await asyncio.sleep(1)
-        answer = 'first'
+        answer = text[6:] or 'first'
     elif text == 'REMEMBER':
         answer = session.get('memory', 'missing')
     else:

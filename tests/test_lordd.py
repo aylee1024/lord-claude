@@ -2105,6 +2105,8 @@ def test_each_turn_has_a_record_a_kept_answer_and_a_footer_and_prune_removes_the
     assert [t['turn'] for t in document['turns']] == [1, 2] and document['turns'][0]['usage']['input_tokens'] == 10
     assert (rig.home / 'logs/a.answers/1.md').read_text() == 'PONG' and (rig.home / 'logs/a.answers/2.md').read_text() == 'second answer'
     assert {p.name for p in (rig.home / 'logs').iterdir()} == {'a.log', 'a.answer.md', 'a.json', 'a.answers'}
+    # A record replacement cut short leaves its scratch file, which pruning removes with the rest.
+    (rig.home / 'logs/a.json.tmp').write_text('{}')
     rig.stop()
     rows = [{**json.loads(line), 'used': '2020-01-01T00:00:00+00:00'} for line in (rig.home / 'journal.jsonl').read_text().splitlines()]
     (rig.home / 'journal.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
@@ -2180,3 +2182,58 @@ def test_a_refused_open_names_the_folder_and_is_logged(rig):
 def test_the_daemon_and_its_vendors_helpers_run_from_lords_own_folder(rig):
     out = subprocess.run(['/usr/sbin/lsof', '-a', '-p', str(rig.proc.pid), '-d', 'cwd', '-Fn'], capture_output=True, text=True).stdout
     assert f'n{rig.home.resolve()}' in out.splitlines() or f'n{rig.home}' in out.splitlines()
+
+
+
+def test_a_helpers_edit_counts_as_the_turns_edit_so_at_capacity_is_not_retried(rig):
+    rig.open('gpt')
+    failed = rig.turn('HELPER_BUSY')[-1]
+    assert failed['type'] == 'error' and failed['record']['retries'] == 0 and failed['record']['ended_how'] == 'error (serverOverloaded)'
+
+
+def test_messages_queued_one_after_another_keep_every_result(rig):
+    rig.open('grok')
+    stream = rig.stream('/turn', {'agentId': 'a', 'text': 'WAIT1 alpha'})
+    assert next(stream)['type'] == 'activity'
+    assert rig.request('/queue', {'agentId': 'a', 'text': 'WAIT1 beta'})['queued'] is True
+    time.sleep(1.5)
+    assert rig.request('/queue', {'agentId': 'a', 'text': 'PING'})['queued'] is True
+    done = list(stream)[-1]
+    assert done['type'] == 'done' and all(word in done['text'] for word in ('alpha', 'beta', 'PONG'))
+    assert done['text'].index('alpha') < done['text'].index('beta') < done['text'].index('PONG')
+
+
+def test_answer_files_stay_within_the_last_100_turns_whatever_turns_are_empty(tmp_path):
+    m = load('lordd_answers')
+    a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6.1-sol'})
+    a.state = 'running'
+    for n in range(300):
+        a.turn_record('done', {'text': '' if 100 <= n < 200 else f'answer {n}'})
+    kept = sorted(int(p.stem) for p in a.answers_path.iterdir())
+    assert len(json.loads(a.record_path.read_text())['turns']) == 100 and kept == list(range(201, 301))
+
+
+def test_an_interrupt_while_a_retry_is_being_sent_still_stops_codexs_turn():
+    m = load('lordd_retry_interrupt')
+    from unittest.mock import AsyncMock
+    async def main():
+        d = object.__new__(m.Daemon); d.redact = str; d.config = {'gpt': {}}
+        a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '/w', 'model': 'gpt-6.1-sol', 'vendorSession': 's'})
+        a.state, a.turn_body, a.note, a.turn_record = 'running', {'text': 'work'}, lambda text: None, lambda kind, value: {}
+        requests, sent = [], asyncio.Event()
+        async def rpc(method, params):
+            requests.append(method)
+            if method == 'turn/start':
+                sent.set()
+                await asyncio.sleep(.2)
+                return {'turn': {'id': 't2'}}
+            if method == 'turn/interrupt': a.emit('error', message='interrupted', retryable=False)
+            return {}
+        v = types.SimpleNamespace(last=0, rpc=rpc, close=AsyncMock(), process=None)
+        d.backend = lambda agent: v
+        a.retry_task = asyncio.create_task(d.retry(a, 0))
+        await sent.wait()
+        await d.interrupt(a)
+        await asyncio.gather(a.retry_task, return_exceptions=True)
+        return requests, a.state
+    assert asyncio.run(main()) == (['turn/start', 'turn/interrupt'], 'idle')
