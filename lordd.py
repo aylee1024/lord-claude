@@ -192,8 +192,7 @@ def tests_profile(cwd, dirs, env):
     folder = HERE.parent / 'sandbox'
     profile = '\n'.join((folder / name).read_text() for name in ('seatbelt_base_policy.sbpl', 'seatbelt_preferences_policy.sbpl', 'tests.sbpl'))
     params = {'TMP': canon(env.get('TMPDIR') or '/tmp'), 'PRIVATE_TMP': '/private/tmp',
-              'EXEC_TMP': canon(Path(env['CODEX_HOME']) / 'tmp/arg0-macos'), 'KEY': canon(HOME / 'control.header'),
-              'LORD_HOME': canon(HOME)}
+              'KEY': canon(HOME / 'control.header'), 'LORD_HOME': canon(HOME)}
     roots = list(dict.fromkeys(canon(root) for root in [cwd, *dirs]))
     protected = set()
     for i, root in enumerate(roots):
@@ -207,7 +206,7 @@ def tests_profile(cwd, dirs, env):
         name = f'PROTECTED_{i}'
         params[name] = path
         profile += f'\n(lord-protect-metadata (param "{name}"))'
-    profile += '\n(lord-protect-home (param "LORD_HOME"))\n(lord-writable-root (param "EXEC_TMP"))\n'
+    profile += '\n(lord-protect-home (param "LORD_HOME"))\n'
     return profile, [f'-D{name}={path}' for name, path in params.items()]
 
 TEMP_ROOTS = ('/tmp', '/private/tmp', '/var/tmp', '/private/var/tmp', '/var/folders', '/private/var/folders')
@@ -629,7 +628,7 @@ class Vendor:
         self.codex_home = codex_home
         self.process, self.serial, self.generation = None, 0, 0
         self.exec_process, self.exec_descendants, self.environment_id = None, set(), None
-        self.exec_home, self.exec_error = None, ''
+        self.exec_error = ''
         self.last, self.reason, self.efforts, self.descendants = time.monotonic(), None, [], set()
         self.pending, self.models = {}, []
         self.lock, self.write_lock = asyncio.Lock(), asyncio.Lock()
@@ -692,6 +691,9 @@ class Vendor:
                 self.process = await asyncio.create_subprocess_exec(*command,
                     cwd=self.agent.cwd if self.agent else HOME, start_new_session=True, env=env,
                     stdin=-1, stdout=-1, stderr=-1, limit=LIMIT)
+                if self.stopping:
+                    await kill_tree(self.process)
+                    raise RuntimeError('Vendor closed during start')
             except BaseException as error:
                 await self.close()
                 if isinstance(error, FileNotFoundError): raise RuntimeError(f'{command[0]} was not found; {INSTALL[self.family]}') from None
@@ -719,15 +721,10 @@ class Vendor:
                 raise
 
     async def start_exec(self, command, env, nice):
-        self.exec_home = home = HOME / 'exec' / self.agent.agentId
-        home.mkdir(parents=True, exist_ok=True, mode=0o700)
-        home.chmod(0o700)
-        (home / 'tmp/arg0-macos').mkdir(parents=True, exist_ok=True, mode=0o700)
         self.exec_token, self.environment_id = uuid.uuid4().hex, 'lord-' + uuid.uuid4().hex
         self.exec_descendants = set()
         self.d.redact.secrets.add(self.exec_token)
         env = {k: v for k, v in env.items() if k not in ('LORD_MCP_TOKEN', 'LORD_DAEMON_SOCKET')}
-        env['CODEX_HOME'] = str(home)
         profile, params = tests_profile(self.agent.cwd, self.agent.record.get('dirs', []), env)
         try:
             self.exec_process = await asyncio.create_subprocess_exec(*nice, '/usr/bin/sandbox-exec', '-p', profile, *params,
@@ -735,6 +732,9 @@ class Vendor:
                 '--ws-token-sha256', hashlib.sha256(self.exec_token.encode()).hexdigest(),
                 cwd=self.agent.cwd, env=env, start_new_session=True, stdin=-1, stdout=-1, stderr=-1, limit=LIMIT)
         except OSError as error: raise RuntimeError(f'@tests exec-server could not start (requires macOS sandbox-exec): {error}') from None
+        if self.stopping:
+            await kill_tree(self.exec_process)
+            raise RuntimeError('Vendor closed during exec-server start')
         self.exec_error = ''
         stderr = self.d.task(self.stderr(self.exec_process))
         try: line = await asyncio.wait_for(self.exec_process.stdout.readline(), EXEC_START_TIMEOUT)
@@ -993,14 +993,10 @@ class Vendor:
         self.stopping, self.ready = True, False
         for future in [*self.pending.values(), getattr(self, 'initialized', None)]:
             if future and not future.done(): future.set_exception(RuntimeError('Vendor closed'))
-        process, ex, home = self.process, self.exec_process, self.exec_home
+        process, ex = self.process, self.exec_process
         await self.kill()
         if self.process is process: self.process = None
         if self.exec_process is ex: self.exec_process = None
-        # A close finishing after another start must not remove the new process's folder.
-        if self.exec_home is home:
-            self.exec_home = None
-            if home: shutil.rmtree(home, ignore_errors=True)
 
 class Daemon:
     def __init__(self):
@@ -1893,7 +1889,6 @@ class Daemon:
                 removed.append(aid)
                 for path in a.files(): path.unlink(missing_ok=True)
                 shutil.rmtree(a.answers_path, ignore_errors=True)
-                shutil.rmtree(HOME / 'exec' / aid, ignore_errors=True)
                 del self.agents[aid]
                 self.open_locks.pop(aid, None)
         self.pruned.update(removed)
@@ -1905,20 +1900,18 @@ class Daemon:
         # Files of an agent no journal holds, older than the prune period: a daemon of an earlier version pruned the
         # agent and removed only the files it knew. Under the journal lock, which every daemon holds to add a record,
         # so an agent reopened meanwhile is seen; a file is the agent's by its exact name, never a prefix, and any
-        # other file in logs/ is left alone. Each exec home is named by its agent's exact id too.
+        # other file in logs/ is left alone.
         cutoff = time.time() - days * 86400
         with self.journal_lock():
             known = set(self.agents) | set(self.records(self.legacy_journal, self.journal))
-            for folder in ('logs', 'exec'):
-                try: paths = list((HOME / folder).iterdir())
-                except OSError: continue
-                for path in paths:
-                    try:
-                        owner = (path.name if path.is_dir() else None) if folder == 'exec' else next(
-                            (path.name[:-len(suffix)] for suffix in AGENT_FILES if path.name.endswith(suffix) and len(path.name) > len(suffix)), None)
-                        if owner is None or owner in known or path.lstat().st_mtime >= cutoff: continue
-                        shutil.rmtree(path) if path.is_dir() and not path.is_symlink() else path.unlink()
-                    except OSError as error: self.log(f'{path} not removed: {error}')
+            try: paths = list((HOME / 'logs').iterdir())
+            except OSError: return
+            for path in paths:
+                owner = next((path.name[:-len(suffix)] for suffix in AGENT_FILES if path.name.endswith(suffix) and len(path.name) > len(suffix)), None)
+                try:
+                    if owner is None or owner in known or path.lstat().st_mtime >= cutoff: continue
+                    shutil.rmtree(path) if path.is_dir() and not path.is_symlink() else path.unlink()
+                except OSError as error: self.log(f'{path} not removed: {error}')
 
     def compact(self, removed=()):
         # The journal rewritten with one line per agent: the newest record of each, from the file (which daemons of

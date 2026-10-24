@@ -2647,8 +2647,8 @@ def test_tests_wiring_settings_environment_and_resume(tests_backend, rig):
             step = 12 - os.getpriority(os.PRIO_PROCESS, 0)
             assert argv[:4] == ('/usr/bin/nice', '-n', str(step), '/usr/bin/sandbox-exec') if step > 0 else argv[0] == '/usr/bin/sandbox-exec'
             assert ex['cwd'] == str(rig.home.resolve()) and ex['nice'] == max(12, os.getpriority(os.PRIO_PROCESS, 0))
-            assert ex['mcp_env'] == {} and ex['env'] == {} and ex['codex_home'] == str(d.journal.parent / 'exec/a')
-            assert (Path(ex['codex_home']).stat().st_mode & 0o777) == 0o700
+            assert ex['mcp_env'] == {} and ex['env'] == {}
+            assert ex['codex_home'] == next(e['codex_home'] for e in audit if e.get('launch') and e['pid'] == v.process.pid)
             args = ex['argv']
             assert args[args.index('--listen') + 1] == 'ws://127.0.0.1:0'
             assert args[args.index('--ws-auth') + 1] == 'capability-token'
@@ -2716,7 +2716,7 @@ def test_tests_later_enable_is_sticky_and_start_options_restart_both(tests_backe
             assert v.process is app and v.exec_process is ex
             assert d.agents['a'].record['tests'] is True
             await d.open({**body, 'agentId': 'b', 'tests': True})
-            assert {e['codex_home'] for e in rig.audit() if e.get('exec_launch')} == {str(d.journal.parent / 'exec' / aid) for aid in ('a', 'b')}
+            assert {e['codex_home'] for e in rig.audit() if e.get('exec_launch')} == {None}
         finally: await d.close()
     asyncio.run(scenario())
 
@@ -2768,10 +2768,6 @@ def test_tests_exec_server_tree_dies_with_vendor(tests_backend, rig, stop):
                 except ProcessLookupError: break
                 assert time.monotonic() < deadline, 'exec-server left a command running'
                 await asyncio.sleep(.02)
-            deadline = time.monotonic() + 4
-            while (d.journal.parent / 'exec/a').exists():
-                assert time.monotonic() < deadline, 'stopped exec-server left its home behind'
-                await asyncio.sleep(.02)
         finally: await d.close()
     asyncio.run(scenario())
 
@@ -2798,6 +2794,88 @@ def test_tests_failed_start_is_bounded_and_reaps_both(tests_backend, rig, failur
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize('own_home', [False, True])
+def test_tests_exec_start_preserves_vendor_home_and_creates_no_lord_files(tests_backend, rig, own_home):
+    d, m, _ = tests_backend
+    async def scenario():
+        a = types.SimpleNamespace(agentId='a', cwd=str(rig.home), record={})
+        v = m['Vendor'](d, 'gpt', a)
+        env = m['subscription_env']()
+        if own_home: env['CODEX_HOME'] = str(d.journal.parent / 'codex')
+        before = set(d.journal.parent.rglob('*'))
+        try:
+            await v.start_exec(d.config['gpt']['program'], env, [])
+            assert set(d.journal.parent.rglob('*')) == before, 'exec-server start created files under Lord home'
+            launch = next(e for e in rig.audit() if e.get('exec_launch'))
+            assert launch['codex_home'] == env.get('CODEX_HOME')
+        finally:
+            await v.close()
+            await d.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='macOS Seatbelt profile')
+def test_tests_profile_grants_only_project_and_temp_roots(tmp_path):
+    m = load('lordd_tests_writable_roots')
+    work, extra, temp, outside = [tmp_path / name for name in ('work', 'extra', 'temp', 'outside')]
+    for path in (work, extra, temp, outside): path.mkdir()
+    m.HOME.mkdir()
+    alias = m.HOME / 'exec/a/tmp/arg0-macos'
+    alias.parent.mkdir(parents=True)
+    alias.symlink_to(outside, target_is_directory=True)
+    profile, params = m.tests_profile(str(work), [str(extra)], {'TMPDIR': str(temp), 'CODEX_HOME': str(alias.parents[1])})
+    code = '''import json, pathlib, sys
+result = {}
+for path in map(pathlib.Path, sys.argv[1:]):
+ try: (path / 'probe').write_text('x'); result[str(path)] = 'allowed'
+ except PermissionError: result[str(path)] = 'denied'
+print(json.dumps(result))
+'''
+    paths = [work, extra, temp, outside, alias]
+    result = subprocess.run(['/usr/bin/sandbox-exec', '-p', profile, *params, PYTHON, '-c', code, *map(str, paths)],
+        cwd=work, capture_output=True, text=True, timeout=8)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {str(path): 'allowed' if path in (work, extra, temp) else 'denied' for path in paths}
+    assert 'EXEC_TMP' not in profile and not any(p.startswith('-DEXEC_TMP=') for p in params)
+
+
+@pytest.mark.parametrize('spawn', ['exec-server', 'app-server'])
+def test_tests_close_during_spawn_reaps_the_late_process(tests_backend, rig, monkeypatch, spawn):
+    d, _, _ = tests_backend
+    async def scenario():
+        await d.open({'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home), 'tests': True})
+        v = d.backend(d.agents['a'])
+        await v.close()
+        entered, release = asyncio.Event(), asyncio.Event()
+        real = asyncio.create_subprocess_exec
+        spawned = []
+        async def gated(*argv, **kw):
+            process = await real(*argv, **kw)
+            if spawn in argv:
+                spawned.append(process)
+                entered.set()
+                await release.wait()
+            return process
+        monkeypatch.setattr(asyncio, 'create_subprocess_exec', gated)
+        starting = asyncio.create_task(v.ensure())
+        try:
+            await asyncio.wait_for(entered.wait(), 3)
+            await v.close()
+            release.set()
+            result, = await asyncio.wait_for(asyncio.gather(starting, return_exceptions=True), 5)
+            assert spawned[0].returncode is not None, 'a spawn completed after close and left its process alive'
+            assert isinstance(result, RuntimeError) and 'closed' in str(result).lower()
+            for event in rig.audit():
+                if event.get('launch') or event.get('exec_launch'):
+                    for pid in [event['pid'], *([event['child']] if event.get('exec_launch') else [])]:
+                        with pytest.raises(ProcessLookupError): os.kill(pid, 0)
+        finally:
+            release.set()
+            await asyncio.gather(starting, return_exceptions=True)
+            await d.close()
+    asyncio.run(scenario())
+
+
 def test_tests_profile_uses_parameters_and_protects_resolved_metadata(tmp_path, monkeypatch):
     m = load('lordd_tests_profile')
     work = tmp_path / 'work " (odd)'; work.mkdir()
@@ -2807,7 +2885,7 @@ def test_tests_profile_uses_parameters_and_protects_resolved_metadata(tmp_path, 
     key = tmp_path / 'actual-key'; key.write_text('decoy')
     m.HOME.mkdir(); (m.HOME / 'control.header').symlink_to(key)
     temp = tmp_path / 'temp'; temp.mkdir()
-    profile, params = m.tests_profile(str(work), [str(extra)], {'TMPDIR': str(temp), 'CODEX_HOME': str(m.HOME / 'exec/a')})
+    profile, params = m.tests_profile(str(work), [str(extra)], {'TMPDIR': str(temp)})
     assert str(work) not in profile and str(extra) not in profile and str(key) not in profile
     assert all(p.startswith('-D') for p in params)
     assert {str(p.resolve()) for p in (work, extra, temp, key, target)} <= {p.split('=', 1)[1] for p in params}
@@ -2855,7 +2933,7 @@ except PermissionError: pass
 print('profile ok')
 '''
     try:
-        profile, params = m.tests_profile(str(work), [str(extra)], {'TMPDIR': str(temp), 'CODEX_HOME': str(m.HOME / 'exec/a')})
+        profile, params = m.tests_profile(str(work), [str(extra)], {'TMPDIR': str(temp)})
         result = subprocess.run(['/usr/bin/sandbox-exec', '-p', profile, *params, PYTHON, '-c', code, str(work), str(extra), str(temp), str(outside), endpoint], cwd=work, capture_output=True, text=True, timeout=8)
         assert result.returncode == 0, result.stdout + result.stderr
     finally: listener.close(); Path(endpoint).unlink(missing_ok=True)
@@ -2866,99 +2944,6 @@ def test_the_gpt_description_grows_no_longer_with_its_options():
     line = next(line for line in (ROOT / "agents/gpt.md").read_text().splitlines() if line.startswith("description: "))
     assert len(json.loads(line.removeprefix("description: "))) <= 975
 
-
-def test_tests_exec_homes_are_per_agent(tests_backend, rig):
-    d, _, _ = tests_backend
-    async def scenario():
-        try:
-            for aid in ('a', 'b'):
-                await d.open({'agentId': aid, 'family': 'gpt', 'cwd': str(rig.home), 'tests': True})
-            homes = [Path(e['codex_home']) for e in rig.audit() if e.get('exec_launch')]
-            assert homes == [d.journal.parent / 'exec' / aid for aid in ('a', 'b')]
-            assert all(home.stat().st_mode & 0o777 == 0o700 for home in homes)
-        finally: await d.close()
-    asyncio.run(scenario())
-
-
-@pytest.mark.skipif(sys.platform != 'darwin', reason='macOS Seatbelt profile')
-def test_tests_exec_profiles_cannot_write_other_agents_aliases(tests_backend, rig):
-    d, _, launched = tests_backend
-    async def scenario():
-        try:
-            for aid in ('a', 'b'):
-                cwd = rig.home / aid; cwd.mkdir()
-                await d.open({'agentId': aid, 'family': 'gpt', 'cwd': str(cwd), 'tests': True})
-            profiles, aliases = {}, {}
-            for argv, kw in launched:
-                if '/usr/bin/sandbox-exec' not in argv: continue
-                at = argv.index('/usr/bin/sandbox-exec')
-                end = at + 3
-                while argv[end].startswith('-D'): end += 1
-                aid = kw['env']['LORD_AGENT_ID']
-                profiles[aid] = (argv[at:end], kw)
-                aliases[aid] = Path(kw['env']['CODEX_HOME']) / 'tmp/arg0-macos' / f'codex-arg0-{aid}'
-                aliases[aid].mkdir()
-            code = '''import pathlib, sys
-own, other = map(pathlib.Path, sys.argv[1:])
-(own / 'apply_patch').write_text('own alias')
-try: (other / 'apply_patch').write_text('planted alias')
-except PermissionError: pass
-else: raise AssertionError("another agent's alias folder is writable")
-'''
-            for aid, other in (('a', 'b'), ('b', 'a')):
-                argv, kw = profiles[aid]
-                result = subprocess.run([*argv, PYTHON, '-c', code, str(aliases[aid]), str(aliases[other])],
-                    cwd=kw['cwd'], env=kw['env'], capture_output=True, text=True, timeout=8)
-                assert result.returncode == 0, result.stdout + result.stderr
-        finally: await d.close()
-    asyncio.run(scenario())
-
-
-def test_tests_prune_removes_the_agents_exec_home(tests_backend, rig):
-    d, _, _ = tests_backend
-    async def scenario():
-        try:
-            await d.open({'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home), 'tests': True})
-            home = d.journal.parent / 'exec/a'
-            home.mkdir(parents=True, exist_ok=True)
-            (home / 'alias').write_text('stale')
-            assert (await d.prune(0))['pruned'] == ['a']
-            assert not home.exists()
-        finally: await d.close()
-    asyncio.run(scenario())
-
-
-@pytest.mark.parametrize('with_logs', [False, True])
-def test_tests_sweep_removes_only_old_unrecorded_exec_homes_under_lock(tmp_path, monkeypatch, with_logs):
-    m = load('lordd_exec_sweep')
-    root = m.HOME / 'exec'; root.mkdir(parents=True)
-    if with_logs: (m.HOME / 'logs').mkdir()
-    for aid in ('gone', 'live', 'live.review', 'journal-only', 'legacy-only', 'recent'):
-        home = root / aid; home.mkdir()
-        (home / 'alias').write_text('kept until sweep')
-        if aid != 'recent': os.utime(home, (0, 0))
-    (root / 'notes.txt').write_text('not a home'); os.utime(root / 'notes.txt', (0, 0))
-    d = object.__new__(m.Daemon)
-    d.agents = {'live.review': object()}
-    d.journal, d.legacy_journal = m.HOME / 'journal.jsonl', m.HOME / 'sessions.jsonl'
-    d.journal.write_text(json.dumps({'agentId': 'journal-only'}) + '\n')
-    d.legacy_journal.write_text(json.dumps({'agentId': 'legacy-only'}) + '\n')
-    held, removed = [], []
-    real_lock, real_rmtree = m.Daemon.journal_lock, m.shutil.rmtree
-    @contextlib.contextmanager
-    def lock(self):
-        with real_lock(self):
-            held.append(True)
-            try: yield
-            finally: held.pop()
-    def remove(path, **kw):
-        removed.append((Path(path).name, bool(held)))
-        return real_rmtree(path, **kw)
-    monkeypatch.setattr(m.Daemon, 'journal_lock', lock)
-    monkeypatch.setattr(m.shutil, 'rmtree', remove)
-    d.sweep(14)
-    assert sorted(removed) == [('gone', True), ('live', True)]
-    assert sorted(p.name for p in root.iterdir()) == ['journal-only', 'legacy-only', 'live.review', 'notes.txt', 'recent']
 
 
 def test_nosandbox_reports_network_on_in_open_and_turn_log(rig):
@@ -2997,7 +2982,7 @@ def test_tests_dir_cannot_open_lord_home_for_writes(tmp_path):
     own = home / 'exec/a/tmp/arg0-macos'; own.mkdir(parents=True)
     other = home / 'exec/b/tmp/arg0-macos'; other.mkdir(parents=True)
     work = tmp_path / 'work'; work.mkdir()
-    profile, params = m.tests_profile(str(work), [str(home)], {'TMPDIR': str(home), 'CODEX_HOME': str(home / 'exec/a')})
+    profile, params = m.tests_profile(str(work), [str(home)], {'TMPDIR': str(home)})
     code = '''import json, pathlib, sys
 home, own, other = map(pathlib.Path, sys.argv[1:])
 result = {}
@@ -3009,23 +2994,31 @@ print(json.dumps(result))
     result = subprocess.run(['/usr/bin/sandbox-exec', '-p', profile, *params, PYTHON, '-c', code, str(home), str(own), str(other)],
         cwd=work, capture_output=True, text=True, timeout=8)
     assert result.returncode == 0, result.stderr
-    assert json.loads(result.stdout) == {'key': 'denied', 'journal': 'denied', 'other': 'denied', 'own': 'allowed'}
+    assert json.loads(result.stdout) == {'key': 'denied', 'journal': 'denied', 'other': 'denied', 'own': 'denied'}
     assert key.read_text() == 'decoy'
 
 
-def test_tests_watch_exec_kills_child_before_any_guard(tmp_path):
+def test_tests_watch_exec_kills_detached_child_recorded_by_guard(tmp_path):
     m = load('lordd_watch_exec_child')
     async def scenario():
-        v = m.Vendor(types.SimpleNamespace(stopping=False), 'gpt')
+        d = object.__new__(m.Daemon)
+        d.stopping, d.config = False, {'idle_exit_s': 60, 'gpt': {}}
+        a = types.SimpleNamespace(state='running', record={}, family='gpt')
+        v = m.Vendor(d, 'gpt', a)
+        d.vendors = {'a': v}
+        child = None
         try:
             v.process = await asyncio.create_subprocess_exec(PYTHON, '-c', 'import time; time.sleep(300)',
                 cwd=tmp_path, start_new_session=True)
             code = ('import subprocess, sys, time\n'
-                    'p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n'
+                    'p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n'
                     'print(p.pid, flush=True)\ntime.sleep(300)\n')
             v.exec_process = await asyncio.create_subprocess_exec(PYTHON, '-c', code, cwd=tmp_path, start_new_session=True, stdout=-1)
             child = int(await asyncio.wait_for(v.exec_process.stdout.readline(), 3))
             assert not v.descendants and not v.exec_descendants
+            assert os.getsid(child) == child
+            await d.guard(time.monotonic())
+            assert child in v.exec_descendants
             ex = v.exec_process
             watching = asyncio.create_task(v.watch_exec(ex))
             ex.kill()
@@ -3034,28 +3027,12 @@ def test_tests_watch_exec_kills_child_before_any_guard(tmp_path):
             while True:
                 try: os.kill(child, 0)
                 except ProcessLookupError: break
-                assert time.monotonic() < deadline, 'exec-server left a child alive before the first guard pass'
+                assert time.monotonic() < deadline, 'exec-server left a recorded detached child alive'
                 await asyncio.sleep(.02)
             assert v.process.returncode is not None
-        finally: await v.close()
-    asyncio.run(scenario())
-
-
-@pytest.mark.parametrize('stop', ['close', '--exec-eof', '--exec-invalid', '--exec-silent', '--fail-environment'])
-def test_tests_close_removes_home_after_normal_or_failed_start(tests_backend, rig, stop):
-    d, m, _ = tests_backend
-    m['EXEC_START_TIMEOUT'] = 1
-    async def scenario():
-        try:
-            body = {'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home), 'tests': True}
-            home = d.journal.parent / 'exec/a'
-            if stop == 'close':
-                await d.open(body)
-                assert home.is_dir()
-                await d.backend(d.agents['a']).close()
-            else:
-                d.config['gpt']['program'].append(stop)
-                with pytest.raises(RuntimeError, match='exec-server|environment refused'): await d.open(body)
-            assert not home.exists()
-        finally: await d.close()
+        finally:
+            if child:
+                try: os.kill(child, signal.SIGKILL)
+                except ProcessLookupError: pass
+            await v.close()
     asyncio.run(scenario())
