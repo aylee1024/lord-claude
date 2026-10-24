@@ -449,6 +449,7 @@ class Agent:
         self.earlier_done = False
         # This turn's commands, retries after "at capacity", and whether it edited a file; and codex's error for it.
         self.commands, self.retries, self.edited, self.last_command, self.turn_error, self.retry_task = 0, 0, False, None, None, None
+        self.retry_waiting = False
         self.final_text, self.restart, self.token = '', False, uuid.uuid4().hex
         self.default_model, self.agy_step = False, None
         # Each vendor tool step's result, by step id, for the plugin's row of it (/row).
@@ -517,8 +518,14 @@ class Agent:
         how = 'done' if kind == 'done' else 'interrupted' if value.get('message') == 'interrupted' or self.cancel_requested else f"error ({value.get('cause') or 'vendor'})"
         settings = getattr(self, 'settings', None) or {}
         transcript = transcript_path(self.family, self.vendorSession, self.cwd, settings.get('codex_folder'))
-        try: turns = json.loads(self.record_path.read_text(encoding='utf-8'))['turns']
-        except (OSError, ValueError, KeyError, TypeError): turns = []
+        try: saved = json.loads(self.record_path.read_text(encoding='utf-8'))
+        except (OSError, ValueError): saved = {}
+        saved = saved if isinstance(saved, dict) else {}
+        turns = saved.get('turns', [])
+        # Helpers the record named before a daemon restart stay, so earlier turns' helper ids keep their models.
+        for helper in saved.get('helpers') if isinstance(saved.get('helpers'), list) else []:
+            if isinstance(helper, dict) and isinstance(helper.get('thread'), str) and isinstance(helper.get('started'), str):
+                self.helpers.setdefault(helper['thread'], helper)
         # A record edited by hand or cut short is read for what it still holds, never a reason the turn cannot end.
         turns = [turn for turn in turns if isinstance(turn, dict)] if isinstance(turns, list) else []
         last = turns[-1].get('turn') if turns else 0
@@ -562,6 +569,9 @@ class Agent:
             value['message'] = sign_in_hint(self.family, value['message'])
             self.note('error: ' + str(value['message']))
         if kind in ('done', 'error'):
+            # A turn that ends while its "at capacity" retry waits (a guard, a crash) takes the retry with it.
+            if self.retry_waiting and self.retry_task and not self.retry_task.done(): self.retry_task.cancel()
+            self.retry_waiting = False
             value['record'] = self.turn_record(kind, value)
             self.state, self.activity = 'idle', ''
             self.finished.set()
@@ -874,7 +884,7 @@ class Vendor:
 
     async def unfinished(self, a, turn_id):
         await asyncio.sleep(5)
-        if a.state in ('running', 'waiting_tool') and a.turn_id == turn_id: self.failed(a, a.turn_error or {}, 'failed', turn_id)
+        if a.state in ('running', 'waiting_tool') and a.turn_id == turn_id and turn_id not in a.ended_turns: self.failed(a, a.turn_error or {}, 'failed', turn_id)
 
     def helper_event(self, a, helper, method, p):
         # A codex helper's steps go to its parent's log and read list only: no row, so nothing reaches a model.
@@ -1004,7 +1014,8 @@ class Daemon:
             with self.journal_lock():
                 self.load_quota()
                 self.quota[key] = value
-                scratch = HOME / f'quota.json.{os.getpid()}'
+                # One scratch name under the lock, replaced by the next write, so a failed one leaves nothing new.
+                scratch = HOME / 'quota.json.tmp'
                 scratch.write_text(dumps({f'{family} {model}': list(entry) for (family, model), entry in self.quota.items()}), encoding='utf-8')
                 scratch.replace(HOME / 'quota.json')
         except OSError as error: self.log(f'quota.json not written: {error}')
@@ -1310,7 +1321,7 @@ class Daemon:
         a.base, a.tokens, a.turn_id = dict(a.total), usage({}), None
         a.finished.clear()
         a.dispatched, a.agy_step, a.rows = False, None, {}
-        a.commands, a.retries, a.edited, a.last_command, a.turn_error, a.turn_body = 0, 0, False, None, None, body
+        a.commands, a.retries, a.edited, a.last_command, a.turn_error, a.turn_body, a.retry_waiting = 0, 0, False, None, None, body, False
         a.turn_started = datetime.now(timezone.utc).isoformat(timespec='seconds')
         a.settings = self.settings(a)
         a.note(f'turn: {a.family} {a.model} effort {a.effort} · {settings_line(a.settings)}')
@@ -1334,9 +1345,11 @@ class Daemon:
     async def retry(self, a, delay):
         # A turn that met "at capacity" before changing anything, sent again on the same session after a wait. The
         # session already holds the task, so the retry asks it to go on rather than sending the task twice.
+        owner = a.turn_body
         try: await asyncio.sleep(delay)
         finally: a.retry_waiting = False
-        if a.cancel_requested or a.state not in ('running', 'waiting_tool'): return
+        # Only the turn that met "at capacity": a later turn started meanwhile is not continued.
+        if a.cancel_requested or a.state not in ('running', 'waiting_tool') or a.turn_body is not owner: return
         self.backend(a).last = time.monotonic()
         await self.run_turn(a, {**a.turn_body, 'text': 'Continue with the task above: the last attempt stopped because the model was at capacity.'}, retry=True)
 
@@ -1359,9 +1372,10 @@ class Daemon:
 
     def gpt_quota(self, a, message):
         # A spent codex allowance is refused until the window that ran out resets, as codex last reported it.
-        # The bucket that meters this model: the one naming it, else codex's ordinary one.
+        # The bucket that meters this model: the one named after it (a limit such as gpt-reserve), else codex's own.
+        # normalModelSlug is only the model lending an alias quota its display name.
         buckets = allowance_buckets()
-        own = [b for b in buckets.values() if b.get('normalModelSlug') == a.model] or [b for k, b in buckets.items() if k == 'codex']
+        own = [b for k, b in buckets.items() if a.model in (k, b.get('limitName'))] or [b for k, b in buckets.items() if k == 'codex']
         resets = [w.get('resetsAt') for bucket in own for w in (bucket.get('primary'), bucket.get('secondary'))
                   if isinstance(w, dict) and isinstance(w.get('resetsAt'), (int, float)) and (w.get('usedPercent') or 0) >= 100]
         if not resets: return a.note('usage limit reached; codex named no reset time, so new turns are not refused')
@@ -1388,7 +1402,9 @@ class Daemon:
                                            else {'type': 'workspaceWrite', 'networkAccess': bool(a.record.get('net')), 'writableRoots': a.record.get('dirs', [])}}
                 if body.get('schema'): params['outputSchema'] = body['schema']
                 result = await v.rpc('turn/start', params)
-                a.turn_id = result['turn']['id']
+                # The response can arrive after codex already reported this turn ended (an "at capacity" failure read
+                # from the same batch), which a retry has replaced.
+                if result['turn']['id'] not in a.ended_turns: a.turn_id = result['turn']['id']
                 if a.cancel_requested and a.state == 'running': await self.interrupt(a)
             elif a.family == 'grok':
                 text = body['text']
@@ -1766,7 +1782,21 @@ class Daemon:
                 self.open_locks.pop(aid, None)
         self.pruned.update(removed)
         self.compact(removed)
+        self.sweep(days)
         return {'ok': True, 'pruned': removed}
+
+    def sweep(self, days):
+        # Files of an agent no journal holds, older than the prune period: a daemon of an earlier version pruned the
+        # agent and removed only the files it knew.
+        known = set(self.agents) | set(self.records(self.legacy_journal, self.journal))
+        cutoff = time.time() - days * 86400
+        try: paths = list((HOME / 'logs').iterdir())
+        except OSError: return
+        for path in paths:
+            try:
+                if path.name.split('.', 1)[0] in known or path.lstat().st_mtime >= cutoff: continue
+                shutil.rmtree(path) if path.is_dir() and not path.is_symlink() else path.unlink()
+            except OSError as error: self.log(f'{path} not removed: {error}')
 
     def compact(self, removed=()):
         # The journal rewritten with one line per agent: the newest record of each, from the file (which daemons of

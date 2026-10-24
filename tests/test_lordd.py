@@ -2350,7 +2350,7 @@ def test_allowance_writes_take_the_journal_lock_and_leave_one_scratch_file_at_mo
     d.allowance({'limitId': 'codex', 'primary': {'usedPercent': 2}})
     d.allowance({'limitId': 'codex', 'primary': {'usedPercent': 3}})
     monkeypatch.setattr(m.Path, 'replace', original)
-    assert len([p for p in m.HOME.iterdir() if p.name.startswith('allowance.json.')]) <= 1
+    assert [p.name for p in m.HOME.iterdir() if p.name.startswith('allowance.json.')] in ([], ['allowance.json.tmp'])
     d.allowance({'limitId': 'codex', 'primary': {'usedPercent': 4}})
     assert [p.name for p in m.HOME.iterdir() if p.name.startswith('allowance.json')] == ['allowance.json']
 
@@ -2361,14 +2361,18 @@ def test_a_usage_limit_is_refused_until_the_reset_of_the_models_own_bucket():
     m.HOME.mkdir(parents=True, exist_ok=True)
     (m.HOME / 'allowance.json').write_text(json.dumps({'gpt': {
         'codex': {'primary': {'usedPercent': 100, 'resetsAt': now + 3600}},
-        'reserve': {'normalModelSlug': 'gpt-6-reserve', 'primary': {'usedPercent': 100, 'resetsAt': now + 604800}}}}))
+        'gpt-reserve': {'limitId': 'gpt-reserve', 'limitName': 'gpt-reserve', 'normalModelSlug': 'gpt-6-luna', 'primary': {'usedPercent': 100, 'resetsAt': now + 604800}}}}))
     d = object.__new__(m.Daemon); d.quota = {}; d.log = lambda text: None
     a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6.1-sol'})
     d.gpt_quota(a, 'limit')
     assert abs(d.quota[('gpt', 'gpt-6.1-sol')][0] - (now + 3600)) < 5
-    b = m.Agent({'agentId': 'b', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6-reserve'})
+    b = m.Agent({'agentId': 'b', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-reserve'})
     d.gpt_quota(b, 'limit')
-    assert abs(d.quota[('gpt', 'gpt-6-reserve')][0] - (now + 604800)) < 5
+    assert abs(d.quota[('gpt', 'gpt-reserve')][0] - (now + 604800)) < 5
+    # normalModelSlug only lends a display name to an alias quota; gpt-6-luna is metered by codex's own bucket.
+    c = m.Agent({'agentId': 'c', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6-luna'})
+    d.gpt_quota(c, 'limit')
+    assert abs(d.quota[('gpt', 'gpt-6-luna')][0] - (now + 3600)) < 5
 
 
 def test_one_large_batch_of_reads_stops_at_the_limit():
@@ -2400,8 +2404,8 @@ def test_an_interrupt_right_after_at_capacity_cancels_the_retry_at_once(monkeypa
         await d.interrupt(a)
         took = time.monotonic() - started
         await asyncio.gather(a.retry_task, return_exceptions=True)
-        return took < 1, a.retry_task.cancelled(), killed, a.state
-    assert asyncio.run(main()) == (True, True, [], 'idle')
+        return took < 1, a.retry_task.cancelled(), killed, a.state, a.retry_waiting
+    assert asyncio.run(main()) == (True, True, [], 'idle', False)
 
 
 def test_a_retry_keeps_the_turns_wall_clock_and_its_wait_is_not_silence(monkeypatch):
@@ -2443,3 +2447,94 @@ def test_capacity_retry_settings_must_be_numbers(tmp_path, monkeypatch, key):
     monkeypatch.setenv('LORD_CONFIG', str(bundled))
     monkeypatch.setattr(m, 'HOME', tmp_path)
     with pytest.raises(ValueError, match=key): m.load_config()
+
+
+def test_a_turn_id_codex_already_ended_is_never_taken_back():
+    m = load('lordd_ended_turn_id')
+    async def main():
+        d = object.__new__(m.Daemon); d.redact = str; d.config = {'gpt': {}}
+        a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '/w', 'model': 'gpt-6.1-sol', 'vendorSession': 's'})
+        a.state = 'running'
+        # codex's start response arrives after the same turn already failed "at capacity" (failed() ended it).
+        a.ended_turns.add('t1')
+        async def rpc(method, params): return {'turn': {'id': 't1'}}
+        d.backend = lambda agent: types.SimpleNamespace(last=0, rpc=rpc)
+        await d.run_turn(a, {'text': 'work'})
+        return a.turn_id
+    assert asyncio.run(main()) is None
+
+
+def test_a_pending_retry_ends_with_its_turn_and_never_reaches_a_later_one(monkeypatch):
+    m = load('lordd_retry_owner')
+    async def main():
+        d = object.__new__(m.Daemon); d.redact = str; d.config = {'gpt': {}, 'capacity_retry_s': .1}; d.tasks = set(); d.log = lambda text: None
+        a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '/w', 'model': 'gpt-6.1-sol', 'vendorSession': 's'})
+        a.state, a.turn_body, a.note, a.turn_record = 'running', {'text': 'work'}, lambda text: None, lambda kind, value: {}
+        starts = []
+        async def rpc(method, params):
+            starts.append(params['input'][0]['text'])
+            return {'turn': {'id': 'n'}}
+        d.backend = lambda agent: types.SimpleNamespace(last=0, rpc=rpc)
+        m.Vendor(d, 'gpt', a).failed(a, {'message': 'at capacity', 'codexErrorInfo': 'serverOverloaded'}, 'failed', 't1')
+        # The turn ends another way (the wall-clock guard) while the retry waits; a new turn then runs.
+        a.emit('error', message='stopped: the turn ran past its 60 s wall-clock limit', retryable=True)
+        waiting = a.retry_waiting
+        a.state, a.turn_body = 'running', {'text': 'new task'}
+        await asyncio.sleep(.3)
+        return waiting, starts
+    assert asyncio.run(main()) == (False, [])
+
+
+def test_a_restarted_daemon_keeps_the_helpers_its_record_names(tmp_path):
+    m = load('lordd_helpers_kept')
+    a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6.1-sol'})
+    a.state, a.turn_started = 'running', '2026-01-01T00:00:00+00:00'
+    m.helper_seen(a, {'type': 'subAgentActivity', 'agentThreadId': 'child', 'agentPath': '/root/x', 'model': 'gpt-6-luna'})
+    a.turn_record('done', {'text': 'one'})
+    b = m.Agent(dict(a.record))
+    b.state = 'running'
+    b.turn_record('done', {'text': 'two'})
+    document = json.loads(b.record_path.read_text())
+    assert [h['thread'] for h in document['helpers']] == ['child'] and document['turns'][0]['helpers'] == ['child']
+
+
+
+def test_a_retry_whose_turn_was_replaced_while_it_waited_sends_nothing():
+    m = load('lordd_retry_identity')
+    async def main():
+        d = object.__new__(m.Daemon); d.redact = str; d.config = {'gpt': {}}
+        a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '/w', 'model': 'gpt-6.1-sol', 'vendorSession': 's'})
+        a.state, a.turn_body = 'running', {'text': 'old task'}
+        starts = []
+        async def rpc(method, params): starts.append(params['input'][0]['text']); return {'turn': {'id': 'n'}}
+        d.backend = lambda agent: types.SimpleNamespace(last=0, rpc=rpc)
+        waiting = asyncio.create_task(d.retry(a, .1))
+        await asyncio.sleep(.02)
+        a.turn_body = {'text': 'new task'}
+        await waiting
+        return starts
+    assert asyncio.run(main()) == []
+
+
+def test_a_quota_write_that_fails_leaves_one_fixed_scratch_name_at_most(monkeypatch):
+    m = load('lordd_quota_scratch')
+    m.HOME.mkdir(parents=True, exist_ok=True)
+    d = object.__new__(m.Daemon); d.quota = {}; d.log = lambda text: None
+    monkeypatch.setattr(m.Path, 'replace', lambda self, target: (_ for _ in ()).throw(OSError('disk full')))
+    d.save_quota(('gpt', 'x'), (time.time() + 60, 'spent'))
+    assert [p.name for p in m.HOME.iterdir() if p.name.startswith('quota.json')] in ([], ['quota.json.tmp'])
+
+
+def test_prune_removes_files_of_agents_an_older_daemon_pruned(rig):
+    logs = rig.home / 'logs'
+    logs.mkdir(exist_ok=True)
+    old = time.time() - 20 * 86400
+    for name in ('gone.json', 'gone.reads.txt', 'gone.answers/1.md', 'fresh.json'):
+        (logs / name).parent.mkdir(exist_ok=True)
+        (logs / name).write_text('x')
+    for path in (logs / 'gone.json', logs / 'gone.reads.txt', logs / 'gone.answers/1.md', logs / 'gone.answers'): os.utime(path, (old, old))
+    rig.open('gpt', agent='kept'); rig.turn('PING', agent='kept')
+    for path in logs.glob('kept*'): os.utime(path, (old, old))
+    rig.request('/prune', {'days': 14})
+    # No record and older than the prune period: removed. A young file, or one whose agent has a record, stays.
+    assert sorted(p.name for p in logs.iterdir()) == sorted(['fresh.json', *[p.name for p in logs.glob('kept*')]]) and (logs / 'kept.log').exists()

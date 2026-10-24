@@ -83,7 +83,7 @@ can reach them; grok's Lord profiles deny reading it); without it the reply is 4
 | GET | /allowance | - | `{gpt, refused}`: `allowance.json`'s codex buckets, and each quota reset Lord refuses turns until |
 | POST | /interrupt, /close | `{agentId}` | `{ok}` (codex `turn/interrupt`, then the codex process is stopped once a started turn ends, since codex leaves the running command alive; grok `session/cancel`; agy process kill; close also stops the process) |
 | POST | /mcp | `{agentId, name, arguments, token}` | the lord tool call of a vendor's MCP server; the per-agent token is required |
-| POST | /prune | `{days}` | `{ok, pruned}`; also at daemon start and hourly: journal records unused for `prune_days`; codex threads archived, vendor history otherwise kept |
+| POST | /prune | `{days}` | `{ok, pruned}`; also at daemon start and hourly: journal records unused for `prune_days`; codex threads archived, vendor history otherwise kept; then any `logs/<id>.*` with no journal record and older than `prune_days` (left by an earlier version's prune, which knew fewer files) is removed |
 | GET | /agents | - | `[{agentId, family, model, effort, state, activity, cwd, log, answer, usage, quiet_s}]` (`quiet_s`: seconds since the vendor's last output while its turn runs, else null) (`answer`: the answer file's path, null before a first answer) (`usage`: the vendor's last turn; codex input excludes its cached tokens) |
 
 NDJSON events: `text` (vendor text as it streams), `activity` (one line of vendor work), `row` (`{rowId, shell, title,
@@ -147,8 +147,9 @@ the reason. Every stop kills the vendor's whole process tree by pid as well as i
 retried once; a crash, or a codex turn that ends failed, restarts the vendor on the next turn, never in a loop, except
 the codex kinds `cyberPolicy` and `misalignmentPolicyViolation` (the error reads `refused by vendor (<kind>): …`, names
 the last completed command and says a reworded message resumes the session), `usageLimitExceeded` (the reset of the
-window codex last reported at 100%, in the bucket whose `normalModelSlug` is the agent's model, else the `codex` bucket, is
-kept in `quota.json`; none reported, nothing is refused), `rateLimitExceeded` and
+window codex last reported at 100%, in the bucket named after the agent's model (its `limitId` or `limitName`, for
+example `gpt-reserve`), else the `codex` bucket, is kept in `quota.json` (written under the journal lock through the one
+scratch name `quota.json.tmp`); none reported, nothing is refused), `rateLimitExceeded` and
 `serverOverloaded`. `serverOverloaded` before any `fileChange` in the turn (a helper's included) waits `capacity_retry_s` (30) and starts a
 turn on the same thread asking it to continue, up to `capacity_retries` (2) times (both numbers checked at start-up); an
 interrupt during the wait, from the moment it is scheduled, ends the turn; the wait is not vendor silence for `hang_s`,
