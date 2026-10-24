@@ -2025,10 +2025,12 @@ def test_codex_without_tools_lists_no_skills_and_a_read_only_agent_starts_no_hel
 
 def test_helper_agent_steps_reach_the_parents_log_and_record_but_never_its_rows(rig):
     rig.open('gpt')
-    events = rig.turn('HELPER')
+    # As the plugin asks: rows, each ending the stream until the client continues.
+    events = rig.turn('HELPER', rows=True)
+    while events[-1]['type'] == 'row': events += list(rig.stream('/continue', {'agentId': 'a', 'rows': True}))
     assert events[-1]['type'] == 'done'
-    # A helper's steps are not rows: nothing of them enters the Claude-side transcript.
-    assert not any(e['type'] == 'row' and 'notes.md' in e.get('title', '') for e in events)
+    # A helper's steps are not rows or activity: nothing of them enters the Claude-side transcript.
+    assert not any('notes.md' in str(e.get('title', '')) + str(e.get('text', '')) for e in events[:-1])
     log = (rig.home / 'logs/a.log').read_text()
     assert '[/root/check] $ /bin/zsh -lc "cat notes.md"' in log and '[/root/check] edit /w/out.txt' in log
     assert 'helper started /root/check gpt-6-luna low' in log
@@ -2200,7 +2202,9 @@ def test_messages_queued_one_after_another_keep_every_result(rig):
     stream = rig.stream('/turn', {'agentId': 'a', 'text': 'WAIT1 alpha'})
     assert next(stream)['type'] == 'activity'
     assert rig.request('/queue', {'agentId': 'a', 'text': 'WAIT1 beta'})['queued'] is True
-    time.sleep(1.5)
+    # PING is queued once beta's turn has started, however loaded the machine is.
+    deadline = time.monotonic() + 10
+    while (rig.home / 'logs/a.log').read_text().count(' turn: grok ') < 2 and time.monotonic() < deadline: time.sleep(.05)
     assert rig.request('/queue', {'agentId': 'a', 'text': 'PING'})['queued'] is True
     done = list(stream)[-1]
     assert done['type'] == 'done' and all(word in done['text'] for word in ('alpha', 'beta', 'PONG'))
@@ -2308,3 +2312,134 @@ def test_the_niceness_reported_is_the_one_the_vendor_runs_at(monkeypatch):
     assert d.settings(a)['nice'] == 8
     a.record['nice'] = 12
     assert d.settings(a)['nice'] == 12
+
+
+
+def test_a_message_asking_for_read_only_is_not_steered_into_a_turn_that_can_write(rig):
+    rig.open('gpt')
+    stream = rig.stream('/turn', {'agentId': 'a', 'text': 'SLOW'})
+    assert next(stream)['type'] == 'activity'
+    # The next turn is to be read-only, but this one still runs writable.
+    rig.open('gpt', readonly=True)
+    assert rig.request('/steer', {'agentId': 'a', 'text': 'review only', 'readonly': True})['steered'] is False
+    assert rig.request('/steer', {'agentId': 'a', 'text': 'finish'})['steered'] is True
+    assert list(stream)[-1]['text'] == 'finish'
+
+
+@pytest.mark.parametrize('family', ['grok', 'gemini'])
+def test_grok_and_gemini_turns_count_their_commands(rig, family):
+    rig.open(family)
+    # The fake agy also runs its opening `fake work` command.
+    assert rig.turn('STEPS')[-1]['record']['commands'] == {'grok': 1, 'gemini': 2}[family]
+
+
+def test_allowance_writes_take_the_journal_lock_and_leave_one_scratch_file_at_most(monkeypatch):
+    m = load('lordd_allowance_lock')
+    d = object.__new__(m.Daemon); d.log = lambda text: None
+    m.HOME.mkdir(parents=True, exist_ok=True)
+    held = []
+    real = m.Daemon.journal_lock
+    def lock(self):
+        held.append(True)
+        return real(self)
+    monkeypatch.setattr(m.Daemon, 'journal_lock', lock)
+    d.allowance({'limitId': 'codex', 'primary': {'usedPercent': 1}})
+    assert held
+    original = m.Path.replace
+    monkeypatch.setattr(m.Path, 'replace', lambda self, target: (_ for _ in ()).throw(OSError('disk full')))
+    d.allowance({'limitId': 'codex', 'primary': {'usedPercent': 2}})
+    d.allowance({'limitId': 'codex', 'primary': {'usedPercent': 3}})
+    monkeypatch.setattr(m.Path, 'replace', original)
+    assert len([p for p in m.HOME.iterdir() if p.name.startswith('allowance.json.')]) <= 1
+    d.allowance({'limitId': 'codex', 'primary': {'usedPercent': 4}})
+    assert [p.name for p in m.HOME.iterdir() if p.name.startswith('allowance.json')] == ['allowance.json']
+
+
+def test_a_usage_limit_is_refused_until_the_reset_of_the_models_own_bucket():
+    m = load('lordd_quota_bucket')
+    now = time.time()
+    m.HOME.mkdir(parents=True, exist_ok=True)
+    (m.HOME / 'allowance.json').write_text(json.dumps({'gpt': {
+        'codex': {'primary': {'usedPercent': 100, 'resetsAt': now + 3600}},
+        'reserve': {'normalModelSlug': 'gpt-6-reserve', 'primary': {'usedPercent': 100, 'resetsAt': now + 604800}}}}))
+    d = object.__new__(m.Daemon); d.quota = {}; d.log = lambda text: None
+    a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6.1-sol'})
+    d.gpt_quota(a, 'limit')
+    assert abs(d.quota[('gpt', 'gpt-6.1-sol')][0] - (now + 3600)) < 5
+    b = m.Agent({'agentId': 'b', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6-reserve'})
+    d.gpt_quota(b, 'limit')
+    assert abs(d.quota[('gpt', 'gpt-6-reserve')][0] - (now + 604800)) < 5
+
+
+def test_one_large_batch_of_reads_stops_at_the_limit():
+    m = load('lordd_reads_batch')
+    m.READS_LIMIT = 100
+    a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6.1-sol'})
+    a.read_paths([('read', f'/w/{"x" * 20}{n}.py') for n in range(10)])
+    lines = a.reads_path.read_text().splitlines()
+    assert lines[-1] == m.READS_FULL and a.reads_path.stat().st_size <= 100 + len(m.READS_FULL) + 1
+
+
+
+def test_an_interrupt_right_after_at_capacity_cancels_the_retry_at_once(monkeypatch):
+    m = load('lordd_retry_window')
+    async def main():
+        d = object.__new__(m.Daemon); d.redact = str; d.config = {'gpt': {}}; d.tasks = set(); d.log = lambda text: None
+        a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '/w', 'model': 'gpt-6.1-sol', 'vendorSession': 's'})
+        a.state, a.turn_body, a.note, a.turn_record = 'running', {'text': 'work'}, lambda text: None, lambda kind, value: {}
+        a.finished.clear()
+        killed = []
+        async def kill_tree(process, known=()): killed.append(process)
+        monkeypatch.setattr(m, 'kill_tree', kill_tree)
+        async def rpc(method, params): return {}
+        v = types.SimpleNamespace(last=0, rpc=rpc, process=None, close=None)
+        d.backend = lambda agent: v
+        # codex's "at capacity" schedules the retry; the interrupt is handled before the retry task first runs.
+        m.Vendor(d, 'gpt', a).failed(a, {'message': 'Selected model is at capacity', 'codexErrorInfo': 'serverOverloaded'}, 'failed', 't1')
+        started = time.monotonic()
+        await d.interrupt(a)
+        took = time.monotonic() - started
+        await asyncio.gather(a.retry_task, return_exceptions=True)
+        return took < 1, a.retry_task.cancelled(), killed, a.state
+    assert asyncio.run(main()) == (True, True, [], 'idle')
+
+
+def test_a_retry_keeps_the_turns_wall_clock_and_its_wait_is_not_silence(monkeypatch):
+    m = load('lordd_retry_clock')
+    async def main():
+        d = object.__new__(m.Daemon); d.redact = str; d.config = {'gpt': {}, 'process_idle_s': 60, 'idle_exit_s': 600}
+        a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '/w', 'model': 'gpt-6.1-sol', 'vendorSession': 's', 'hang_s': 5})
+        a.state, a.turn_body, a.started = 'running', {'text': 'work'}, 100.0
+        async def rpc(method, params): return {'turn': {'id': 't2'}}
+        v = types.SimpleNamespace(last=0, rpc=rpc, agent=a, process=types.SimpleNamespace(pid=999999, returncode=None), reason=None, descendants=set())
+        d.backend, d.vendors = (lambda agent: v), {'a': v}
+        await d.retry(a, 0)
+        kept = a.started
+        # While Lord waits to retry, codex is idle by Lord's choice: the silence guard does not count it.
+        a.retry_waiting, v.last = True, time.monotonic() - 60
+        async def table(): return {}, {}
+        monkeypatch.setattr(m, 'process_table', table)
+        await d.guard(time.monotonic())
+        return kept, v.reason
+    assert asyncio.run(main()) == (100.0, None)
+
+
+def test_a_logged_message_is_redacted_before_it_is_cut(rig):
+    rig.open('grok')
+    stream = rig.stream('/turn', {'agentId': 'a', 'text': 'SLOW'})
+    assert next(stream)['type'] == 'activity'
+    rig.request('/queue', {'agentId': 'a', 'text': 'x' * 290 + ' sk-' + 'q' * 30})
+    rig.request('/interrupt', {'agentId': 'a'})
+    list(stream)
+    assert 'sk-qqq' not in (rig.home / 'logs/a.log').read_text()
+
+
+@pytest.mark.parametrize('key', ['capacity_retry_s', 'capacity_retries'])
+def test_capacity_retry_settings_must_be_numbers(tmp_path, monkeypatch, key):
+    m = load('lordd_capacity_config')
+    bundled = tmp_path / 'bundled.json'
+    bundled.write_text(json.dumps({'gpt': {'model': 'gpt-6.1-sol'}}))
+    (tmp_path / 'config.json').write_text(json.dumps({key: '30'}))
+    monkeypatch.setenv('LORD_CONFIG', str(bundled))
+    monkeypatch.setattr(m, 'HOME', tmp_path)
+    with pytest.raises(ValueError, match=key): m.load_config()

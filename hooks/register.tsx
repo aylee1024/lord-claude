@@ -385,7 +385,8 @@ async function steer($: EngineInterface, agentId: string, text: string): Promise
   agent.pending = merge({ text: '', ...agent.pending }, options)
   await keep($, agentId)
   try {
-    const response = JSON.parse(await request($, '/steer', { agentId, text: parsed.text }, await daemonOf($, agent)))
+    // The daemon knows the running turn's sandbox: a @readonly message goes in only if that turn is read-only.
+    const response = JSON.parse(await request($, '/steer', { agentId, text: parsed.text, ...(parsed.readonly ? { readonly: true } : {}) }, await daemonOf($, agent)))
     return response.steered === true
   } catch { return false }
 }
@@ -521,7 +522,7 @@ export const register: Register = on => {
       // A caller that copied a Lord label into its description gets this one in its place, not a second one.
       const description = (e.description ?? '').replace(new RegExp(`^(?:(?:[^·,]+, )?(?:${RANKS.join('|')}) · )+`), '')
       // A description that already names the model, by id or short name, is kept as written.
-      const named = !!model && [model, shortName(model)].some(name => description.toLowerCase().includes(name.toLowerCase()))
+      const named = !!model && [model, shortName(model)].some(name => new RegExp(`(?<![a-z0-9])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![a-z0-9])`, 'i').test(description))
       input = { ...e, description: named ? description : description ? `${label} · ${description}` : label, ...(model ? { model } : {}) }
     }
     callEfforts.delete(e.tool_use_id)

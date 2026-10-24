@@ -60,7 +60,7 @@ agent's latest non-empty final answer, redacted, removed with the record), `logs
 per path first read, listed, searched or edited, from codex's `commandActions` and `fileChange`, a helper's tagged with its
 path; it stops at 4 MB with a last line saying so), all removed with the record; `allowance.json` (`{gpt: {<limitId>:
 snapshot}}`, codex's last `account/rateLimits/updated` for each quota bucket, merged within the bucket as codex sends it,
-with `seen`; one file every daemon replaces; a malformed file reads as empty), `lordd.log` (1 MB, one rotation). Two global side effects: an agy MCP entry `lord` while a daemon runs (added
+with `seen`; written under `journal.lock` through one scratch name, so daemons of every version share it; a malformed file reads as empty), `lordd.log` (1 MB, one rotation). Two global side effects: an agy MCP entry `lord` while a daemon runs (added
 or updated at each gemini agent start, removed when a daemon exits with no daemon of another version running; agy has
 no per-run MCP option) and the `lord-workspace` and `lord-readonly` profiles between `# lord: begin` and `# lord: end` in
 `$GROK_HOME/sandbox.toml` (default `~/.grok`), rewritten only when they differ.
@@ -78,7 +78,7 @@ can reach them; grok's Lord profiles deny reading it); without it the reply is 4
 | POST | /continue | `{agentId, rows?}` | NDJSON stream of the same turn after a tool result or a row |
 | POST | /row | `{agentId, rowId}` | `{output, stopped}` once the vendor reports the step finished, or the turn ends (`stopped` when it ended in an error or a stop); `output` is the step's output, redacted, its last 2,000 characters with a line counting the rest |
 | POST | /tool_result | `{agentId, callId, text, isError}` | `{ok}` |
-| POST | /steer | `{agentId, text}` | `{ok, steered}` (codex `turn/steer` while a turn runs; logged as `message injected into the running turn:`) |
+| POST | /steer | `{agentId, text, readonly?}` | `{ok, steered}` (codex `turn/steer` while a turn runs; with `readonly`, only into a turn that runs read-only; logged as `message injected into the running turn:`) |
 | POST | /queue | `{agentId, text}` | `{ok, queued}`: while a turn runs, the text becomes the next turn, started when this one ends in the same stream (joined to any message already queued, and a `/turn` arriving meanwhile joins it), its done text prefixed `Result of the task, before the message sent while it ran:`; logged as `message queued for the next turn:` |
 | GET | /allowance | - | `{gpt, refused}`: `allowance.json`'s codex buckets, and each quota reset Lord refuses turns until |
 | POST | /interrupt, /close | `{agentId}` | `{ok}` (codex `turn/interrupt`, then the codex process is stopped once a started turn ends, since codex leaves the running command alive; grok `session/cancel`; agy process kill; close also stops the process) |
@@ -114,7 +114,7 @@ waits undelivered, for up to `keep_undelivered_s` (a day).
   then `multi_agent`; a thread's `config` is merged key by key over the user's `config.toml`). A codex helper (`subAgentActivity` with `agentThreadId`, `agentPath`, `model`, `reasoningEffort`, or in
   codex's older helper mode a `collabAgentToolCall` `spawnAgent` with `receiverThreadIds`, from the agent's thread or
   another helper's) is mapped to its agent: the helper's completed steps go to the agent's log as
-  `[<agentPath>] <line>` and to its read list, never to rows or events. `webSearch` lines name `action`'s query, queries,
+  `[<agentPath>] <line>` (the helper's thread id in codex's older helper mode, which names no path) and to its read list, never to rows or events. `webSearch` lines name `action`'s query, queries,
   url or pattern; a search with none yet gets its row when it completes.
 - grok: `grok --sandbox <write_sandbox|readonly_sandbox> agent --always-approve stdio` per agent, defaults
   `lord-workspace` (extends `workspace`: writes to cwd and temp folders) and `lord-readonly` (extends `read-only` with
@@ -147,10 +147,12 @@ the reason. Every stop kills the vendor's whole process tree by pid as well as i
 retried once; a crash, or a codex turn that ends failed, restarts the vendor on the next turn, never in a loop, except
 the codex kinds `cyberPolicy` and `misalignmentPolicyViolation` (the error reads `refused by vendor (<kind>): …`, names
 the last completed command and says a reworded message resumes the session), `usageLimitExceeded` (the reset of the
-window codex last reported at 100% is kept in `quota.json`; none reported, nothing is refused), `rateLimitExceeded` and
-`serverOverloaded`. `serverOverloaded` before any `fileChange` in the turn waits `capacity_retry_s` (30) and starts a
-turn on the same thread asking it to continue, up to `capacity_retries` (2) times; an interrupt during the wait ends the
-turn. A codex `error` notification for the running turn waits for that turn's completion (5 s at most), which then ends
+window codex last reported at 100%, in the bucket whose `normalModelSlug` is the agent's model, else the `codex` bucket, is
+kept in `quota.json`; none reported, nothing is refused), `rateLimitExceeded` and
+`serverOverloaded`. `serverOverloaded` before any `fileChange` in the turn (a helper's included) waits `capacity_retry_s` (30) and starts a
+turn on the same thread asking it to continue, up to `capacity_retries` (2) times (both numbers checked at start-up); an
+interrupt during the wait, from the moment it is scheduled, ends the turn; the wait is not vendor silence for `hang_s`,
+and `wall_s` runs from the turn's first dispatch. A codex `error` notification for the running turn waits for that turn's completion (5 s at most), which then ends
 the turn with the error's kind. Each turn's activity log starts with a `turn: <family> <model> effort <effort> · <settings line>` line; every record is one line (a
 line break inside it, of any kind, is shown as `⏎`), and a turn that fails adds an `error: <reason>` line. agy states a failure only on
 stderr (`AGY_ERROR: {...}`) before it exits: its `short_error` is the turn's error, and a 429 that names its reset

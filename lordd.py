@@ -132,7 +132,7 @@ def load_config():
         config[key] = {**config[key], **value} if isinstance(value, dict) and isinstance(config.get(key), dict) else value
     for family in ('gpt', 'grok', 'gemini'):
         if family in config and not isinstance(config[family], dict): raise ValueError(f'{family} in config.json must be an object')
-    numbers = [(k, config[k]) for k in ('memory_ceiling_kb', 'idle_exit_s', 'process_idle_s', 'prune_days') if k in config]
+    numbers = [(k, config[k]) for k in ('memory_ceiling_kb', 'idle_exit_s', 'process_idle_s', 'prune_days', 'capacity_retry_s', 'capacity_retries') if k in config]
     numbers += [(f'{f}.no_progress_s', config[f]['no_progress_s']) for f in ('gpt', 'grok', 'gemini') if 'no_progress_s' in config.get(f, {})]
     for key, value in numbers:
         if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0: raise ValueError(f'{key} must be a number of 0 or more')
@@ -474,13 +474,18 @@ class Agent:
         lines = [line for line in (f'{kind} {path}' + (f' ({helper})' if helper else '') for kind, path in found) if line not in self.reads]
         if not lines or READS_FULL in self.reads: return
         self.reads.update(lines)
-        try: full = self.reads_path.stat().st_size >= READS_LIMIT
-        except OSError: full = False
-        if full:
-            lines = [READS_FULL]
-            self.reads.add(READS_FULL)
+        try: size = self.reads_path.stat().st_size
+        except OSError: size = 0
+        written = []
+        for line in (REDACT(line)[:2000] + '\n' for line in lines):
+            if size + len(line.encode()) > READS_LIMIT:
+                written.append(READS_FULL + '\n')
+                self.reads.add(READS_FULL)
+                break
+            written.append(line)
+            size += len(line.encode())
         self.reads_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with self.reads_path.open('a', encoding='utf-8') as file: file.write(''.join(REDACT(line)[:2000] + '\n' for line in lines))
+        with self.reads_path.open('a', encoding='utf-8') as file: file.write(''.join(written))
 
     def note(self, text):
         # The agent's activity log: what the vendor ran and read, for review provenance.
@@ -753,7 +758,9 @@ class Vendor:
                         rid, name = f"agy-{payload['step_index']}", info.get('name') or payload.get('tool_name')
                         command = name == 'run_command' and (info.get('parameters') or {}).get('CommandLine')
                         a.row(rid, 'command' if command else 'step', command or agy_title(payload), agy_activity(payload))
-                        if payload.get('state') == 'DONE': a.row_done(rid, str(info.get('output') or ''))
+                        if payload.get('state') == 'DONE':
+                            a.row_done(rid, str(info.get('output') or ''))
+                            if command: a.commands += 1
                     elif payload.get('step_index') is None or payload.get('step_index') != a.agy_step:
                         a.agy_step = payload.get('step_index')
                         a.emit('activity', text=agy_activity(payload))
@@ -786,7 +793,11 @@ class Vendor:
                 # Text before a tool call is narration; the answer is what grok says after its last one.
                 a.final_text = ''
                 rid = update.get('toolCallId') or uuid.uuid4().hex
-                if kind == 'tool_call': a.row(rid, *grok_step(update))
+                if kind == 'tool_call':
+                    step = grok_step(update)
+                    # grok names a command only when it starts; its completion carries no command.
+                    if step[0] == 'command' and rid not in a.rows: a.commands += 1
+                    a.row(rid, *step)
                 elif update.get('status') in ('completed', 'failed'):
                     a.row(rid, *grok_step(update))
                     a.row_done(rid, grok_output(update))
@@ -848,6 +859,8 @@ class Vendor:
             a.ended_turns.add(turn_id)
             a.turn_id, a.turn_error = None, None
             a.note(f'vendor at capacity ({message}); retry {a.retries} in {delay} s on the same session')
+            # Waiting from now, so an interrupt handled before the retry task first runs still cancels it.
+            a.retry_waiting = True
             a.retry_task = self.d.task(self.d.retry(a, delay))
             return
         if kind in REFUSALS:
@@ -1321,36 +1334,41 @@ class Daemon:
     async def retry(self, a, delay):
         # A turn that met "at capacity" before changing anything, sent again on the same session after a wait. The
         # session already holds the task, so the retry asks it to go on rather than sending the task twice.
-        a.retry_waiting = True
         try: await asyncio.sleep(delay)
         finally: a.retry_waiting = False
         if a.cancel_requested or a.state not in ('running', 'waiting_tool'): return
         self.backend(a).last = time.monotonic()
-        await self.run_turn(a, {**a.turn_body, 'text': 'Continue with the task above: the last attempt stopped because the model was at capacity.'})
+        await self.run_turn(a, {**a.turn_body, 'text': 'Continue with the task above: the last attempt stopped because the model was at capacity.'}, retry=True)
 
     def allowance(self, snapshot):
         # codex's account limits as it last reported them (it sends them unasked during turns), merged as codex says:
         # an update carries only what changed. Kept in allowance.json, one file every daemon replaces.
         # Each quota bucket (limitId) is kept apart: a model metered under another limit reports its own windows.
+        # Under the journal lock, so daemons of other versions neither lose each other's buckets nor leave scratch files
+        # (one scratch name, replaced by the next write).
         if not isinstance(snapshot, dict): return
-        buckets = allowance_buckets()
-        key = str(snapshot.get('limitId') or 'codex')
-        buckets[key] = {**buckets.get(key, {}), **{k: v for k, v in snapshot.items() if v is not None}, 'seen': datetime.now(timezone.utc).isoformat(timespec='seconds')}
         try:
-            scratch = HOME / f'allowance.json.{os.getpid()}'
-            scratch.write_text(dumps({'gpt': buckets}), encoding='utf-8')
-            scratch.replace(HOME / 'allowance.json')
+            with self.journal_lock():
+                buckets = allowance_buckets()
+                key = str(snapshot.get('limitId') or 'codex')
+                buckets[key] = {**buckets.get(key, {}), **{k: v for k, v in snapshot.items() if v is not None}, 'seen': datetime.now(timezone.utc).isoformat(timespec='seconds')}
+                scratch = HOME / 'allowance.json.tmp'
+                scratch.write_text(dumps({'gpt': buckets}), encoding='utf-8')
+                scratch.replace(HOME / 'allowance.json')
         except OSError as error: self.log(f'allowance.json not written: {error}')
 
     def gpt_quota(self, a, message):
         # A spent codex allowance is refused until the window that ran out resets, as codex last reported it.
-        resets = [w.get('resetsAt') for bucket in allowance_buckets().values() for w in (bucket.get('primary'), bucket.get('secondary'))
+        # The bucket that meters this model: the one naming it, else codex's ordinary one.
+        buckets = allowance_buckets()
+        own = [b for b in buckets.values() if b.get('normalModelSlug') == a.model] or [b for k, b in buckets.items() if k == 'codex']
+        resets = [w.get('resetsAt') for bucket in own for w in (bucket.get('primary'), bucket.get('secondary'))
                   if isinstance(w, dict) and isinstance(w.get('resetsAt'), (int, float)) and (w.get('usedPercent') or 0) >= 100]
         if not resets: return a.note('usage limit reached; codex named no reset time, so new turns are not refused')
         reset = max(resets)
         self.save_quota(('gpt', a.model), (reset / 1000 if reset > 1e12 else reset, message))
 
-    async def run_turn(self, a, body):
+    async def run_turn(self, a, body, retry=False):
         v = self.backend(a)
         try:
             if a.cancel_requested:
@@ -1360,7 +1378,8 @@ class Daemon:
                     while not a.events.empty(): a.events.get_nowait()
                 return
             a.dispatched, v.last = True, time.monotonic()
-            a.started = v.last
+            # A retry continues the same turn, whose wall-clock limit runs from its first dispatch.
+            if not retry: a.started = v.last
             if a.family == 'gpt':
                 params = {'threadId': a.vendorSession, 'input': [{'type': 'text', 'text': body['text']}],
                           'model': a.model, 'effort': a.effort,
@@ -1516,10 +1535,13 @@ class Daemon:
                 return await asyncio.shield(future)
             elif path == '/steer':
                 steered = a.family == 'gpt' and a.state in ('running', 'waiting_tool') and bool(a.turn_id)
+                # A message asking for @readonly goes into the running turn only if that turn already runs read-only;
+                # the agent's record may name the next turn's sandbox.
+                if body.get('readonly') and (getattr(a, 'settings', None) or {}).get('sandbox') != 'read-only': steered = False
                 if steered:
                     await self.backend(a).rpc('turn/steer', {'threadId': a.vendorSession, 'expectedTurnId': a.turn_id,
                         'input': [{'type': 'text', 'text': body['text']}]})
-                    a.note('message injected into the running turn: ' + body['text'][:300])
+                    a.note('message injected into the running turn: ' + self.redact(body['text'])[:300])
                 return {'ok': True, 'steered': steered}
             elif path == '/queue':
                 # A message for a running agent whose vendor takes none mid-turn: it becomes the next turn, started as
@@ -1527,7 +1549,7 @@ class Daemon:
                 if a.state not in ('running', 'waiting_tool'): return {'ok': True, 'queued': False}
                 text = body['text'] if not a.followup else a.followup['text'] + '\n\n' + body['text']
                 a.followup = {**(a.followup or {'agentId': a.agentId}), 'text': text, 'queued': True}
-                a.note('message queued for the next turn: ' + body['text'][:300])
+                a.note('message queued for the next turn: ' + self.redact(body['text'])[:300])
                 return {'ok': True, 'queued': True}
             elif path in ('/interrupt', '/close'):
                 await self.interrupt(a)
@@ -1695,7 +1717,7 @@ class Daemon:
             used = sum(rss.get(pid, 0) for pid in pids)
             silent = a.record['hang_s'] if a.record.get('hang_s') is not None else self.config[a.family].get('no_progress_s', 0)
             if used > ceiling: v.reason = f'stopped: the {a.family} process tree used {used / 1048576:.1f} GB, over the {ceiling / 1048576:.1f} GB memory ceiling'
-            elif silent and a.state == 'running' and now - v.last > silent: v.reason = f'stopped: {a.family} printed nothing for {silent} s while working'
+            elif silent and a.state == 'running' and now - v.last > silent and not getattr(a, 'retry_waiting', False): v.reason = f'stopped: {a.family} printed nothing for {silent} s while working'
             elif (wall := a.record.get('wall_s')) and a.state in ('running', 'waiting_tool') and now - getattr(a, 'started', now) > wall:
                 v.reason = f'stopped: the turn ran past its {wall} s wall-clock limit'
             else: continue

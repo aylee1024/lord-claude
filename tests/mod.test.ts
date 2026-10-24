@@ -1267,3 +1267,26 @@ test('a message queued for gpt says why it was not taken into the turn', async (
   const sent: any = await $.tool.call({ tool: 'SendMessage', tool_use_id: 'm1', to: 'a1', message: 'later', summary: 'x' } as any)
   expect(sent.result.message).toStartWith('Queued for a1: gpt has no running step to take it into yet, so it reads this')
 })
+
+
+test('a read-only agent\'s @readonly message reaches the daemon marked, so it is never put into a writable turn', async ($, on) => {
+  const w = world(on, [{ type: 'tool', callId: 'call1', name: 'SendMessage', input: { to: 'other', message: 'hi', summary: 'hi' } }])
+  await spawn($)
+  await step($, '@readonly\nrunning')
+  await $.session.send({ to: 'a1', text: '@readonly\nlook only', origin: { kind: 'model' } })
+  expect(w.requests.find(x => x.path === '/steer')?.body).toEqual({ agentId: 'a1', text: 'look only', readonly: true })
+})
+
+
+test('a description holding the short name inside a word still gets the label', async ($, on) => {
+  const w = world(on)
+  on('fs.read', (_, e) => CONFIGS(e.path))
+  const launch = async (prompt: string, description: string) => {
+    await $.tool.call({ tool: 'Agent', tool_use_id: 'L', subagent_type: 'lord:gpt', prompt, description } as any)
+    await $.agent.spawn({ tool_use_id: 'L', prompt, description, subagentType: 'lord:gpt', provider: { plugin: 'lord', tier: 'user' }, parentModel: 'haiku', background: true, fork: false } as any)
+    return w.spawnInputs.at(-1).description
+  }
+  expect(await launch('@model gpt-6-sol\nwork', 'Resolve the failing test')).toBe('Sol, high · Resolve the failing test')
+  expect(await launch('@model gpt-6-luna\nwork', 'Lunar lander physics check')).toBe('Luna, high · Lunar lander physics check')
+  expect(await launch('@model gpt-6-sol\nwork', 'Sol review of the fix')).toBe('Sol review of the fix')
+})
