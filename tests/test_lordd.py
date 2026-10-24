@@ -1227,6 +1227,53 @@ def test_grok_refuses_spelled_home_overlap(rig, spelling, readonly):
     assert rig.request('/agents') == [] and not rig.data.exists()
 
 
+@pytest.mark.skipif(sys.platform != 'darwin', reason='macOS filesystem spellings')
+@pytest.mark.parametrize('folder', ['/System', '/System/Volumes'])
+@pytest.mark.parametrize('family,option', [('gpt', 'cwd'), ('gpt', 'dir'), ('grok', 'cwd')])
+def test_spelled_data_volume_ancestor_is_refused(rig, folder, family, option):
+    spelled = folder.replace('/System', '/ſystem')
+    assert os.path.samefile(spelled, folder)
+    for path in (folder, spelled):
+        body = {'agentId': 'a', 'family': family, 'cwd': str(rig.home)}
+        if option == 'cwd': body['cwd'] = path
+        else: body['dirs'] = [path]
+        conn, file, status, _ = rig.connect('/open', body)
+        reply = json.loads(file.read()); file.close(); conn.close()
+        assert status == 400 and 'home folder' in reply['error'], reply
+    assert rig.request('/agents') == [] and not rig.data.exists()
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='macOS filesystem spellings')
+@pytest.mark.parametrize('readonly', [False, True])
+def test_grok_refuses_missing_spelled_home_inside_project(rig, readonly):
+    project = rig.home / 'storage'; project.mkdir()
+    spelled = str(project).replace('/storage', '/ſtorage')
+    assert os.path.samefile(spelled, project)
+    home = project / 'New-Grok/state'
+    rig.stop(); rig.env['GROK_HOME'] = spelled + '/New-Grok/state'; rig.start()
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'a', 'family': 'grok', 'cwd': str(project), 'readonly': readonly})
+    reply = json.loads(file.read()); file.close(); conn.close()
+    assert status == 400, reply
+    assert f'inside or contains {home}' in reply['error']
+    assert rig.request('/agents') == [] and not rig.data.exists() and not home.exists()
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='macOS filesystem spellings')
+def test_grok_key_deny_uses_kernel_spelling(tmp_path):
+    m = load('lordd_grok_spelled_key')
+    home = tmp_path / 'storage'; home.mkdir()
+    key = home / 'control.header'; key.write_text('decoy')
+    spelled = str(home).replace('/storage', '/ſtorage')
+    assert os.path.samefile(spelled, home)
+    m.HOME = Path(spelled)
+    m.grok_profiles()
+    import tomllib
+    profiles = tomllib.loads((Path(os.environ['GROK_HOME']) / 'sandbox.toml').read_text())['profiles']
+    for profile in profiles.values():
+        assert str(key) in profile['deny']
+        assert str(m.HOME / 'control.header') not in profile['deny']
+
+
 @pytest.mark.parametrize('readonly', [False, True])
 def test_saved_grok_turn_rechecks_home_overlap_after_restart(rig, readonly):
     project = rig.home / 'project'; project.mkdir()
@@ -3360,12 +3407,14 @@ def test_tests_linked_lord_home_refusal_explains_repair(tests_backend, rig, phas
 @pytest.mark.skipif(sys.platform != 'darwin', reason='macOS data-volume alias')
 @pytest.mark.parametrize('phase', ['open', 'start'])
 @pytest.mark.parametrize('root', ['cwd', 'dir'])
-def test_tests_refuses_data_volume_writable_root(tests_backend, rig, phase, root):
+@pytest.mark.parametrize('prefix', ['/System/Volumes/Data', '/ſystem/Volumes/Data'])
+def test_tests_refuses_data_volume_writable_root(tests_backend, rig, phase, root, prefix):
     d, _, launched = tests_backend
     async def scenario():
         work = rig.home / 'work'
         extra = rig.home / 'extra'; extra.mkdir()
-        path = Path('/System/Volumes/Data') / (work if root == 'cwd' else extra).relative_to('/')
+        path = Path(prefix) / (work if root == 'cwd' else extra).relative_to('/')
+        assert os.path.samefile(path, work if root == 'cwd' else extra)
         body = {'agentId': 'a', 'family': 'gpt', 'cwd': str(work), 'tests': True, 'dirs': [str(extra)]}
         try:
             if phase == 'start':
@@ -3425,6 +3474,17 @@ def test_tests_parameters_use_kernel_spelling_for_protected_paths(tmp_path, spel
     params = dict(value.removeprefix('-D').split('=', 1) for value in params)
     assert params['LORD_HOME'] == str(home) and params['KEY'] == str(home / 'control.header')
     assert str(metadata) in {value for name, value in params.items() if name.startswith('PROTECTED_')}
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='macOS filesystem spellings')
+def test_tests_spelled_root_protects_kernel_spelled_ancestors(tmp_path):
+    m = load('lordd_tests_spelled_ancestors')
+    work = tmp_path / 'storage'; work.mkdir()
+    spelled = str(work).replace('/storage', '/ſtorage')
+    assert os.path.samefile(spelled, work)
+    _, params = m.tests_profile(spelled, [], {})
+    ancestors = {value.split('=', 1)[1] for value in params if value.startswith('-DANCESTOR_')}
+    assert str(work) in ancestors
 
 
 def test_nested_symlink_component_rejects_two_level_link(tmp_path, monkeypatch):

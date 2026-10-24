@@ -169,7 +169,7 @@ def grok_profiles():
     link = grok_home() / 'sandbox.toml'
     path = Path(os.path.realpath(link))
     if link.is_symlink() and not path.exists(): raise RuntimeError(f'{link} is a link to {path}, which does not exist')
-    key = os.path.realpath(HOME / 'control.header')
+    key = canon(HOME / 'control.header')
     sockets = sorted({p for s in SOCKETS for p in link_chain(s)})
     listed = lambda paths: '[' + ', '.join(json.dumps(p) for p in paths) + ']'
     block = ('# lord: begin (written by the lord plugin; edits between these lines are replaced)\n'
@@ -209,7 +209,9 @@ def nested_symlink_component(path):
         if stat.S_ISLNK(mode) and len(component.parents) >= 2: return str(component)
 
 def tests_root(path, label):
-    if label in ('cwd', '@dir') and inside(os.path.abspath(Path(path).expanduser()), ('/System/Volumes/Data',)):
+    # Canonicalizing the whole path can lose the data-volume prefix through a firmlink.
+    prefix = Path(*Path(os.path.abspath(Path(path).expanduser())).parts[:4])
+    if label in ('cwd', '@dir') and len(prefix.parts) == 4 and canon(prefix) == canon('/System/Volumes/Data'):
         raise ValueError(f'@tests {label} {path} uses /System/Volumes/Data; use the path without /System/Volumes/Data')
     if link := nested_symlink_component(path):
         if label == "Lord's folder":
@@ -226,7 +228,7 @@ def validate_tests_layout(cwd, dirs, env):
     roots, tmp, private_tmp = tests_paths(cwd, dirs, env)
     logical = tests_root(HOME, "Lord's folder")
     for path in (logical, canon(HOME)):
-        if root := next((root for root in [*roots, tmp, private_tmp] if inside(path, [root, canon(root)])), None):
+        if root := next((root for root in [*roots, tmp, private_tmp] if inside(path, [root, canon(root)]) or inside(canon(path), [canon(root)])), None):
             raise ValueError(f"@tests Lord's folder {HOME} is inside writable root {root}; choose writable roots that do not contain Lord's folder")
 
 def tests_profile(cwd, dirs, env):
@@ -252,9 +254,10 @@ def tests_profile(cwd, dirs, env):
         profile += f'\n(lord-protect-metadata (param "{name}"))'
     profile += '\n(lord-protect-home (param "LORD_HOME"))\n(lord-protect-home (param "LORD_HOME_LOGICAL"))\n(lord-protect-daemon (param "CODEX_DAEMON"))'
     writable = [*roots, params['TMP'], params['PRIVATE_TMP']]
+    canonical_writable = [canon(root) for root in writable]
     ancestors = set(writable) | {str(path) for path in daemon.parents}
     for path in protected | {params['KEY'], params['LORD_HOME'], params['LORD_HOME_LOGICAL'], params['TMP']}:
-        ancestors.update(str(parent) for parent in Path(path).parents if inside(str(parent), writable))
+        ancestors.update(str(parent) for parent in Path(path).parents if inside(str(parent), writable) or inside(canon(parent), canonical_writable))
     for i, path in enumerate(sorted(ancestors)):
         name = f'ANCESTOR_{i}'
         params[name] = path
@@ -270,14 +273,22 @@ def fold(path):
 
 def canon(path):
     # F_GETPATH returns the kernel's spelling, including Unicode normalization and filesystem case folding.
-    # Non-blocking open also handles FIFOs; paths that cannot be opened keep their realpath spelling.
+    # Missing paths inherit their nearest existing ancestor's spelling; non-blocking open also handles FIFOs.
     path = os.path.realpath(path)
     if sys.platform == 'darwin':
-        try:
-            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-            try: path = os.fsdecode(fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).rstrip(b'\0'))
-            finally: os.close(fd)
-        except OSError: pass
+        ancestor, missing = path, []
+        while True:
+            try:
+                fd = os.open(ancestor, os.O_RDONLY | os.O_NONBLOCK)
+                try: path = os.path.join(os.fsdecode(fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).rstrip(b'\0')), *missing)
+                finally: os.close(fd)
+                break
+            except FileNotFoundError:
+                parent, name = os.path.split(ancestor)
+                if parent == ancestor: break
+                ancestor = parent
+                missing.insert(0, name)
+            except OSError: break
     if sys.platform == 'darwin' and fold(path + '/').startswith('/system/volumes/data/'): path = path[len('/System/Volumes/Data'):] or '/'
     return path
 
@@ -1339,7 +1350,7 @@ class Daemon:
                 validate_tests_layout(a.cwd if a else body['cwd'], [*(a.record.get('dirs', []) if a else []), *(body.get('dirs') or [])], subscription_env())
             cwd = str(Path(body['cwd']).expanduser().resolve(strict=True))
             # A folder that holds the home folder, by its usual path or through macOS's data volume (/System/Volumes).
-            if inside(canon(str(Path.home())), (canon(cwd),)) or (sys.platform == 'darwin' and inside('/System/Volumes/Data', (cwd,))):
+            if inside(canon(str(Path.home())), (canon(cwd),)) or (sys.platform == 'darwin' and inside('/System/Volumes/Data', (cwd, canon(cwd)))):
                 raise ValueError('refusing / or a folder holding your home folder as a working folder: start Claude Code in a project folder, or put "@cwd <folder>" on the first line of the task')
             if a and body.get('pin_cwd') and not os.path.samefile(cwd, a.cwd): raise ValueError(f'@cwd is fixed at the first turn ({a.cwd})')
             if isinstance(body.get('path'), str) and body['path']:
@@ -1402,7 +1413,7 @@ class Daemon:
             raise ValueError('@nice must be a whole number from 0 to 19')
         if relative := [x for x in body.get('dirs') or [] if not Path(x).expanduser().is_absolute()]: raise ValueError(f'@dir {relative[0]} is not an absolute path')
         dirs = [str(Path(x).expanduser().resolve()) for x in body.get('dirs') or []]
-        if any(inside(canon(str(Path.home())), (canon(x),)) or (sys.platform == 'darwin' and inside('/System/Volumes/Data', (x,))) for x in dirs):
+        if any(inside(canon(str(Path.home())), (canon(x),)) or (sys.platform == 'darwin' and inside('/System/Volumes/Data', (x, canon(x)))) for x in dirs):
             raise ValueError('refusing / or a folder holding your home folder as an @dir')
         if missing := [x for x in dirs if not Path(x).is_dir()]: raise ValueError(f'@dir {missing[0]} is not an existing directory')
         for key in ('readonly', 'net', 'nosandbox', 'tests'):
