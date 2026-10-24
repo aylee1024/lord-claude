@@ -11,7 +11,8 @@ answer becomes the agent's reply. No Claude tokens are spent on these turns.
 
 - **Mod** (`hooks/register.tsx`, runs inside Claude Code). Control requests use `$.http.fetch` over the Unix socket;
   turn streams use `/usr/bin/curl --unix-socket` through `$.process.spawn`, because `$.http.fetch` buffers bodies.
-- **Daemon** (`lordd.py`, one standard-library file, Python 3.11 or later). Owns one vendor process per agent. Outlives
+- **Daemon** (`lordd.py`, one standard-library file, Python 3.11 or later). Runs from `~/.claude/lord`, as its `--mcp`
+  helper does, so no agent's folder is held by it. Owns one vendor process per agent. Outlives
   Claude Code sessions; exits after `idle_exit_s` with no request and no running turn, or after `retire_idle_s` (30 s)
   once an `/open` came from a newer plugin version (so the next turn starts that version's daemon). The mod starts it
   with the first of `LORD_PYTHON`, `/opt/homebrew/bin/python3`, `/usr/local/bin/python3`, `python3` in each folder of the
@@ -51,7 +52,14 @@ each thread through a codex in the agent's folder. A vendor's Lord tool server
 gets the starting daemon's socket as `LORD_DAEMON_SOCKET`; one without it (started by an older daemon) uses `lordd.sock`.
 `logs/<agentId>.log` (the agent's activity: vendor commands and file actions, redacted, moved to `.log.1` at 4 MB, removed with the
 record; agy tool steps are logged once each, as the tool's name and parameters), `logs/<agentId>.answer.md` (the
-agent's latest non-empty final answer, redacted, removed with the record), `lordd.log` (1 MB, one rotation). Two global side effects: an agy MCP entry `lord` while a daemon runs (added
+agent's latest non-empty final answer, redacted, removed with the record), `logs/<agentId>.json` (the effective settings,
+`lordVersion`, the calling `session`, `vendorSession`, the vendor's transcript path when found, codex helpers, and the last
+100 turns: `turn`, `started`, `ended`, `ended_how` (`done`, `interrupted`, `error (<codexErrorInfo kind or vendor>)`),
+`commands`, `retries`, `helpers`, `usage` or `error`, `answer`), `logs/<agentId>.answers/<n>.md` (each turn's answer or
+`lord: error:` line, redacted; turn n-100's is deleted as turn n is written), `logs/<agentId>.reads.txt` (gpt only: one line
+per path first read, listed, searched or edited, from codex's `commandActions` and `fileChange`, a helper's tagged with its
+path), all removed with the record; `allowance.json` (codex's last `account/rateLimits/updated`, merged as codex sends
+it, with `seen`; one file every daemon replaces), `lordd.log` (1 MB, one rotation). Two global side effects: an agy MCP entry `lord` while a daemon runs (added
 or updated at each gemini agent start, removed when a daemon exits with no daemon of another version running; agy has
 no per-run MCP option) and the `lord-workspace` and `lord-readonly` profiles between `# lord: begin` and `# lord: end` in
 `$GROK_HOME/sandbox.toml` (default `~/.grok`), rewritten only when they differ.
@@ -64,23 +72,27 @@ can reach them; grok's Lord profiles deny reading it); without it the reply is 4
 | Method | Path | Body | Reply |
 |---|---|---|---|
 | GET | /health | - | `{ok, pid, version}` (`version` from the daemon's own plugin.json) |
-| POST | /open | `{agentId, family, cwd, version?, model?, effort?, readonly?, net?, nosandbox?, dirs?, memory_gb?, hang_s?, wall_s?, tools?}` | `{vendorSession, model, effort}`; idempotent; resumes after a daemon restart from the journal. A new agent whose configured default model the vendor does not list gets the vendor's own default (codex `isDefault`, grok's current `model` option, agy's first listed model), logged. A later `readonly`, `net`, `nosandbox`, `tools` or new `dirs` restarts the vendor session before the next turn. Refused with the reason: a named model the vendor does not list (the vendor's list), `dirs` for grok/gemini, `nosandbox` for grok/gemini or with `readonly`, `readonly` for gemini, for gpt with `net`, or for grok under a temp folder or `~/.grok` (an existing agent is judged by its own folder), `/` or the home folder as cwd |
+| POST | /open | `{agentId, family, cwd, version?, session?, model?, effort?, readonly?, net?, nosandbox?, dirs?, memory_gb?, hang_s?, wall_s?, tools?, nice?}` | `{vendorSession, model, effort, cwd, dirs, sandbox, network, tools, nice, memory_gb, hang_s, wall_s, codexHome?, line}`, the effective settings with defaults (`line`: the same as one line); idempotent; a refusal is logged in `lordd.log` as `<agentId>: open refused: <reason>`, a missing or relative `@dir` named; a different `nice` (0 to 19, absolute) restarts the vendor under `/usr/bin/nice -n <nice minus the daemon's own niceness>`, or plain when the daemon's is already that high; resumes after a daemon restart from the journal. A new agent whose configured default model the vendor does not list gets the vendor's own default (codex `isDefault`, grok's current `model` option, agy's first listed model), logged. A later `readonly`, `net`, `nosandbox`, `tools` or new `dirs` restarts the vendor session before the next turn. Refused with the reason: a named model the vendor does not list (the vendor's list), `dirs` for grok/gemini, `nosandbox` for grok/gemini or with `readonly`, `readonly` for gemini, for gpt with `net`, or for grok under a temp folder or `~/.grok` (an existing agent is judged by its own folder), `/` or the home folder as cwd |
 | POST | /turn | `{agentId, text, model?, effort?, rows?}` | NDJSON stream; if the agent has a running or undelivered turn (its client went away), that turn streams first (a pending lord tool call is offered again, its queued steps and text are dropped) and this text starts when it ends, its done text prefixed with the earlier result. An interrupted turn leaves nothing to deliver |
 | POST | /continue | `{agentId, rows?}` | NDJSON stream of the same turn after a tool result or a row |
 | POST | /row | `{agentId, rowId}` | `{output, stopped}` once the vendor reports the step finished, or the turn ends (`stopped` when it ended in an error or a stop); `output` is the step's output, redacted, its last 2,000 characters with a line counting the rest |
 | POST | /tool_result | `{agentId, callId, text, isError}` | `{ok}` |
-| POST | /steer | `{agentId, text}` | `{ok, steered}` (codex `turn/steer` while a turn runs) |
+| POST | /steer | `{agentId, text}` | `{ok, steered}` (codex `turn/steer` while a turn runs; logged as `message injected into the running turn:`) |
+| POST | /queue | `{agentId, text}` | `{ok, queued}`: while a turn runs, the text becomes the next turn, started when this one ends in the same stream (joined to any message already queued, and a `/turn` arriving meanwhile joins it), its done text prefixed `Result of the task, before the message sent while it ran:`; logged as `message queued for the next turn:` |
+| GET | /allowance | - | `{gpt, refused}`: `allowance.json`'s codex report, and each quota reset Lord refuses turns until |
 | POST | /interrupt, /close | `{agentId}` | `{ok}` (codex `turn/interrupt`, then the codex process is stopped once a started turn ends, since codex leaves the running command alive; grok `session/cancel`; agy process kill; close also stops the process) |
 | POST | /mcp | `{agentId, name, arguments, token}` | the lord tool call of a vendor's MCP server; the per-agent token is required |
 | POST | /prune | `{days}` | `{ok, pruned}`; also at daemon start and hourly: journal records unused for `prune_days`; codex threads archived, vendor history otherwise kept |
-| GET | /agents | - | `[{agentId, family, model, effort, state, activity, cwd, log, answer, usage}]` (`answer`: the answer file's path, null before a first answer) (`usage`: the vendor's last turn; codex input excludes its cached tokens) |
+| GET | /agents | - | `[{agentId, family, model, effort, state, activity, cwd, log, answer, usage, quiet_s}]` (`quiet_s`: seconds since the vendor's last output while its turn runs, else null) (`answer`: the answer file's path, null before a first answer) (`usage`: the vendor's last turn; codex input excludes its cached tokens) |
 
 NDJSON events: `text` (vendor text as it streams), `activity` (one line of vendor work), `row` (`{rowId, shell, title,
 text}`, only to a stream that asked with `rows: true`: a vendor tool step starting, `shell` for a shell command; the stream
 ends and the vendor keeps working; any other stream gets the step as one `activity` line), `tool` (`{callId, name: Agent|
 SendMessage, input}`; the stream ends, the vendor waits), `done` (`{text, usage, model}`; `text` is the final answer
 only: codex's last agent message, grok's text after its last tool call, agy's text after its last tool step, else its
-whole response), `error` (`{message, retryable}`).
+whole response), `error` (`{message, retryable, cause?}`, `cause` codex's `codexErrorInfo` kind). `done` and `error` carry
+`record` (`{ended_how, model, effort, started, ended, commands, retries, helpers, session}`, `helpers` the models of the
+turn's codex helpers), which the plugin renders as the answer's closing line.
 
 Rows: the plugin draws a `row` as a `Bash` tool call (`shell`) or a call of its step tool `mcp__lord__<family>`
 (`{step}`), both listed in the agent files, and answers that call itself from `/row`, so nothing runs and no
@@ -94,7 +106,13 @@ waits undelivered, for up to `keep_undelivered_s` (a day).
 ## Vendor setup
 - codex: `codex app-server` per agent; `thread/start|resume` with cwd, `approvalPolicy: never`, sandbox
   `workspace-write` (writable roots = cwd + `dirs`), `read-only`, or `danger-full-access` with `nosandbox`, network per `net`, the lord MCP server, and the
-  user's codex MCP servers, codex plugins and notifier disabled unless `tools`.
+  user's codex MCP servers, codex plugins and notifier disabled unless `tools`; without `tools` also
+  `skills: {include_instructions: false, bundled: {enabled: false}}` (codex lists skills from its skills folder and plugin
+  caches, the remote ones included, which the plugin switch-off misses), and for `readonly` `features: {multi_agent: false}`
+  (no helper agents). A codex helper (`subAgentActivity` with `agentThreadId`, `agentPath`, `model`, `reasoningEffort`, from
+  the agent's thread or another helper's) is mapped to its agent: the helper's completed steps go to the agent's log as
+  `[<agentPath>] <line>` and to its read list, never to rows or events. `webSearch` lines name `action`'s query, queries,
+  url or pattern; a search with none yet gets its row when it completes.
 - grok: `grok --sandbox <write_sandbox|readonly_sandbox> agent --always-approve stdio` per agent, defaults
   `lord-workspace` (extends `workspace`: writes to cwd and temp folders) and `lord-readonly` (extends `read-only` with
   `restrict_network = false`, whose socket resolver refuses symlinked endpoints such as Docker Desktop's, and an explicit
@@ -123,7 +141,14 @@ Every `guard_interval_s` (5 s): an agent's whole process tree over `memory_ceili
 the family's `no_progress_s` while running (grok and gemini 2400 s, gpt off), is killed (per agent: `memory_gb`,
 `hang_s`), or a turn past its `wall_s`; progress is vendor stdout since the turn's dispatch (stderr is logging); the turn ends with an error naming
 the reason. Every stop kills the vendor's whole process tree by pid as well as its group. A failed vendor start is
-retried once; a crash, or a codex turn that ends failed, restarts the vendor on the next turn, never in a loop. Each turn's activity log starts with a `turn: <family> <model> effort <effort>` line; every record is one line (a
+retried once; a crash, or a codex turn that ends failed, restarts the vendor on the next turn, never in a loop, except
+the codex kinds `cyberPolicy` and `misalignmentPolicyViolation` (the error reads `refused by vendor (<kind>): …`, names
+the last completed command and says a reworded message resumes the session), `usageLimitExceeded` (the reset of the
+window codex last reported at 100% is kept in `quota.json`; none reported, nothing is refused), `rateLimitExceeded` and
+`serverOverloaded`. `serverOverloaded` before any `fileChange` in the turn waits `capacity_retry_s` (30) and starts a
+turn on the same thread asking it to continue, up to `capacity_retries` (2) times; an interrupt during the wait ends the
+turn. A codex `error` notification for the running turn waits for that turn's completion (5 s at most), which then ends
+the turn with the error's kind. Each turn's activity log starts with a `turn: <family> <model> effort <effort> · <settings line>` line; every record is one line (a
 line break inside it, of any kind, is shown as `⏎`), and a turn that fails adds an `error: <reason>` line. agy states a failure only on
 stderr (`AGY_ERROR: {...}`) before it exits: its `short_error` is the turn's error, and a 429 that names its reset
 (`Resets in 104h27m0s`) makes the daemon refuse that gemini model's `/open` and turns until then, saying when, before
@@ -165,8 +190,16 @@ goes as an `@model` first line); `send_message(to, text)` becomes SendMessage; `
 - Turn text from `turn.start`, with the Workflow header, the coordinator envelope and task notifications unwrapped.
   First-line directives, removed before the vendor reads the text: `@model <id>`, `@effort <level>` (persists; beats
   the Agent call's effort, which only reaches low to max), `@readonly`, `@net`, `@cwd <path>`
-  (first turn only; a different one later is an error), `@dir <path>` (repeatable), `@memory <GB>`, `@hang <seconds>`, `@wall <seconds>`, `@tools` (the user's own vendor
-  tool servers and grok's Claude imports, which a new process loads).
+  (first turn only; a different one later is an error), `@dir <path>` (repeatable), `@memory <GB>`, `@hang <seconds>`, `@wall <seconds>`, `@nice <0-19>`, `@tools` (the user's own vendor
+  skills, tool servers and grok's Claude imports, which a new process loads). A line `@<letters>` with at most one value
+  that is no directive, a repeated directive other than `@dir`, or a directive written wrongly is an error: an Agent call
+  carrying one is denied (`lord: <reason>`), a message carrying one ends the turn with it. A lord Agent call that is not a
+  resume gets one `context` line, `lord: requested <model> <effort> · …`, the settings it asks for with the configured
+  defaults. The answer (not a bare JSON value) and the `lord: error:` line end with the `record` line `[lord: <ended_how> ·
+  <model> <effort> · <start> to <end> · <n> commands · <helpers> · <retries> · session <id>]`; `lastAnswer`, which a
+  schema step reads, stays without it. A `SendMessage` to a running Lord agent is answered by the mod: `/steer`, else
+  `/queue`, with a reply saying which; the vendor's own SendMessage call still gets its result. A launch description
+  that names the model (id or short name) is not labelled.
 - `turn.step`: index 0 opens and starts the turn; a later step after a lord tool continues it. In auto permission mode
   Claude Code delivers a subagent's report only through its `SubagentHandback` tool (its reminder is in the API form of
   the agent's messages, `$.session.messages({ agentId, as: 'api' })`, read at a turn's start and end; the newest of the
@@ -191,4 +224,5 @@ goes as an `@model` first line); `send_message(to, text)` becomes SendMessage; `
 - Task notifications from children are unwrapped with their result verbatim.
 - TaskStop or Esc sends /interrupt; once `session.end` fires for a quit (not `/clear` or a resume), aborted turns are
   left running in the daemon.
-  `/lord` lists agents with the model that ran, tokens and log; `/lord model <id> <model>`.
+  `/lord` lists agents with the model that ran, `quiet_s`, tokens and log, then codex's allowance windows and each
+  refused quota from `/allowance`; `/lord model <id> <model>`.

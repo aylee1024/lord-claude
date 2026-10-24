@@ -577,8 +577,10 @@ class Vendor:
             if not shutil.which(command[0], path=subscription_env().get('PATH')):
                 raise RuntimeError(f'{command[0]} was not found; {INSTALL[self.family]}')
             # @nice: the vendor starts at that niceness and every command it runs inherits it; a sandboxed command
-            # cannot lower its own priority.
-            if self.agent and self.agent.record.get('nice'): command = ['/usr/bin/nice', '-n', str(self.agent.record['nice']), *command]
+            # cannot lower its own priority. nice -n adds to the daemon's own niceness, which no one may lower, so a
+            # daemon already at or past the level starts the vendor at its own.
+            if self.agent and (step := self.agent.record.get('nice', 0) - os.getpriority(os.PRIO_PROCESS, 0)) > 0:
+                command = ['/usr/bin/nice', '-n', str(step), *command]
             if self.family == 'gpt': command += ['app-server']
             elif self.family == 'grok':
                 # Seatbelt applies to the whole grok process, so read-only sessions get their own process.

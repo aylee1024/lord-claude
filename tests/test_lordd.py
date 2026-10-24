@@ -2125,13 +2125,15 @@ def test_open_and_every_turn_state_the_effective_settings_with_their_defaults(ri
 
 
 def test_nice_starts_the_vendor_at_that_niceness_and_a_change_restarts_it(rig):
-    rig.open('gpt', nice=10)
+    # The daemon has the test's niceness (zsh starts background jobs at 5); a level is absolute, never below it.
+    base = os.getpriority(os.PRIO_PROCESS, 0)
+    rig.open('gpt', nice=15)
     rig.turn('PING')
     launches = [e for e in rig.audit() if e.get('launch')]
-    assert launches[-1]['nice'] == 10
-    assert rig.open('gpt', nice=10) and len([e for e in rig.audit() if e.get('launch')]) == 1
-    rig.open('gpt', nice=5)
-    assert [e for e in rig.audit() if e.get('launch')][-1]['nice'] == 5
+    assert launches[-1]['nice'] == max(15, base)
+    assert rig.open('gpt', nice=15) and len([e for e in rig.audit() if e.get('launch')]) == 1
+    rig.open('gpt', nice=12)
+    assert [e for e in rig.audit() if e.get('launch')][-1]['nice'] == max(12, base)
     conn, file, status, _ = rig.connect('/open', {'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home), 'nice': 20})
     try: assert status == 400 and '0 to 19' in json.loads(file.read())['error']
     finally: file.close(); conn.close()
