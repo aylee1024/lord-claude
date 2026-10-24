@@ -58,7 +58,8 @@ agent's latest non-empty final answer, redacted, removed with the record), `logs
 `commands`, `retries`, `helpers`, `usage` or `error`, `answer`), `logs/<agentId>.answers/<n>.md` (each turn's answer or
 `lord: error:` line, redacted; turn n-100's is deleted as turn n is written), `logs/<agentId>.reads.txt` (gpt only: one line
 per path first read, listed, searched or edited, from codex's `commandActions` and `fileChange`, a helper's tagged with its
-path; it stops at 4 MB with a last line saying so), all removed with the record; `allowance.json` (`{gpt: {<limitId>:
+path; a file a program or script opens is not in codex's actions and is not listed; written only when there is a path;
+it stops at 4 MB with a last line saying so), all removed with the record; `allowance.json` (`{gpt: {<limitId>:
 snapshot}}`, codex's last `account/rateLimits/updated` for each quota bucket, merged within the bucket as codex sends it,
 with `seen`; written under `journal.lock` through one scratch name, so daemons of every version share it; a malformed file reads as empty), `lordd.log` (1 MB, one rotation). Two global side effects: an agy MCP entry `lord` while a daemon runs (added
 or updated at each gemini agent start, removed when a daemon exits with no daemon of another version running; agy has
