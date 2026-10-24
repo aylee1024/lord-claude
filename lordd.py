@@ -164,6 +164,8 @@ def grok_project_paths(cwd):
     directories = [launch, *list(launch.parents)[:len(launch.parents) - len(root.parents)]]
     protected = {root / name for name in ('.git', '.codex', '.agents')}
     for directory in directories:
+        # Directory renames check the destination entry, not the configs moved below it.
+        protected.update(directory / name for name in ('.claude', '.cursor', '.grok') if not (directory / name).is_dir())
         configs = [directory / name for name in ('.claude/settings.json', '.claude/settings.local.json', '.cursor/hooks.json')]
         hooks = directory / '.grok/hooks'
         configs += list(hooks.glob('*.json'))
@@ -182,10 +184,12 @@ def grok_profile(cwd, readonly, env):
     folder = HERE.parent / 'sandbox'
     profile = '\n'.join((folder / name).read_text() for name in ('seatbelt_base_policy.sbpl', 'seatbelt_preferences_policy.sbpl', 'grok.sbpl'))
     real_home = Path.home() / '.claude/lord'
+    # Socket nodes cannot be opened for F_GETPATH; the served name inherits its parent's kernel spelling.
     params = {name: canon(path) for name, path in {
         'AGENT': cwd, 'TMP': env.get('TMPDIR') or '/tmp', 'PRIVATE_TMP': '/private/tmp',
         'GROK_HOME': grok_home(), 'SESSIONS': grok_home() / 'sessions', 'KEY': HOME / 'control.header', 'REAL_KEY': real_home / 'control.header',
-        'LORD_HOME': HOME, 'REAL_LORD_HOME': real_home}.items()}
+        'LORD_HOME': HOME, 'REAL_LORD_HOME': real_home, 'SOCKET': Path(canon(SOCKET.parent)) / SOCKET.name}.items()}
+    params['SOCKET_LOGICAL'] = str(SOCKET)
     if not readonly: profile += '\n(allow file-write* (subpath (param "AGENT")))'
     protected = grok_project_paths(cwd)
     writable = [params[name] for name in ('TMP', 'PRIVATE_TMP', 'SESSIONS')] + ([] if readonly else [params['AGENT']])

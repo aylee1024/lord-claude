@@ -20,7 +20,9 @@
     (require-not (subpath (param "SESSIONS")))))
 (allow network-outbound (remote ip "*:*"))
 (allow network-outbound
-  (remote unix-socket (path "/private/var/run/mDNSResponder")))
+  (remote unix-socket (path "/private/var/run/mDNSResponder"))
+  (remote unix-socket (path (param "SOCKET")))
+  (remote unix-socket (path (param "SOCKET_LOGICAL"))))
 (allow mach-lookup (global-name "com.apple.trustd.agent"))
 (allow sysctl-read)
 (allow process-info*)

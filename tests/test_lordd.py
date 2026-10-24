@@ -1048,7 +1048,10 @@ def test_writable_grok_starts_in_its_working_folder(rig):
 
 
 def test_requests_without_the_control_key_are_refused_except_health_and_mcp(rig):
-    for path, body in [('/agents', None), ('/open', {'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home)})]:
+    requests = [('/agents', None), ('/allowance', None), ('/open', {'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home)})]
+    requests += [(path, {}) for path in ('/turn', '/continue', '/row', '/tool_result', '/steer', '/queue', '/interrupt', '/close', '/prune', '/health')]
+    requests += [('/mcp', None), ('/unknown', None)]
+    for path, body in requests:
         conn, file, status, _ = rig.connect(path, body, key=False)
         reply = json.loads(file.read()); file.close(); conn.close()
         assert status == 403 and 'control key' in reply['error']
@@ -3848,6 +3851,137 @@ print(json.dumps(results))
         expected.update(temp='allowed', sessions='allowed', work='denied' if readonly else 'allowed')
         assert results == expected
     finally: listener.close()
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='macOS Seatbelt profile')
+@pytest.mark.parametrize('name,config', [('.claude', 'settings.json'), ('.cursor', 'hooks.json'), ('.grok', 'hooks/a.json')])
+@pytest.mark.parametrize('attack', ['mkdir', 'rename', 'symlink'])
+@pytest.mark.parametrize('initial', ['missing', 'file', 'broken-symlink'])
+def test_grok_outer_missing_hook_folders(tmp_path, name, config, attack, initial):
+    m = load('lordd_grok_missing_hooks')
+    root = tmp_path / 'repo'; launch = root / 'src/deep'; launch.mkdir(parents=True)
+    (root / '.git').mkdir()
+    existing = root / 'src/.claude'; existing.mkdir()
+    (existing / 'settings.json').write_text('{}')
+    for directory in (root, root / 'src', launch):
+        target = directory / name
+        if target == existing: continue
+        if initial == 'file': target.write_text('placeholder')
+        elif initial == 'broken-symlink': target.symlink_to(launch / 'absent')
+    code = '''
+import errno, json, pathlib, sys
+root, launch, existing = map(pathlib.Path, sys.argv[1:4])
+name, config, attack = sys.argv[4:]
+results = {}
+for index, directory in enumerate((root, root / 'src', launch)):
+    target = directory / name
+    if target.is_dir(): continue
+    source = launch / ('prepared' + str(index))
+    source.mkdir(); leaf = source / config; leaf.parent.mkdir(parents=True, exist_ok=True); leaf.write_text('{}')
+    try:
+        if target.is_symlink() or target.is_file(): target.unlink()
+        if attack == 'mkdir': target.mkdir()
+        elif attack == 'rename': source.rename(target)
+        else:
+            target.symlink_to(source, target_is_directory=True)
+            (target / config).write_text('{}')
+        results[str(target)] = 'allowed'
+    except OSError as error:
+        assert error.errno in (errno.EPERM, errno.EACCES), error
+        results[str(target)] = 'denied'
+(existing / 'notes.md').write_text('ordinary write')
+try: (existing / 'settings.json').write_text('changed')
+except PermissionError: results['settings'] = 'denied'
+else: results['settings'] = 'allowed'
+print(json.dumps(results))
+'''
+    profile, params = m.grok_profile(str(launch), False, {'TMPDIR': str(tmp_path)})
+    result = subprocess.run(['/usr/bin/sandbox-exec', '-p', profile, *params, PYTHON, '-c', code,
+                             str(root), str(launch), str(existing), name, config, attack], cwd=launch,
+                            capture_output=True, text=True, timeout=8)
+    assert result.returncode == 0, result.stdout + result.stderr
+    results = json.loads(result.stdout)
+    assert results and set(results.values()) == {'denied'}, results
+    for directory in (root, root / 'src', launch):
+        target = directory / name
+        if target == existing: continue
+        if initial == 'missing': assert not os.path.lexists(target)
+        elif initial == 'file': assert target.read_text() == 'placeholder'
+        else: assert target.is_symlink() and not target.exists()
+    assert (existing / 'notes.md').read_text() == 'ordinary write'
+    assert (existing / 'settings.json').read_text() == '{}'
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='macOS Seatbelt profile')
+@pytest.mark.parametrize('readonly', [False, True])
+@pytest.mark.parametrize('spelling', ['kernel', 'logical', 'case', 'unicode', 'data-volume'])
+def test_grok_outer_relay_socket(tmp_path, request, readonly, spelling):
+    m = load('lordd_grok_relay_socket')
+    # AF_UNIX paths are limited to 104 bytes, so the socket's folder must not depend on pytest's temp folder length.
+    short = Path(tempfile.mkdtemp(prefix='lrs', dir='/private/tmp')); request.addfinalizer(lambda: shutil.rmtree(short, ignore_errors=True))
+    home = short / 'lord-café'; home.mkdir(); (home / 'control.header').write_text('decoy')
+    link = short / 'link'; link.symlink_to(home, target_is_directory=True)
+    m.HOME = link; m.SOCKET = link / 'custom.sock'
+    work = tmp_path / 'work'; work.mkdir()
+    temp = tmp_path / 'temp'; temp.mkdir()
+    if spelling == 'case': m.SOCKET = Path(str(home).upper()) / 'custom.sock'
+    elif spelling == 'unicode': m.SOCKET = Path(unicodedata.normalize('NFC', str(home))) / 'custom.sock'
+    endpoint = str(Path(m.canon(home)) / 'custom.sock') if spelling == 'kernel' else str(m.SOCKET)
+    if spelling == 'data-volume':
+        m.SOCKET = Path('/System/Volumes/Data' + str(m.SOCKET))
+        endpoint = str(m.SOCKET)
+    received, stop = [], threading.Event()
+    listener = socket.socket(socket.AF_UNIX); listener.bind(str(home / 'custom.sock')); listener.listen(); listener.settimeout(.1)
+    other = socket.socket(socket.AF_UNIX); other.bind(str(temp / 'other.sock')); other.listen()
+    def serve():
+        while not stop.is_set():
+            try: conn, _ = listener.accept()
+            except socket.timeout: continue
+            with conn, conn.makefile('rb') as file:
+                first = file.readline()
+                headers = {}
+                while (line := file.readline()) != b'\r\n':
+                    key, value = line.decode().split(':', 1); headers[key.lower()] = value.strip()
+                body = json.loads(file.read(int(headers['content-length'])))
+                received.append((first, headers, body))
+                reply = json.dumps({'content': [{'type': 'text', 'text': 'decoy daemon reached'}], 'isError': False}).encode()
+                conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n' % len(reply) + reply)
+    worker = threading.Thread(target=serve); worker.start()
+    code = r'''
+import errno, json, pathlib, socket, subprocess, sys
+daemon, home, other = sys.argv[1:]
+for operation in (lambda: pathlib.Path(home, 'control.header').read_text(),
+                  lambda: socket.socket(socket.AF_UNIX).connect(other)):
+    try: operation()
+    except OSError as error: assert error.errno in (errno.EPERM, errno.EACCES), error
+    else: raise AssertionError('control key or unrelated socket allowed')
+process = subprocess.Popen([sys.executable, daemon, '--mcp', 'decoy-agent'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+try:
+    process.stdin.write(json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': 'tools/call', 'params': {'name': 'list_agents', 'arguments': {}}}) + '\n')
+    process.stdin.flush()
+    print(process.stdout.readline(), end='')
+finally:
+    process.stdin.close(); process.wait(timeout=3)
+'''
+    try:
+        profile, params = m.grok_profile(str(work), readonly, {'TMPDIR': str(temp)})
+        result = subprocess.run(['/usr/bin/sandbox-exec', '-p', profile, *params, PYTHON, '-c', code,
+                                 str(DAEMON), str(link), str(temp / 'other.sock')], cwd=work,
+                                env={**os.environ, 'LORD_HOME': str(link), 'LORD_DAEMON_SOCKET': endpoint, 'LORD_MCP_TOKEN': 'decoy-token'},
+                                capture_output=True, text=True, timeout=8)
+        assert result.returncode == 0, result.stdout + result.stderr
+        reply = json.loads(result.stdout)
+        assert 'error' not in reply, reply
+        assert reply['result'] == {'content': [{'type': 'text', 'text': 'decoy daemon reached'}], 'isError': False}
+        for name, path in (('SOCKET', str(Path(m.canon(home)) / 'custom.sock')), ('SOCKET_LOGICAL', str(m.SOCKET))):
+            assert f'-D{name}={path}' in params
+            assert f'(remote unix-socket (path (param "{name}")))' in profile
+        assert len(received) == 1
+        first, headers, body = received[0]
+        assert first == b'POST /mcp HTTP/1.1\r\n' and 'x-lord-control' not in headers
+        assert body == {'agentId': 'decoy-agent', 'name': 'list_agents', 'arguments': {}, 'token': 'decoy-token'}
+    finally:
+        stop.set(); worker.join(3); listener.close(); other.close()
 
 
 @pytest.mark.parametrize('readonly', [False, True])

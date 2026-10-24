@@ -120,7 +120,7 @@ waits undelivered, for up to `keep_undelivered_s` (a day).
 - grok: `/usr/bin/sandbox-exec -p <profile> -D<NAME>=<path> ... grok --sandbox off agent --always-approve stdio`
   per agent, with `/usr/bin/nice` outside sandbox-exec when requested. Both process cwd and ACP `session/new|load`
   cwd are the agent's folder in both modes. Lord combines Codex's base and preferences policies with `sandbox/grok.sbpl`;
-  all path parameters use `canon()`, and the profile is passed inline with no profile file written.
+  path parameters use `canon()` except the daemon socket's additional logical spelling, and the profile is passed inline with no profile file written.
   Reads everywhere except Lord's control key; writes to the agent folder (unless read-only), temp folders and
   `grok_home()/sessions` (`$GROK_HOME` or `~/.grok`) and its own login files. At the kernel-spelled `GROK_HOME`,
   literal write grants cover `auth.json`, `auth.json.lock`, `mcp_credentials.json` and `mcp_credentials.json.lock`.
@@ -128,19 +128,24 @@ waits undelivered, for up to `keep_undelivered_s` (a day).
   anchored numeric pattern `\.[0-9]+\.[0-9]+\.tmp`; the home prefix is regex-quoted. All other writes under grok's home
   are denied except sessions, including `config.toml`, `sandbox.toml`, `trusted_folders.toml` and `bin/`, even if a
   temp write grant overlaps the home. No writes under Lord's logical or resolved folder.
-  Outbound IP network is allowed; Unix-socket connections allow only `/private/var/run/mDNSResponder` for DNS.
-  Docker's real socket, tmux and Lord's own socket are blocked in both modes. `com.apple.trustd.agent` lookup is allowed;
+  Outbound IP network is allowed; Unix-socket connections allow only `/private/var/run/mDNSResponder` for DNS and
+  the daemon's `SOCKET`, by kernel and logical spelling, for grok's Lord tools. Every other Unix socket, including
+  Docker's real socket and tmux, is blocked in both modes. `com.apple.trustd.agent` lookup is allowed;
   XPC service-name-prefix lookups and mutating fcntl commands 80 and 110 are denied. Writable roots are pinned against unlink.
   Each start protects `.claude/settings.json`, `.claude/settings.local.json`, `.cursor/hooks.json` and `.grok/hooks/`
   at every directory from the nearest repository root through the launch folder (just the launch folder outside a repository),
-  plus root `.git`, `.codex` and `.agents`, by logical and resolved path, including absent named configs.
+  plus root `.git`, `.codex` and `.agents`, by logical and resolved path. At each directory on that path, a missing
+  `.claude`, `.cursor` or `.grok` gets a write deny for the name itself and everything below it: the agent cannot create
+  that folder, including by rename or symlink. In existing folders the named configs stay protected even when absent;
+  ordinary files remain writable where project writes are allowed.
   Existing parent directories inside writable roots are pinned against unlink and rename. Existing hook configs must
   resolve to regular files with one hard link; otherwise the start is refused with the file named.
   A grok working folder may not be inside `grok_home()` or contain it, at `/open` and every start. Read-only grok
   refuses temp folders at `/open` and every start. Grok's other storage stays read-only, so memory saves and grok's own
   git worktrees are unavailable; Claude Code supplies worktree paths through `SubagentStart`.
   Every grok agent, read-only included, can change another grok agent's saved conversation in their shared sessions folder.
-  ACP `session/new|load` supplies the lord MCP server; its subprocess cannot connect to Lord's Unix socket under this profile.
+  ACP `session/new|load` supplies the lord MCP server. Its sandboxed `--mcp` subprocess reaches only Lord's daemon socket;
+  the unreadable control key leaves only `GET /health` and per-agent-token-checked `POST /mcp` available.
   `GROK_{CLAUDE,CURSOR}_{MCPS,HOOKS,SKILLS}_ENABLED=false` suppress Claude/Cursor imports unless `tools`.
   Effort as requested (low to xhigh; max runs as xhigh).
 - agy: `agy --model M --effort E --input-format stream-json --output-format stream-json --dangerously-skip-permissions
