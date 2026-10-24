@@ -160,10 +160,11 @@ LORD_BLOCK = re.compile(r'^# lord: begin[^\n]*\n.*?^# lord: end[^\n]*(?:\n|\Z)',
 
 def grok_profiles():
     # grok runs unconfined, with only a warning, when a built-in profile fails to apply, but refuses to start
-    # when a custom profile fails. Lord therefore runs grok only under its own custom profiles. Both drop
-    # restrict_network, whose socket resolver refuses symlinked endpoints (Docker Desktop's
-    # /var/run/docker.sock); both profiles deny the container sockets and each symlink hop explicitly. Neither can read Lord's control
-    # key, without which a grok agent cannot ask the daemon for a less confined agent.
+    # when a custom profile fails. Lord therefore runs grok only under its own custom profiles. Both set
+    # restrict_network = false, so commands keep network access; on macOS the setting blocks no Unix-socket
+    # connection either way. Socket denies block file access, stopping connections through the listed link paths
+    # only. Neither profile can read Lord's control key, without which a grok agent cannot ask the daemon for a
+    # less confined agent.
     import tomllib
     link = grok_home() / 'sandbox.toml'
     path = Path(os.path.realpath(link))
@@ -268,13 +269,26 @@ def fold(path):
     return path.lower() if sys.platform == 'darwin' else path
 
 def canon(path):
-    # The real path, with macOS's data-volume alias removed: /System/Volumes/Data/private/tmp is /private/tmp.
+    # F_GETPATH returns the kernel's spelling, including Unicode normalization and filesystem case folding.
+    # Non-blocking open also handles FIFOs; paths that cannot be opened keep their realpath spelling.
     path = os.path.realpath(path)
+    if sys.platform == 'darwin':
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            try: path = os.fsdecode(fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).rstrip(b'\0'))
+            finally: os.close(fd)
+        except OSError: pass
     if sys.platform == 'darwin' and fold(path + '/').startswith('/system/volumes/data/'): path = path[len('/System/Volumes/Data'):] or '/'
     return path
 
 def inside(path, roots):
     return any(fold(path) == fold(root) or fold(path).startswith(fold(root).rstrip('/') + '/') for root in roots)
+
+def validate_grok_folder(cwd):
+    folder, root = canon(cwd), canon(str(grok_home()))
+    if inside(folder, (root,)) or inside(root, (folder,)):
+        raise ValueError(f"refusing {folder} as a grok working folder: it is inside or contains {root}; grok's sandbox lets an agent write its whole working folder")
+    return folder
 
 # The PATH of the latest Claude Code session to open an agent: a vendor CLI installed after the daemon started is found.
 SESSION_PATH = None
@@ -713,6 +727,7 @@ class Vendor:
                 command = [*nice, *command]
             if self.family == 'gpt': command += ['app-server']
             elif self.family == 'grok':
+                if self.agent: validate_grok_folder(self.agent.cwd)
                 # Seatbelt applies to the whole grok process, so read-only sessions get their own process.
                 command += ['--sandbox', config['readonly_sandbox'] if self.readonly else config['write_sandbox']]
                 command += ['agent', '--always-approve', 'stdio']
@@ -1336,9 +1351,7 @@ class Daemon:
             if family == 'gpt' and readonly and (body.get('net') or bool(a and a.record.get('net'))):
                 raise ValueError("@readonly with @net is not read-only for gpt: with network on, codex can reach local services, Lord's included; use lord:grok for a read-only agent with network")
             if family == 'grok':
-                folder, root = canon(a.cwd if a else cwd), canon(str(grok_home()))
-                if inside(folder, (root,)) or inside(root, (folder,)):
-                    raise ValueError(f"refusing {folder} as a grok working folder: it is inside or contains {root}; grok's sandbox lets an agent write its whole working folder")
+                folder = validate_grok_folder(a.cwd if a else cwd)
                 # grok's profile leaves temp folders writable.
                 if readonly and inside(folder, TEMP_ROOTS):
                     raise ValueError("grok's read-only profile leaves temp folders writable; pin a read-only grok outside /tmp, /var/tmp and /var/folders")

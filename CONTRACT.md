@@ -123,14 +123,15 @@ waits undelivered, for up to `keep_undelivered_s` (a day).
   `~/.grok/daemon/run/<profile>` when its daemon backend is used), under `grok_home()` (`$GROK_HOME` or `~/.grok`).
   A writable process starts in the agent's folder; a read-only one starts in `grok_home()/sessions`, so `strict` grants
   it no project writes. ACP gets the agent's actual folder for both new and resumed sessions. Both profiles explicitly
-  deny the container sockets and each symlink hop to them, since `restrict_network`'s socket resolver refuses
-  symlinked endpoints such as Docker Desktop's. Both deny Lord's control key. Grok's other folders stay read-only:
+  deny file access to the container sockets and each symlink hop to them. These denies stop connections through the
+  listed link paths only. Both deny Lord's control key. Grok's other folders stay read-only:
   Lord's grok agents cannot save grok memory or use grok's own git worktrees. Lord uses neither; Claude Code supplies
   worktree paths through `SubagentStart`, so its worktree isolation still works.
   A grok working folder may not be inside `~/.grok` or contain it (`$GROK_HOME` if set), because grok's sandbox lets
   an agent write its whole working folder. Every grok agent, read-only included, can change another grok agent's saved
-  conversation, because grok keeps all sessions in one writable folder. A grok command can reach Unix sockets of
-  programs the user runs, such as a tmux server, which can act outside the sandbox; container sockets are denied.
+  conversation, because grok keeps all sessions in one writable folder. A grok agent, read-only included, can connect
+  to Docker's socket and other local control sockets, such as a tmux server's, which act outside its sandbox.
+  No grok profile setting blocks these connections on macOS, including `restrict_network = true` (grok 1.0.70).
   Custom profiles only: grok refuses to start when one
   cannot be applied, while a failed built-in profile runs unconfined with a warning. ACP `session/new|load` with the
   lord MCP server;

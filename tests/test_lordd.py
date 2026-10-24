@@ -16,6 +16,7 @@ import tempfile
 import threading
 import time
 import types
+import unicodedata
 from urllib.parse import quote
 
 import pytest
@@ -1187,6 +1188,91 @@ def test_grok_checks_its_saved_working_folder_for_home_overlap(rig, readonly):
     assert f'refusing {project.resolve()} as a grok working folder' in reply['error'] and 'sandbox lets an agent write its whole working folder' in reply['error']
 
 
+@pytest.mark.skipif(sys.platform != 'darwin', reason='macOS filesystem spellings')
+@pytest.mark.parametrize('spelling', ['long_s', 'nfd'])
+@pytest.mark.parametrize('option', ['cwd', 'dir'])
+def test_spelled_home_folder_is_refused(rig, monkeypatch, spelling, option):
+    home = rig.home / 'storage-café'; home.mkdir()
+    project = rig.home / 'project'; project.mkdir()
+    spelled = str(home).replace('storage', 'ſtorage') if spelling == 'long_s' else unicodedata.normalize('NFD', str(home))
+    assert spelled != str(home) and os.path.samefile(spelled, home)
+    d = local_daemon(rig, monkeypatch)
+    monkeypatch.setattr(Path, 'home', classmethod(lambda cls: home))
+    async def scenario():
+        try:
+            body = {'agentId': 'a', 'family': 'gpt', 'cwd': str(project)}
+            if option == 'cwd': body['cwd'] = spelled
+            else: body['dirs'] = [spelled]
+            with pytest.raises(ValueError, match='holding your home folder'):
+                await d.open(body)
+            assert not d.agents
+        finally: await d.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='macOS filesystem spellings')
+@pytest.mark.parametrize('spelling', ['long_s', 'nfd'])
+@pytest.mark.parametrize('readonly', [False, True])
+def test_grok_refuses_spelled_home_overlap(rig, spelling, readonly):
+    home = rig.home / 'storage-café/grok'
+    child = home / 'bin'; child.mkdir(parents=True)
+    spelled = str(child).replace('storage', 'ſtorage') if spelling == 'long_s' else unicodedata.normalize('NFD', str(child))
+    assert spelled != str(child) and os.path.samefile(spelled, child)
+    rig.stop(); rig.env['GROK_HOME'] = str(home); rig.start()
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'a', 'family': 'grok', 'cwd': spelled, 'readonly': readonly})
+    reply = json.loads(file.read()); file.close(); conn.close()
+    assert status == 400, reply
+    assert f'refusing {child} as a grok working folder' in reply['error']
+    assert 'sandbox lets an agent write its whole working folder' in reply['error']
+    assert rig.request('/agents') == [] and not rig.data.exists()
+
+
+@pytest.mark.parametrize('readonly', [False, True])
+def test_saved_grok_turn_rechecks_home_overlap_after_restart(rig, readonly):
+    project = rig.home / 'project'; project.mkdir()
+    rig.open('grok', cwd=str(project), readonly=readonly)
+    assert rig.turn('before-restart')[-1]['type'] == 'done'
+    launches = [e for e in rig.audit() if e.get('launch')]
+    home = project / 'grok'
+    rig.stop(); rig.env['GROK_HOME'] = str(home); rig.start()
+    conn, file, status, _ = rig.connect('/turn', {'agentId': 'a', 'text': 'PING'})
+    reply = file.read(); file.close(); conn.close()
+    assert status == 400, reply
+    result = json.loads(reply)
+    assert f'refusing {project} as a grok working folder' in result['error']
+    assert 'sandbox lets an agent write its whole working folder' in result['error']
+    assert [e for e in rig.audit() if e.get('launch')] == launches
+    assert not home.exists()
+
+
+@pytest.mark.parametrize('readonly', [False, True])
+def test_grok_refuses_overlap_with_symlinked_home(rig, readonly):
+    home = rig.home / 'storage/grok'
+    child = home / 'bin'; child.mkdir(parents=True)
+    link = rig.home / 'linked-home'; link.symlink_to(home, target_is_directory=True)
+    rig.stop(); rig.env['GROK_HOME'] = str(link); rig.start()
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'a', 'family': 'grok', 'cwd': str(child), 'readonly': readonly})
+    reply = json.loads(file.read()); file.close(); conn.close()
+    assert status == 400, reply
+    assert f'inside or contains {home}' in reply['error']
+    assert rig.request('/agents') == [] and not rig.data.exists()
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='macOS data-volume alias')
+@pytest.mark.parametrize('readonly', [False, True])
+def test_grok_refuses_overlap_with_data_volume_folder(rig, readonly):
+    home = rig.home / 'storage/grok'
+    child = home / 'bin'; child.mkdir(parents=True)
+    spelled = '/System/Volumes/Data' + str(child)
+    assert os.path.samefile(spelled, child)
+    rig.stop(); rig.env['GROK_HOME'] = str(home); rig.start()
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'a', 'family': 'grok', 'cwd': spelled, 'readonly': readonly})
+    reply = json.loads(file.read()); file.close(); conn.close()
+    assert status == 400, reply
+    assert f'refusing {child} as a grok working folder' in reply['error']
+    assert rig.request('/agents') == [] and not rig.data.exists()
+
+
 def test_a_failed_first_open_leaves_no_agent_behind(rig):
     conn, file, status, _ = rig.connect('/open', {'agentId': 'm', 'family': 'gpt', 'cwd': str(rig.home), 'model': 'no-such-model'})
     file.close(); conn.close()
@@ -1451,6 +1537,39 @@ def test_path_refusals_ignore_letter_case_on_macos(rig):
     conn, file, status, _ = rig.connect('/open', {'agentId': 'r', 'family': 'grok', 'cwd': str(grok_home).upper(), 'readonly': True})
     reply = json.loads(file.read()); file.close(); conn.close()
     assert status == 400 and 'sandbox lets an agent write its whole working folder' in reply['error']
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='macOS F_GETPATH')
+@pytest.mark.parametrize('kind', ['missing', 'socket', 'permission'])
+def test_canon_falls_back_to_realpath_for_unopenable_paths(tmp_path, kind):
+    m = load('lordd_canon_fallback')
+    real = tmp_path / 'real'; real.mkdir()
+    link = tmp_path / 'link'; link.symlink_to(real, target_is_directory=True)
+    target = real / kind
+    listener = None
+    endpoint = tmp_path.parent / 's'
+    try:
+        if kind == 'socket':
+            listener = socket.socket(socket.AF_UNIX)
+            listener.bind(str(endpoint)); target.symlink_to(endpoint)
+        elif kind == 'permission': target.mkdir(); target.chmod(0)
+        assert m.canon(link / kind) == os.path.realpath(link / kind)
+    finally:
+        if kind == 'permission': target.chmod(0o700)
+        if listener: listener.close(); endpoint.unlink()
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='macOS F_GETPATH')
+def test_canon_does_not_wait_for_a_fifo_writer(tmp_path):
+    fifo = tmp_path / 'fifo'; os.mkfifo(fifo)
+    code = '''import importlib.util, sys
+spec = importlib.util.spec_from_file_location('lordd_fifo', sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+print(m.canon(sys.argv[2]))
+'''
+    result = subprocess.run([PYTHON, '-c', code, str(DAEMON), str(fifo)], capture_output=True, text=True, timeout=5)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(fifo)
 
 
 def test_a_failed_agy_listing_is_not_cached_and_ultra_stays_in_range():
@@ -3276,6 +3395,36 @@ def test_tests_real_home_containment_with_data_volume_spelling(tmp_path):
     assert m.normalize_system_aliases(m.HOME) != m.canon(m.HOME)
     with pytest.raises(ValueError, match="Lord's folder.*inside writable root"):
         m.validate_tests_layout(str(work), [], {'TMPDIR': str(tmp_path / 'temp')})
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='macOS filesystem spellings')
+@pytest.mark.parametrize('spelling', ['long_s', 'nfd'])
+def test_tests_spelled_writable_root_cannot_contain_lord_home(tmp_path, spelling):
+    m = load('lordd_tests_spelled_layout')
+    work = tmp_path / 'storage-café'; work.mkdir()
+    m.HOME = work / 'lord'; m.HOME.mkdir()
+    spelled = str(work).replace('storage', 'ſtorage') if spelling == 'long_s' else unicodedata.normalize('NFD', str(work))
+    assert spelled != str(work) and os.path.samefile(spelled, work)
+    with pytest.raises(ValueError, match="Lord's folder.*inside writable root"):
+        m.validate_tests_layout(spelled, [], {'TMPDIR': str(tmp_path / 'temp')})
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='macOS filesystem spellings')
+@pytest.mark.parametrize('spelling', ['long_s', 'nfd'])
+def test_tests_parameters_use_kernel_spelling_for_protected_paths(tmp_path, spelling):
+    m = load('lordd_tests_spelled_params')
+    work = tmp_path / 'work'; work.mkdir()
+    home = tmp_path / 'storage-café'; home.mkdir()
+    (home / 'control.header').write_text('decoy')
+    metadata = home / 'metadata'; metadata.mkdir()
+    spelled = str(home).replace('storage', 'ſtorage') if spelling == 'long_s' else unicodedata.normalize('NFD', str(home))
+    assert spelled != str(home) and os.path.samefile(spelled, home)
+    m.HOME = Path(spelled)
+    (work / '.git').symlink_to(m.HOME / 'metadata', target_is_directory=True)
+    _, params = m.tests_profile(str(work), [], {})
+    params = dict(value.removeprefix('-D').split('=', 1) for value in params)
+    assert params['LORD_HOME'] == str(home) and params['KEY'] == str(home / 'control.header')
+    assert str(metadata) in {value for name, value in params.items() if name.startswith('PROTECTED_')}
 
 
 def test_nested_symlink_component_rejects_two_level_link(tmp_path, monkeypatch):
