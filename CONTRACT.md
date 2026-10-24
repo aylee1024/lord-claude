@@ -118,9 +118,10 @@ waits undelivered, for up to `keep_undelivered_s` (a day).
   `[<agentPath>] <line>` (the helper's thread id in codex's older helper mode, which names no path) and to its read list, never to rows or events. `webSearch` lines name `action`'s query, queries,
   url or pattern; a search with none yet gets its row when it completes.
 - grok: `grok --sandbox <write_sandbox|readonly_sandbox> agent --always-approve stdio` per agent, defaults
-  `lord-workspace` (extends `workspace`: writes to cwd and temp folders) and `lord-readonly` (extends `read-only` with
+  `lord-workspace` (extends `workspace`: writes to cwd, temp folders and `~/.grok`) and `lord-readonly` (extends `read-only` with
   `restrict_network = false`, whose socket resolver refuses symlinked endpoints such as Docker Desktop's, and an explicit
-  deny of the container sockets and each symlink hop to them). Custom profiles only: grok refuses to start when one
+  deny of the container sockets and each symlink hop to them). Both deny `~/.grok/bin` and `~/.grok/downloads` (grok's own
+  program), resolved under `grok_home()` (`$GROK_HOME` or `~/.grok`). Custom profiles only: grok refuses to start when one
   cannot be applied, while a failed built-in profile runs unconfined with a warning. ACP `session/new|load` with the
   lord MCP server;
   `GROK_{CLAUDE,CURSOR}_{MCPS,HOOKS,SKILLS}_ENABLED=false` so grok does not import Claude Code's setup unless `tools`.

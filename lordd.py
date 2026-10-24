@@ -169,11 +169,12 @@ def grok_profiles():
     path = Path(os.path.realpath(link))
     if link.is_symlink() and not path.exists(): raise RuntimeError(f'{link} is a link to {path}, which does not exist')
     key = os.path.realpath(HOME / 'control.header')
+    programs = [os.path.realpath(grok_home() / name) for name in ('bin', 'downloads')]
     sockets = sorted({p for s in SOCKETS for p in link_chain(s)})
     listed = lambda paths: '[' + ', '.join(json.dumps(p) for p in paths) + ']'
     block = ('# lord: begin (written by the lord plugin; edits between these lines are replaced)\n'
-             f'[profiles.lord-workspace]\nextends = "workspace"\ndeny = {listed([key])}\n\n'
-             f'[profiles.lord-readonly]\nextends = "read-only"\nrestrict_network = false\ndeny = {listed([*sockets, key])}\n# lord: end\n')
+             f'[profiles.lord-workspace]\nextends = "workspace"\ndeny = {listed([key, *programs])}\n\n'
+             f'[profiles.lord-readonly]\nextends = "read-only"\nrestrict_network = false\ndeny = {listed([*sockets, key, *programs])}\n# lord: end\n')
     original = path.read_text() if path.exists() else ''
     kept = LORD_BLOCK.sub('', original).rstrip('\n')
     text = (kept + '\n\n' if kept else '') + block

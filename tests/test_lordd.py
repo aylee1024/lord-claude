@@ -1039,7 +1039,8 @@ def test_grok_runs_only_under_lord_custom_profiles_that_fail_closed(rig):
     profiles = tomllib.loads(sandbox.read_text())['profiles']
     assert profiles['mine'] == {'extends': 'strict'}
     key = str((rig.home / 'control.header').resolve())
-    assert profiles['lord-workspace'] == {'extends': 'workspace', 'deny': [key]}
+    programs = [str((sandbox.parent / name).resolve()) for name in ('bin', 'downloads')]
+    assert profiles['lord-workspace'] == {'extends': 'workspace', 'deny': [key, *programs]}
     assert profiles['lord-readonly']['extends'] == 'read-only' and profiles['lord-readonly']['restrict_network'] is False
     assert '/var/run/docker.sock' in profiles['lord-readonly']['deny'] and key in profiles['lord-readonly']['deny']
     first = sandbox.read_text()
@@ -1049,6 +1050,39 @@ def test_grok_runs_only_under_lord_custom_profiles_that_fail_closed(rig):
     sandbox.write_text(first.rstrip('\n'))
     rig.open('grok', agent='y')
     assert sandbox.read_text() == first
+
+
+@pytest.mark.parametrize('linked_home', [False, True])
+def test_grok_profiles_deny_program_folders(tmp_path, linked_home):
+    import tomllib
+    home = tmp_path / 'grok-home'
+    if linked_home:
+        real = tmp_path / 'real-grok-home'; real.mkdir()
+        home.symlink_to(real, target_is_directory=True)
+    m = load('lordd_grok_program_folders')
+    m.grok_profiles()
+    profiles = tomllib.loads((home / 'sandbox.toml').read_text())['profiles']
+    for name in ('lord-workspace', 'lord-readonly'):
+        for folder in ('bin', 'downloads'):
+            assert str((home / folder).resolve()) in profiles[name]['deny']
+
+
+def test_grok_program_denials_preserve_user_profiles(rig):
+    import tomllib
+    sandbox = rig.home / 'grok/sandbox.toml'
+    sandbox.parent.mkdir()
+    before = '# user profile\n[profiles.mine]\nextends = "strict"\n\n'
+    after = '\n# another user profile\n[profiles.other]\nextends = "workspace"\nread_only = ["/data"]\n'
+    sandbox.write_text(before + '# lord: begin\n[profiles.lord-workspace]\nextends = "workspace"\n# lord: end\n' + after)
+    rig.open('grok')
+    text = sandbox.read_text()
+    assert text[:text.index('# lord: begin')] == before + after + '\n'
+    profiles = tomllib.loads(text)['profiles']
+    assert profiles['mine'] == {'extends': 'strict'}
+    assert profiles['other'] == {'extends': 'workspace', 'read_only': ['/data']}
+    for name in ('lord-workspace', 'lord-readonly'):
+        for folder in ('bin', 'downloads'):
+            assert str((sandbox.parent / folder).resolve()) in profiles[name]['deny']
 
 
 def test_a_sandbox_file_that_cannot_take_the_profiles_is_refused_unchanged(rig):
