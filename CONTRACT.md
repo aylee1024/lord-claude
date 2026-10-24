@@ -118,10 +118,16 @@ waits undelivered, for up to `keep_undelivered_s` (a day).
   `[<agentPath>] <line>` (the helper's thread id in codex's older helper mode, which names no path) and to its read list, never to rows or events. `webSearch` lines name `action`'s query, queries,
   url or pattern; a search with none yet gets its row when it completes.
 - grok: `grok --sandbox <write_sandbox|readonly_sandbox> agent --always-approve stdio` per agent, defaults
-  `lord-workspace` (extends `workspace`: writes to cwd, temp folders and `~/.grok`) and `lord-readonly` (extends `read-only` with
-  `restrict_network = false`, whose socket resolver refuses symlinked endpoints such as Docker Desktop's, and an explicit
-  deny of the container sockets and each symlink hop to them). Both deny `~/.grok/bin` and `~/.grok/downloads` (grok's own
-  program), resolved under `grok_home()` (`$GROK_HOME` or `~/.grok`). Custom profiles only: grok refuses to start when one
+  `lord-workspace` and `lord-readonly`. Both extend `strict` with `read_only = ["/"]` and `restrict_network = false`:
+  reads everywhere, writes to the process's starting folder, temp folders and `~/.grok/sessions` (plus
+  `~/.grok/daemon/run/<profile>` when its daemon backend is used), under `grok_home()` (`$GROK_HOME` or `~/.grok`).
+  A writable process starts in the agent's folder; a read-only one starts in `grok_home()/sessions`, so `strict` grants
+  it no project writes. ACP gets the agent's actual folder for both new and resumed sessions. `lord-readonly` explicitly
+  denies the container sockets and each symlink hop to them, since `restrict_network`'s socket resolver refuses
+  symlinked endpoints such as Docker Desktop's. Both deny Lord's control key. Grok's other folders stay read-only:
+  Lord's grok agents cannot save grok memory or use grok's own git worktrees. Lord uses neither; Claude Code supplies
+  worktree paths through `SubagentStart`, so its worktree isolation still works.
+  Custom profiles only: grok refuses to start when one
   cannot be applied, while a failed built-in profile runs unconfined with a warning. ACP `session/new|load` with the
   lord MCP server;
   `GROK_{CLAUDE,CURSOR}_{MCPS,HOOKS,SKILLS}_ENABLED=false` so grok does not import Claude Code's setup unless `tools`.

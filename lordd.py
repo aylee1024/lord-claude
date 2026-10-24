@@ -160,21 +160,20 @@ LORD_BLOCK = re.compile(r'^# lord: begin[^\n]*\n.*?^# lord: end[^\n]*(?:\n|\Z)',
 
 def grok_profiles():
     # grok runs unconfined, with only a warning, when a built-in profile fails to apply, but refuses to start
-    # when a custom profile fails. Lord therefore runs grok only under its own custom profiles. lord-readonly
-    # drops restrict_network, whose socket resolver refuses symlinked endpoints (Docker Desktop's
-    # /var/run/docker.sock), and denies the sockets explicitly instead. Neither profile can read Lord's control
+    # when a custom profile fails. Lord therefore runs grok only under its own custom profiles. Both drop
+    # restrict_network, whose socket resolver refuses symlinked endpoints (Docker Desktop's
+    # /var/run/docker.sock); lord-readonly denies the sockets explicitly instead. Neither profile can read Lord's control
     # key, without which a grok agent cannot ask the daemon for a less confined agent.
     import tomllib
     link = grok_home() / 'sandbox.toml'
     path = Path(os.path.realpath(link))
     if link.is_symlink() and not path.exists(): raise RuntimeError(f'{link} is a link to {path}, which does not exist')
     key = os.path.realpath(HOME / 'control.header')
-    programs = [os.path.realpath(grok_home() / name) for name in ('bin', 'downloads')]
     sockets = sorted({p for s in SOCKETS for p in link_chain(s)})
     listed = lambda paths: '[' + ', '.join(json.dumps(p) for p in paths) + ']'
     block = ('# lord: begin (written by the lord plugin; edits between these lines are replaced)\n'
-             f'[profiles.lord-workspace]\nextends = "workspace"\ndeny = {listed([key, *programs])}\n\n'
-             f'[profiles.lord-readonly]\nextends = "read-only"\nrestrict_network = false\ndeny = {listed([*sockets, key, *programs])}\n# lord: end\n')
+             f'[profiles.lord-workspace]\nextends = "strict"\nread_only = ["/"]\nrestrict_network = false\ndeny = {listed([key])}\n\n'
+             f'[profiles.lord-readonly]\nextends = "strict"\nread_only = ["/"]\nrestrict_network = false\ndeny = {listed([*sockets, key])}\n# lord: end\n')
     original = path.read_text() if path.exists() else ''
     kept = LORD_BLOCK.sub('', original).rstrip('\n')
     text = (kept + '\n\n' if kept else '') + block
@@ -739,12 +738,17 @@ class Vendor:
                 env['CODEX_HOME'] = home
                 # codex would keep its thread database in this folder instead, which may be the user's.
                 env.pop('CODEX_SQLITE_HOME', None)
+            cwd = self.agent.cwd if self.agent else HOME
+            if self.family == 'grok' and self.readonly:
+                # strict grants writes to the process's starting folder; ACP supplies the agent's folder separately.
+                cwd = grok_home() / 'sessions'
+                cwd.mkdir(parents=True, exist_ok=True)
             try:
                 if self.d.stopping: raise RuntimeError('Daemon stopping')
                 if self.family == 'gpt' and self.agent and self.agent.record.get('tests'):
                     await self.start_exec(command[len(nice):-1], env, nice)
                 self.process = await asyncio.create_subprocess_exec(*command,
-                    cwd=self.agent.cwd if self.agent else HOME, start_new_session=True, env=env,
+                    cwd=cwd, start_new_session=True, env=env,
                     stdin=-1, stdout=-1, stderr=-1, limit=LIMIT)
                 if self.stopping:
                     await kill_tree(self.process)
@@ -1331,9 +1335,9 @@ class Daemon:
                 raise ValueError('@readonly and @nosandbox contradict each other; an agent is one or the other')
             if family == 'gpt' and readonly and (body.get('net') or bool(a and a.record.get('net'))):
                 raise ValueError("@readonly with @net is not read-only for gpt: with network on, codex can reach local services, Lord's included; use lord:grok for a read-only agent with network")
-            # grok's read-only base profile leaves the temp folders and grok's own folder writable.
+            # grok's profile leaves the temp folders and session storage writable.
             if body.get('readonly') and family == 'grok' and inside(canon(a.cwd if a else cwd), (*TEMP_ROOTS, canon(str(grok_home())))):
-                raise ValueError("grok's read-only profile leaves temp folders and ~/.grok writable; pin a read-only grok outside /tmp, /var/tmp, /var/folders and ~/.grok")
+                raise ValueError("grok's read-only profile leaves temp folders and session storage writable; pin a read-only grok outside /tmp, /var/tmp, /var/folders and ~/.grok")
             # An agent with a turn running or a result not yet handed over still opens: /turn delivers that result first,
             # and the turn's start then refuses the new message.
             if not (a and (a.state in ('running', 'waiting_tool') or a.undelivered())):

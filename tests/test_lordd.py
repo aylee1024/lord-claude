@@ -1039,9 +1039,9 @@ def test_grok_runs_only_under_lord_custom_profiles_that_fail_closed(rig):
     profiles = tomllib.loads(sandbox.read_text())['profiles']
     assert profiles['mine'] == {'extends': 'strict'}
     key = str((rig.home / 'control.header').resolve())
-    programs = [str((sandbox.parent / name).resolve()) for name in ('bin', 'downloads')]
-    assert profiles['lord-workspace'] == {'extends': 'workspace', 'deny': [key, *programs]}
-    assert profiles['lord-readonly']['extends'] == 'read-only' and profiles['lord-readonly']['restrict_network'] is False
+    assert profiles['lord-workspace'] == {'extends': 'strict', 'read_only': ['/'], 'restrict_network': False, 'deny': [key]}
+    assert profiles['lord-readonly']['extends'] == 'strict' and profiles['lord-readonly']['restrict_network'] is False
+    assert profiles['lord-readonly']['read_only'] == ['/'] and 'read_write' not in profiles['lord-readonly']
     assert '/var/run/docker.sock' in profiles['lord-readonly']['deny'] and key in profiles['lord-readonly']['deny']
     first = sandbox.read_text()
     rig.open('grok', agent='x')
@@ -1053,21 +1053,25 @@ def test_grok_runs_only_under_lord_custom_profiles_that_fail_closed(rig):
 
 
 @pytest.mark.parametrize('linked_home', [False, True])
-def test_grok_profiles_deny_program_folders(tmp_path, linked_home):
+def test_grok_profiles_confine_grok_state(tmp_path, linked_home):
     import tomllib
     home = tmp_path / 'grok-home'
     if linked_home:
         real = tmp_path / 'real-grok-home'; real.mkdir()
         home.symlink_to(real, target_is_directory=True)
-    m = load('lordd_grok_program_folders')
+    m = load('lordd_grok_state')
     m.grok_profiles()
     profiles = tomllib.loads((home / 'sandbox.toml').read_text())['profiles']
-    for name in ('lord-workspace', 'lord-readonly'):
-        for folder in ('bin', 'downloads'):
-            assert str((home / folder).resolve()) in profiles[name]['deny']
+    key = str((m.HOME / 'control.header').resolve())
+    assert profiles['lord-workspace'] == {'extends': 'strict', 'read_only': ['/'], 'restrict_network': False, 'deny': [key]}
+    readonly = profiles['lord-readonly']
+    assert {k: v for k, v in readonly.items() if k != 'deny'} == {'extends': 'strict', 'read_only': ['/'], 'restrict_network': False}
+    assert key in readonly['deny']
+    for socket_path in m.SOCKETS:
+        assert socket_path in readonly['deny'] and os.path.realpath(socket_path) in readonly['deny']
 
 
-def test_grok_program_denials_preserve_user_profiles(rig):
+def test_grok_strict_profiles_preserve_user_profiles(rig):
     import tomllib
     sandbox = rig.home / 'grok/sandbox.toml'
     sandbox.parent.mkdir()
@@ -1081,8 +1085,23 @@ def test_grok_program_denials_preserve_user_profiles(rig):
     assert profiles['mine'] == {'extends': 'strict'}
     assert profiles['other'] == {'extends': 'workspace', 'read_only': ['/data']}
     for name in ('lord-workspace', 'lord-readonly'):
-        for folder in ('bin', 'downloads'):
-            assert str((sandbox.parent / folder).resolve()) in profiles[name]['deny']
+        assert profiles[name]['extends'] == 'strict' and profiles[name]['read_only'] == ['/']
+        assert 'read_write' not in profiles[name]
+
+
+@pytest.mark.parametrize('readonly_first', [False, True])
+def test_readonly_grok_confines_starting_folder_to_sessions(rig, readonly_first):
+    if not readonly_first: rig.open('grok')
+    opened = rig.open('grok', readonly=True)
+    assert opened['cwd'] == str(rig.home.resolve())
+    assert rig.turn('remember-this')[-1]['type'] == 'done'
+    rig.request('/close', {'agentId': 'a'})
+    assert rig.open('grok')['vendorSession'] == opened['vendorSession']
+    assert rig.turn('REMEMBER')[-1]['text'] == 'remember-this'
+    launches = [e for e in rig.audit() if e.get('launch') and 'test-readonly' in e['argv']]
+    assert len(launches) == 2 and all(e['cwd'] == str((rig.home / 'grok/sessions').resolve()) for e in launches)
+    sessions = [e['params'] for e in rig.audit() if e.get('method') in ('session/new', 'session/load')]
+    assert all(e['cwd'] == str(rig.home.resolve()) for e in sessions)
 
 
 def test_a_sandbox_file_that_cannot_take_the_profiles_is_refused_unchanged(rig):
