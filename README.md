@@ -65,7 +65,7 @@ gpt permissions measured on macOS with codex 0.164.0 (default `workspace-write`,
 
 Where each agent can write: gpt in its folder, `@dir` folders and temp folders (anywhere with `@nosandbox`); grok in its folder, temp folders and `~/.grok/sessions` (plus `~/.grok/daemon/run/<profile>` when its daemon backend is used); gemini anywhere, because agy has no sandbox. Lord's grok agents cannot save grok memory or use grok's own git worktrees. Lord depends on neither: Claude Code supplies worktree folders, so its worktree isolation still works. A sandbox limits one agent, not the agents it starts, so use `@readonly` when an agent must not change anything. A read-only agent cannot start or message other agents.
 
-In all gpt modes, Lord starts codex and codex starts git and other programs by name from the Claude Code session's `PATH`, outside the sandbox; this predates 2.2.1. Start Claude Code with no folders on `PATH` that an agent can write, such as an activated project virtual environment, since a sandboxed command can replace a program there that later runs unconfined.
+Lord starts codex, grok and agy by name from the Claude Code session's `PATH`, and in all gpt modes codex starts git and other programs the same way, outside the sandbox; this predates 2.2.1. Start Claude Code with no folders on `PATH` that an agent can write, such as an activated project virtual environment or a gpt or grok agent's working folder, since a sandboxed command can replace a program there that later runs unconfined.
 
 Launch Lord agents without a `name`: a named launch would start a separate Claude process instead of the vendor, so Lord refuses it. Message an agent by the id its launch returns; it keeps its working folder across messages.
 

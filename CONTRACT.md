@@ -152,7 +152,7 @@ waits undelivered, for up to `keep_undelivered_s` (a day).
 
 For every gpt sandbox mode (`workspace-write`, `read-only` and `@tests`), MCP servers and hooks from a trusted project's `.codex/config.toml` run in codex's own process, outside the sandbox, even without `@tools`. Lord turns off only MCP servers named in the user's own config.
 
-In all gpt modes, Lord starts codex and codex starts git and other programs by name from the Claude Code session's `PATH`, outside the sandbox; this predates 2.2.1. Start Claude Code with no folders on `PATH` that an agent can write, such as an activated project virtual environment, since a sandboxed command can replace a program there that later runs unconfined.
+Lord starts codex, grok and agy by name from the Claude Code session's `PATH`, and in all gpt modes codex starts git and other programs the same way, outside the sandbox; this predates 2.2.1. Start Claude Code with no folders on `PATH` that an agent can write, such as an activated project virtual environment or a gpt or grok agent's working folder, since a sandboxed command can replace a program there that later runs unconfined.
 
 Each such vendor owns two process trees: its normal, unconfined app-server (account connection and Lord MCP), and a sandboxed exec-server (commands and edits, including codex helpers). Start sequence:
 
