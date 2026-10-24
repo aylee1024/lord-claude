@@ -101,6 +101,25 @@ async def turn(sid, text, request_id=None):
               'error': {'message': 'unexpected status 401 Unauthorized: Missing bearer or basic authentication in header'}}})
         send({'method': 'turn/completed', 'params': {'threadId': sid, 'turn': {'id': tid, 'status': 'failed'}}})
         return
+    if text in ('CYBER', 'BUSY', 'BUSY_EDIT', 'ERRFIRST', 'SPENT') and FAMILY == 'gpt':
+        # A failed turn as codex classifies it (codexErrorInfo); BUSY and BUSY_EDIT fail as "at capacity", BUSY_EDIT
+        # after a file edit; ERRFIRST sends the error before the turn's completion, which then carries none.
+        if text in ('CYBER', 'BUSY_EDIT'):
+            item = {'type': 'fileChange', 'id': 'e1', 'changes': [{'path': 'a.txt', 'kind': 'add', 'diff': '+x'}]} if text == 'BUSY_EDIT' else \
+                   {'type': 'commandExecution', 'id': 'c1', 'command': '/bin/zsh -lc "cat probe.py"', 'commandActions': [{'type': 'read', 'command': 'cat probe.py', 'name': 'probe.py', 'path': 'probe.py'}], 'cwd': session['cwd']}
+            send({'method': 'item/completed', 'params': {'threadId': sid, 'item': {**item, 'aggregatedOutput': '', 'exitCode': 0}}})
+        if text == 'SPENT':
+            send({'method': 'account/rateLimits/updated', 'params': {'rateLimits': {'limitId': 'codex', 'primary': {'usedPercent': 100, 'windowDurationMins': 10080, 'resetsAt': int(__import__('time').time()) + 86400}, 'secondary': None}}})
+        kind = {'CYBER': 'cyberPolicy', 'BUSY': 'serverOverloaded', 'BUSY_EDIT': 'serverOverloaded', 'ERRFIRST': 'usageLimitExceeded', 'SPENT': 'usageLimitExceeded'}[text]
+        message = {'cyberPolicy': 'This content was flagged for possible cybersecurity risk', 'serverOverloaded': 'Selected model is at capacity'}.get(kind, 'You have hit your usage limit')
+        error = {'message': message, 'codexErrorInfo': kind}
+        if text == 'ERRFIRST':
+            error = {'message': 'stream ended', 'codexErrorInfo': {'responseStreamDisconnected': {'httpStatusCode': None}}}
+            send({'method': 'error', 'params': {'threadId': sid, 'turnId': tid, 'willRetry': False, 'error': error}})
+        send({'method': 'turn/completed', 'params': {'threadId': sid, 'turn': {'id': tid, 'status': 'failed', **({} if text == 'ERRFIRST' else {'error': error})}}})
+        return
+    if text.startswith('Continue with the task above') and FAMILY == 'gpt':
+        text = 'RECOVERED'
     if text == 'FAIL' and FAMILY == 'gpt':
         # codex fails every later turn of a process whose settings reload failed.
         send({'method': 'turn/completed', 'params': {'threadId': sid, 'turn': {'id': tid, 'status': 'failed',
@@ -206,6 +225,26 @@ async def turn(sid, text, request_id=None):
             answer = json.dumps(await asyncio.gather(mcp(session['server'], name, args), mcp(session['server'], name, args)))
         else:
             answer = json.dumps(await mcp(session['server'], name, args))
+    elif text in ('HELPER', 'SEARCH') and FAMILY == 'gpt':
+        if text == 'SEARCH':
+            # codex names a web search's query only when it is done.
+            send({'method': 'item/started', 'params': {'threadId': sid, 'item': {'type': 'webSearch', 'id': 'w1', 'query': ''}}})
+            send({'method': 'item/completed', 'params': {'threadId': sid, 'item': {'type': 'webSearch', 'id': 'w1', 'query': '', 'action': {'type': 'search', 'query': 'lord claude'}}}})
+        else:
+            # A codex helper agent: its parent reports it starting, then its own steps arrive under its own thread.
+            child = 'child-' + sid[:8]
+            started = {'type': 'subAgentActivity', 'id': 'h1', 'kind': 'started', 'agentThreadId': child, 'agentPath': '/root/check', 'model': 'gpt-6-luna', 'reasoningEffort': 'low'}
+            send({'method': 'item/started', 'params': {'threadId': sid, 'item': started}})
+            send({'method': 'item/completed', 'params': {'threadId': sid, 'item': started}})
+            for item in ({'type': 'commandExecution', 'id': 'k1', 'command': '/bin/zsh -lc "cat notes.md"', 'cwd': '/w', 'commandActions': [{'type': 'read', 'command': 'cat notes.md', 'name': 'notes.md', 'path': 'notes.md'}], 'aggregatedOutput': 'x', 'exitCode': 0},
+                         {'type': 'fileChange', 'id': 'k2', 'changes': [{'path': '/w/out.txt', 'kind': 'add', 'diff': '+y'}]}):
+                send({'method': 'item/started', 'params': {'threadId': child, 'item': item}})
+                send({'method': 'item/completed', 'params': {'threadId': child, 'item': item}})
+            send({'method': 'turn/completed', 'params': {'threadId': child, 'turn': {'id': 'ct', 'status': 'completed'}}})
+        answer = text
+    elif text == 'WAIT1':
+        await asyncio.sleep(1)
+        answer = 'first'
     elif text == 'REMEMBER':
         answer = session.get('memory', 'missing')
     else:
@@ -323,7 +362,7 @@ async def handle(value):
 
 async def main():
     global AGY_SESSION
-    audit(launch=True, argv=sys.argv[3:], path=os.environ.get('PATH', ''), grok_env={k: v for k, v in os.environ.items() if k.startswith('GROK_')}, env={k: v for k, v in os.environ.items() if 'must-not-reach' in v}, codex_home=os.environ.get('CODEX_HOME'), sqlite_home=os.environ.get('CODEX_SQLITE_HOME'))
+    audit(launch=True, argv=sys.argv[3:], path=os.environ.get('PATH', ''), grok_env={k: v for k, v in os.environ.items() if k.startswith('GROK_')}, env={k: v for k, v in os.environ.items() if 'must-not-reach' in v}, codex_home=os.environ.get('CODEX_HOME'), sqlite_home=os.environ.get('CODEX_SQLITE_HOME'), nice=os.getpriority(os.PRIO_PROCESS, 0), cwd=os.getcwd())
     print('fixture Bearer fake-bearer-value', file=sys.stderr, flush=True)
     if FAMILY == 'gemini' and (DATA / 'start-quota-late').exists():
         # The same, with agy's stdout closed before its stderr line arrives.

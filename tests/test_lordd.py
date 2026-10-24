@@ -1330,7 +1330,7 @@ def test_an_earlier_codex_turn_completing_before_the_new_turn_id_is_ignored():
     async def main():
         a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6.1-sol', 'vendorSession': 's'})
         a.turn_id = 'old'
-        d = object.__new__(m.Daemon); d.quota = {}; d.agents = {'a': a}; d.redact = str; d.save = lambda a: None
+        d = object.__new__(m.Daemon); d.quota = {}; d.agents = {'a': a}; d.redact = str; d.save = lambda a: None; d.config = {'gpt': {}}
         d.effort, d.attach = AsyncMock(), AsyncMock()
         d.task = lambda coroutine: coroutine.close()
         await d.begin_locked(a, {'text': 'new'})
@@ -1454,7 +1454,7 @@ def test_an_interrupt_while_a_turn_is_starting_stops_it_and_leaves_nothing():
     from unittest.mock import AsyncMock
     async def main():
         a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6.1-sol', 'vendorSession': 's'})
-        d = object.__new__(m.Daemon); d.quota = {}; d.agents = {'a': a}; d.redact = str; d.save = lambda a: None
+        d = object.__new__(m.Daemon); d.quota = {}; d.agents = {'a': a}; d.redact = str; d.save = lambda a: None; d.config = {'gpt': {}}
         async def slow_attach(a): await asyncio.sleep(.1)
         d.effort, d.attach = AsyncMock(), slow_attach
         d.backend = lambda a: None
@@ -2010,3 +2010,171 @@ def test_prune_removes_the_earlier_log_generation_too(rig):
     (rig.home / 'logs' / 'a.log.1').write_text('older\n')
     assert rig.request('/prune', {'days': 0})['pruned'] == ['a']
     assert not (rig.home / 'logs' / 'a.log.1').exists()
+
+
+def test_codex_without_tools_lists_no_skills_and_a_read_only_agent_starts_no_helpers(rig):
+    rig.open('gpt', readonly=True)
+    config = [e['params'] for e in rig.audit() if e.get('method') == 'thread/start'][-1]['config']
+    assert config['skills'] == {'include_instructions': False, 'bundled': {'enabled': False}}
+    assert config['features'] == {'multi_agent': False}
+    rig.open('gpt', agent='b', tools=True)
+    config = [e['params'] for e in rig.audit() if e.get('method') == 'thread/start'][-1]['config']
+    assert 'skills' not in config and 'features' not in config
+
+
+def test_helper_agent_steps_reach_the_parents_log_and_record_but_never_its_rows(rig):
+    rig.open('gpt')
+    events = rig.turn('HELPER')
+    assert events[-1]['type'] == 'done'
+    # A helper's steps are not rows: nothing of them enters the Claude-side transcript.
+    assert not any(e['type'] == 'row' and 'notes.md' in e.get('title', '') for e in events)
+    log = (rig.home / 'logs/a.log').read_text()
+    assert '[/root/check] $ /bin/zsh -lc "cat notes.md"' in log and '[/root/check] edit /w/out.txt' in log
+    assert 'helper started /root/check gpt-6-luna low' in log
+    reads = (rig.home / 'logs/a.reads.txt').read_text().splitlines()
+    assert reads == ['read /w/notes.md (/root/check)', 'edit /w/out.txt (/root/check)']
+    record = json.loads((rig.home / 'logs/a.json').read_text())
+    assert record['helpers'][0]['path'] == '/root/check' and record['helpers'][0]['model'] == 'gpt-6-luna' and record['helpers'][0]['commands'] == 1
+    assert record['turns'][-1]['helpers'] == [record['helpers'][0]['thread']]
+    assert events[-1]['record']['helpers'] == ['gpt-6-luna']
+
+
+def test_a_search_line_names_what_was_searched(rig):
+    rig.open('gpt')
+    events = rig.turn('SEARCH')
+    assert [e['text'] for e in events if e['type'] == 'activity' and e['text'].startswith('search')] == ['search lord claude']
+    assert 'search lord claude' in (rig.home / 'logs/a.log').read_text()
+
+
+def test_a_vendor_refusal_is_reported_as_refused_and_resumable(rig):
+    rig.open('gpt')
+    failed = rig.turn('CYBER')[-1]
+    assert failed['type'] == 'error' and failed['message'].startswith('refused by vendor (cyberPolicy): This content was flagged')
+    assert 'send a reworded message to resume it' in failed['message'] and 'cat probe.py' in failed['message']
+    assert failed['record']['ended_how'] == 'error (cyberPolicy)'
+    # The session is intact: the next turn runs in the same codex process.
+    assert rig.turn('PING')[-1]['text'] == 'PONG'
+    assert len([e for e in rig.audit() if e.get('launch')]) == 1
+    assert (rig.home / 'logs/a.reads.txt').read_text() == f'read {rig.home}/probe.py\n'
+
+
+def test_at_capacity_before_any_edit_retries_the_same_session(rig):
+    config = json.loads(rig.config.read_text())
+    rig.stop(); rig.config.write_text(json.dumps({**config, 'capacity_retry_s': .1})); rig.start()
+    rig.open('gpt')
+    done = rig.turn('BUSY')[-1]
+    assert done['type'] == 'done' and done['text'] == 'RECOVERED' and done['record']['retries'] == 1
+    assert 'vendor at capacity (Selected model is at capacity); retry 1' in (rig.home / 'logs/a.log').read_text()
+    starts = [e['params'] for e in rig.audit() if e.get('method') == 'turn/start']
+    assert len({s['threadId'] for s in starts}) == 1 and starts[-1]['input'][0]['text'].startswith('Continue with the task above')
+    # After an edit the turn is not repeated.
+    failed = rig.turn('BUSY_EDIT')[-1]
+    assert failed['type'] == 'error' and failed['record']['ended_how'] == 'error (serverOverloaded)' and failed['record']['retries'] == 0
+
+
+def test_an_error_sent_before_the_turns_completion_keeps_its_kind_and_restarts_codex(rig):
+    rig.open('gpt')
+    failed = rig.turn('ERRFIRST')[-1]
+    assert failed['type'] == 'error' and failed['message'] == 'stream ended' and failed['record']['ended_how'] == 'error (responseStreamDisconnected)'
+    rig.turn('PING')
+    assert len([e for e in rig.audit() if e.get('launch')]) == 2
+
+
+def test_a_spent_codex_allowance_is_shown_and_refused_until_its_reset(rig):
+    rig.open('gpt')
+    failed = rig.turn('SPENT')[-1]
+    assert failed['type'] == 'error' and failed['record']['ended_how'] == 'error (usageLimitExceeded)'
+    allowance = rig.request('/allowance')
+    reset = allowance['gpt']['primary']['resetsAt']
+    assert allowance['gpt']['primary'] == {'usedPercent': 100, 'windowDurationMins': 10080, 'resetsAt': reset} and allowance['gpt']['seen']
+    assert allowance['refused'][0]['family'] == 'gpt' and allowance['refused'][0]['until'] == time.strftime('%Y-%m-%dT%H:%M:%S+00:00', time.gmtime(reset))
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'b', 'family': 'gpt', 'cwd': str(rig.home)})
+    try: assert status == 400 and 'gpt quota reached' in json.loads(file.read())['error']
+    finally: file.close(); conn.close()
+
+
+def test_each_turn_has_a_record_a_kept_answer_and_a_footer_and_prune_removes_them(rig):
+    opened = rig.open('gpt', session='caller-1')
+    first = rig.turn('PING')[-1]
+    record = first['record']
+    assert record['ended_how'] == 'done' and record['model'] == opened['model'] and record['session'] == opened['vendorSession']
+    assert record['started'] <= record['ended'] and record['commands'] == 0
+    rig.turn('second answer')
+    document = json.loads((rig.home / 'logs/a.json').read_text())
+    assert document['lordVersion'] and document['session'] == 'caller-1' and document['sandbox'] == 'workspace-write'
+    assert [t['turn'] for t in document['turns']] == [1, 2] and document['turns'][0]['usage']['input_tokens'] == 10
+    assert (rig.home / 'logs/a.answers/1.md').read_text() == 'PONG' and (rig.home / 'logs/a.answers/2.md').read_text() == 'second answer'
+    assert {p.name for p in (rig.home / 'logs').iterdir()} == {'a.log', 'a.answer.md', 'a.json', 'a.answers'}
+    rig.stop()
+    rows = [{**json.loads(line), 'used': '2020-01-01T00:00:00+00:00'} for line in (rig.home / 'journal.jsonl').read_text().splitlines()]
+    (rig.home / 'journal.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
+    rig.start()
+    # The daemon prunes as it starts; this prune finds nothing left.
+    rig.request('/prune', {'days': 14})
+    assert rig.request('/agents') == [] and list((rig.home / 'logs').iterdir()) == []
+
+
+def test_open_and_every_turn_state_the_effective_settings_with_their_defaults(rig):
+    opened = rig.open('gpt', dirs=[str(rig.home)], wall_s=900)
+    assert opened['memory_gb'] == 12.0 and opened['wall_s'] == 900 and opened['hang_s'] is None and opened['nice'] == 0
+    assert opened['dirs'] == [str(rig.home.resolve())] and opened['sandbox'] == 'workspace-write' and opened['network'] is False
+    assert opened['line'].startswith(f'cwd {rig.home.resolve()} · dirs {rig.home.resolve()} · sandbox workspace-write · network off · tools off · nice 0 · memory 12.0 GB')
+    rig.turn('PING')
+    line = next(l for l in (rig.home / 'logs/a.log').read_text().splitlines() if ' turn: ' in l)
+    assert line.endswith(f"turn: gpt {opened['model']} effort {opened['effort']} · {opened['line']}")
+
+
+def test_nice_starts_the_vendor_at_that_niceness_and_a_change_restarts_it(rig):
+    rig.open('gpt', nice=10)
+    rig.turn('PING')
+    launches = [e for e in rig.audit() if e.get('launch')]
+    assert launches[-1]['nice'] == 10
+    assert rig.open('gpt', nice=10) and len([e for e in rig.audit() if e.get('launch')]) == 1
+    rig.open('gpt', nice=5)
+    assert [e for e in rig.audit() if e.get('launch')][-1]['nice'] == 5
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home), 'nice': 20})
+    try: assert status == 400 and '0 to 19' in json.loads(file.read())['error']
+    finally: file.close(); conn.close()
+
+
+def test_a_message_to_a_running_agent_is_logged_and_one_codex_cannot_take_is_queued_as_the_next_turn(rig):
+    rig.open('grok')
+    stream = rig.stream('/turn', {'agentId': 'a', 'text': 'SLOW'})
+    assert next(stream)['type'] == 'activity'
+    assert rig.request('/steer', {'agentId': 'a', 'text': 'too early'})['steered'] is False
+    assert rig.request('/queue', {'agentId': 'a', 'text': 'PING'})['queued'] is True
+    rig.request('/interrupt', {'agentId': 'a'})
+    events = list(stream)
+    assert events[-1]['type'] == 'error'
+    log = (rig.home / 'logs/a.log').read_text()
+    assert 'message queued for the next turn: PING' in log
+    rig.open('gpt', agent='g')
+    stream = rig.stream('/turn', {'agentId': 'g', 'text': 'SLOW'})
+    assert next(stream)['type'] == 'activity'
+    assert rig.request('/steer', {'agentId': 'g', 'text': 'steered words'})['steered'] is True
+    assert list(stream)[-1]['text'] == 'steered words'
+    assert 'message injected into the running turn: steered words' in (rig.home / 'logs/g.log').read_text()
+
+
+def test_a_queued_message_runs_as_the_next_turn_and_the_answer_carries_both(rig):
+    rig.open('grok')
+    stream = rig.stream('/turn', {'agentId': 'a', 'text': 'WAIT1'})
+    assert next(stream)['type'] == 'activity'
+    assert rig.request('/queue', {'agentId': 'a', 'text': 'PING'})['queued'] is True
+    done = list(stream)[-1]
+    assert done['type'] == 'done' and done['record']['ended_how'] == 'done'
+    assert done['text'] == 'Result of the task, before the message sent while it ran:\nfirst\n\nReply to the new message:\nPONG'
+    assert [e['params']['prompt'][0]['text'] for e in rig.audit() if e.get('method') == 'session/prompt'] == ['WAIT1', 'PING']
+    assert rig.request('/queue', {'agentId': 'a', 'text': 'late'})['queued'] is False
+
+
+def test_a_refused_open_names_the_folder_and_is_logged(rig):
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'x', 'family': 'gpt', 'cwd': str(rig.home), 'dirs': [str(rig.home), '/no/such/dir']})
+    try: assert status == 400 and json.loads(file.read())['error'] == '@dir /no/such/dir is not an existing directory'
+    finally: file.close(); conn.close()
+    assert 'x: open refused: @dir /no/such/dir is not an existing directory' in (rig.home / 'lordd.log').read_text()
+
+
+def test_the_daemon_and_its_vendors_helpers_run_from_lords_own_folder(rig):
+    out = subprocess.run(['/usr/sbin/lsof', '-a', '-p', str(rig.proc.pid), '-d', 'cwd', '-Fn'], capture_output=True, text=True).stdout
+    assert f'n{rig.home.resolve()}' in out.splitlines() or f'n{rig.home}' in out.splitlines()

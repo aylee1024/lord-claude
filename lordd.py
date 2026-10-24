@@ -215,15 +215,72 @@ async def run_quick(argv, timeout=20):
         return None, f'{argv[0]} did not answer within {timeout} s'
     return process.returncode, (out + err).decode('utf8', 'replace')
 
+def searched(item):
+    # What a web search looked for: codex fills `query` only once the search is done, and names a page it opened or
+    # searched in `action`.
+    action = item.get('action') if isinstance(item.get('action'), dict) else {}
+    return item.get('query') or action.get('query') or ' '.join(map(str, action.get('queries') or [])) or \
+        ' '.join(str(action[k]) for k in ('url', 'pattern') if action.get(k))
+
 def codex_activity(item):
     # One line per action that touches the machine; messages and reasoning are not activity.
     kind = item.get('type')
     if kind == 'commandExecution': return '$ ' + str(item.get('command'))
     if kind == 'fileChange': return 'edit ' + ', '.join(str(c.get('path')) for c in item.get('changes', []))
     if kind == 'mcpToolCall': return f"tool {item.get('server')}.{item.get('tool')} {dumps(item.get('arguments'))[:300]}"
-    if kind == 'webSearch': return 'search ' + str(item.get('query'))
+    if kind == 'webSearch': return 'search ' + searched(item)
+    if kind == 'subAgentActivity':
+        return f"helper {item.get('kind')} {item.get('agentPath')} {item.get('model') or ''} {item.get('reasoningEffort') or ''}".rstrip()
+    if kind == 'collabAgentToolCall': return f"helpers {item.get('tool')} {' '.join(item.get('receiverThreadIds') or [])}".rstrip()
     if kind in ('userMessage', 'agentMessage', 'reasoning', None): return None
     return str(kind)
+
+def codex_reads(item):
+    # (kind, path) of each file a codex step read, listed, searched or edited, as codex itself parsed the command.
+    if item.get('type') == 'fileChange': return [('edit', str(c.get('path'))) for c in item.get('changes', []) if isinstance(c, dict) and c.get('path')]
+    if item.get('type') != 'commandExecution': return []
+    found = []
+    for action in item.get('commandActions') or []:
+        if isinstance(action, dict) and action.get('type') in ('read', 'listFiles', 'search') and action.get('path'):
+            path = str(action['path'])
+            if not path.startswith('/') and item.get('cwd'): path = os.path.normpath(os.path.join(str(item['cwd']), path))
+            found.append(({'listFiles': 'list'}.get(action['type'], action['type']), path))
+    return found
+
+def error_kind(error):
+    # codex's classification of a failed turn (codexErrorInfo): a word, or an object keyed by one.
+    info = error.get('codexErrorInfo') if isinstance(error, dict) else None
+    return info if isinstance(info, str) else next(iter(info), None) if isinstance(info, dict) and info else None
+
+def transcript_path(family, session, cwd, folder):
+    # Where the vendor keeps this session's own transcript, when it is there; folder is the vendor's own folder.
+    if not session or not folder or not re.fullmatch(r'[A-Za-z0-9_.-]+', session): return None
+    folder = Path(folder)
+    if family == 'gpt':
+        found = sorted(folder.glob(f'sessions/*/*/*/rollout-*-{session}.jsonl'))
+        return str(found[-1]) if found else None
+    path = folder / 'sessions' / quote(cwd, safe='') / session if family == 'grok' else folder / 'antigravity-cli/conversations' / f'{session}.db'
+    return str(path) if path.exists() else None
+
+def settings_line(s):
+    # The effective settings as one log line and one line of the plugin's launch notice.
+    return ' · '.join([f"cwd {s['cwd']}", f"dirs {', '.join(s['dirs']) or 'none'}", f"sandbox {s['sandbox']}",
+                       f"network {'on' if s['network'] else 'off'}", f"tools {'on' if s['tools'] else 'off'}", f"nice {s['nice']}",
+                       f"memory {s['memory_gb']} GB", f"hang {s['hang_s'] or 'none'}{' s' if s['hang_s'] else ''}",
+                       f"wall {s['wall_s'] or 'none'}{' s' if s['wall_s'] else ''}"])
+
+def helper_seen(a, item):
+    # A codex helper agent starting, from its parent's (or a helper's) subAgentActivity item: its later events arrive
+    # under its own thread id.
+    thread = item.get('agentThreadId') if item.get('type') == 'subAgentActivity' else None
+    if not thread or thread == a.vendorSession: return
+    known = a.helpers.setdefault(thread, {'thread': thread, 'path': str(item.get('agentPath') or thread), 'model': None, 'effort': None,
+                                          'started': datetime.now(timezone.utc).isoformat(timespec='seconds'), 'commands': 0})
+    known['model'] = known['model'] or item.get('model')
+    known['effort'] = known['effort'] or item.get('reasoningEffort')
+
+# codex's error kinds where the vendor declined the content: the session is intact and a reworded message resumes it.
+REFUSALS = ('cyberPolicy', 'misalignmentPolicyViolation')
 
 def codex_step(item):
     # (kind, title, log line) of a codex tool item. A command's title is the command as the model wrote it, without
@@ -375,12 +432,34 @@ class Agent:
         self.cancel_requested, self.turn_task = False, None
         self.followup, self.earlier, self.carry, self.call_data, self.ended_turns = None, None, [], {}, set()
         self.earlier_done = False
+        # This turn's commands, retries after "at capacity", and whether it edited a file; and codex's error for it.
+        self.commands, self.retries, self.edited, self.last_command, self.turn_error, self.retry_task = 0, 0, False, None, None, None
         self.final_text, self.restart, self.token = '', False, uuid.uuid4().hex
         self.default_model, self.agy_step = False, None
         # Each vendor tool step's result, by step id, for the plugin's row of it (/row).
         self.rows = {}
         self.log_path = HOME / 'logs' / f"{record['agentId']}.log"
         self.answer_path = self.log_path.with_suffix('.answer.md')
+        # Beside the log, and removed with it by pruning: the turn record, each turn's answer, the files it read.
+        self.record_path, self.answers_path = self.log_path.with_suffix('.json'), self.log_path.with_suffix('.answers')
+        self.reads_path, self.reads = self.log_path.with_suffix('.reads.txt'), None
+        # codex helper threads this agent started: thread id -> {path, model, effort}.
+        self.helpers = {}
+
+    def files(self):
+        return [self.log_path, self.log_path.with_suffix('.log.1'), self.answer_path, self.record_path, self.reads_path]
+
+    def read_paths(self, found, helper=None):
+        # Each path once, in the order first seen, so a reviewer can show what the agent and its helpers read.
+        if not found: return
+        if self.reads is None:
+            try: self.reads = set(self.reads_path.read_text(encoding='utf-8').splitlines())
+            except OSError: self.reads = set()
+        lines = [line for line in (f'{kind} {path}' + (f' ({helper})' if helper else '') for kind, path in found) if line not in self.reads]
+        if not lines: return
+        self.reads.update(lines)
+        self.reads_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with self.reads_path.open('a', encoding='utf-8') as file: file.write(''.join(REDACT(line)[:2000] + '\n' for line in lines))
 
     def note(self, text):
         # The agent's activity log: what the vendor ran and read, for review provenance.
@@ -405,6 +484,42 @@ class Agent:
         if len(text) > ROW_OUTPUT: text = f'[{len(text) - ROW_OUTPUT} earlier characters not shown]\n{text[-ROW_OUTPUT:]}'
         future.set_result({'output': text, 'stopped': stopped})
 
+    def turn_record(self, kind, value):
+        # The turn as a program reads it: logs/<agentId>.json (the settings and every turn, the last 100 with their
+        # answers in <agentId>.answers/), and the plugin's one-line footer on the answer.
+        ended = datetime.now(timezone.utc).isoformat(timespec='seconds')
+        how = 'done' if kind == 'done' else 'interrupted' if value.get('message') == 'interrupted' else f"error ({value.get('cause') or 'vendor'})"
+        settings = getattr(self, 'settings', None) or {}
+        transcript = transcript_path(self.family, self.vendorSession, self.cwd, settings.get('codex_folder'))
+        try: turns = json.loads(self.record_path.read_text(encoding='utf-8')).get('turns', [])
+        except (OSError, ValueError, AttributeError): turns = []
+        number = (turns[-1].get('turn', len(turns)) if turns else 0) + 1
+        answer = self.answers_path / f'{number}.md'
+        text = value.get('text') if kind == 'done' else 'lord: error: ' + str(value.get('message'))
+        started = getattr(self, 'turn_started', None) or ended
+        mine = [h for h in self.helpers.values() if h['started'] >= started]
+        turn = {'turn': number, 'started': started, 'ended': ended, 'ended_how': how,
+                'commands': getattr(self, 'commands', 0), 'retries': getattr(self, 'retries', 0),
+                'helpers': [h['thread'] for h in mine],
+                **({'usage': value.get('usage')} if kind == 'done' else {'error': str(value.get('message'))}),
+                **({'answer': str(answer)} if text and text.strip() else {})}
+        document = {'agentId': self.agentId, 'family': self.family, 'lordVersion': VERSION, 'session': self.record.get('session'),
+                    **{k: v for k, v in settings.items() if k != 'codex_folder'}, 'vendorSession': self.vendorSession,
+                    'transcript': transcript, 'helpers': list(self.helpers.values()), 'turns': [*turns, turn][-100:]}
+        try:
+            if text and text.strip():
+                self.answers_path.mkdir(parents=True, exist_ok=True, mode=0o700)
+                answer.write_text(REDACT(text), encoding='utf-8')
+                stale = self.answers_path / f'{number - 100}.md'
+                stale.unlink(missing_ok=True)
+            scratch = self.record_path.with_name(self.record_path.name + '.tmp')
+            scratch.write_text(dumps(document) + '\n', encoding='utf-8')
+            scratch.replace(self.record_path)
+        except OSError: pass
+        helpers = [h.get('model') or '?' for h in mine]
+        return {'ended_how': how, 'model': self.model, 'effort': self.effort, 'started': turn['started'], 'ended': ended,
+                'commands': turn['commands'], 'retries': turn['retries'], 'helpers': helpers, 'session': self.vendorSession}
+
     def undelivered(self):
         return bool(self.carry) or not self.events.empty()
 
@@ -418,6 +533,7 @@ class Agent:
             value['message'] = sign_in_hint(self.family, value['message'])
             self.note('error: ' + str(value['message']))
         if kind in ('done', 'error'):
+            value['record'] = self.turn_record(kind, value)
             self.state, self.activity = 'idle', ''
             self.finished.set()
             for future in self.calls.values():
@@ -460,6 +576,9 @@ class Vendor:
             # A missing program leaves nothing behind: no grok profiles, no agy entry.
             if not shutil.which(command[0], path=subscription_env().get('PATH')):
                 raise RuntimeError(f'{command[0]} was not found; {INSTALL[self.family]}')
+            # @nice: the vendor starts at that niceness and every command it runs inherits it; a sandboxed command
+            # cannot lower its own priority.
+            if self.agent and self.agent.record.get('nice'): command = ['/usr/bin/nice', '-n', str(self.agent.record['nice']), *command]
             if self.family == 'gpt': command += ['app-server']
             elif self.family == 'grok':
                 # Seatbelt applies to the whole grok process, so read-only sessions get their own process.
@@ -622,8 +741,14 @@ class Vendor:
                     response = payload.get('response') if isinstance(payload.get('response'), str) else ''
                     a.emit('done', text=a.answer if a.answer.strip() else response or a.answer, usage=usage(payload.get('usage', {})), model=a.model)
             return
+        if method == 'account/rateLimits/updated':
+            self.d.allowance(p.get('rateLimits'))
+            return
         sid = p.get('threadId') or p.get('sessionId')
         a = next((a for a in self.d.agents.values() if a.family == self.family and a.vendorSession == sid), None)
+        if a is None and self.agent and sid in self.agent.helpers:
+            self.helper_event(self.agent, self.agent.helpers[sid], method, p)
+            return
         if not a or a.state not in ('running', 'waiting_tool'): return
         if self.family == 'grok':
             update = p.get('update', {})
@@ -646,8 +771,12 @@ class Vendor:
         elif method == 'item/completed' and codex_activity(p['item']):
             item = p['item']
             rid = item.get('id') or uuid.uuid4().hex
+            helper_seen(a, item)
             a.row(rid, *codex_step(item))
             a.row_done(rid, codex_output(item))
+            a.read_paths(codex_reads(item))
+            if item.get('type') == 'commandExecution': a.commands, a.last_command = a.commands + 1, str(item.get('command'))[:300]
+            if item.get('type') == 'fileChange': a.edited = True
         elif method == 'item/completed' and p['item'].get('type') == 'agentMessage':
             item = p['item']
             seen = a.items.get(item['id'], '')
@@ -657,7 +786,9 @@ class Vendor:
         elif method == 'item/started' and codex_activity(p['item']):
             # A message before a tool action is narration; the answer is the agent message after the last action.
             a.final_text = ''
-            a.row(p['item'].get('id') or uuid.uuid4().hex, *codex_step(p['item']))
+            helper_seen(a, p['item'])
+            # A search names what it looks for only when done; its row then starts and ends at once.
+            if p['item'].get('type') != 'webSearch' or searched(p['item']): a.row(p['item'].get('id') or uuid.uuid4().hex, *codex_step(p['item']))
         elif method == 'thread/tokenUsage/updated':
             a.total = p['tokenUsage']['total']
             a.tokens = usage({k: max(0, v - a.base.get(k, 0)) for k, v in a.total.items() if isinstance(v, int)})
@@ -669,13 +800,52 @@ class Vendor:
                 tokens = {**a.tokens, 'input_tokens': max(0, a.tokens['input_tokens'] - a.tokens['cache_read_input_tokens'])}
                 self.d.record_usage(a, tokens)
                 a.emit('done', text=a.final_text, usage=tokens, model=a.model)
-            else:
-                # A codex process can fail every later turn (a settings reload that failed), so the next turn
-                # gets a new process that resumes the thread.
-                if not a.cancel_requested and turn['status'] != 'interrupted': a.restart = True
-                a.emit('error', message=self.d.redact('interrupted' if a.cancel_requested else said(turn.get('error')) or turn['status']), retryable=not a.cancel_requested and turn['status'] != 'interrupted')
-        elif method == 'error' and not p.get('willRetry', False): a.emit('error', message=self.d.redact(said(p.get('error', p))), retryable=True)
+            elif a.cancel_requested or turn['status'] == 'interrupted':
+                a.emit('error', message='interrupted' if a.cancel_requested else str(said(turn.get('error')) or 'interrupted'), retryable=False)
+            else: self.failed(a, turn.get('error') or a.turn_error or {}, turn['status'], turn.get('id'))
+        elif method == 'error' and not p.get('willRetry', False):
+            if p.get('turnId') and p['turnId'] == a.turn_id:
+                # codex follows a turn's error with that turn's completion, which ends the turn; if none comes, the
+                # error ends it.
+                a.turn_error = p.get('error') or {}
+                self.d.task(self.unfinished(a, p['turnId']))
+            else: a.emit('error', message=self.d.redact(said(p.get('error', p))), retryable=True, cause=error_kind(p.get('error')))
         elif method == 'model/rerouted': a.model = p['toModel']
+
+    def failed(self, a, error, status, turn_id):
+        # A codex turn that failed, by codex's own kind for it (codexErrorInfo).
+        kind, message = error_kind(error), str(said(error) or status)
+        if kind == 'serverOverloaded' and not a.edited and a.retries < self.d.config.get('capacity_retries', 2):
+            # The model was at capacity before the turn changed anything: the same session tries again after a wait.
+            a.retries += 1
+            delay = self.d.config.get('capacity_retry_s', 30)
+            a.ended_turns.add(turn_id)
+            a.turn_id, a.turn_error = None, None
+            a.note(f'vendor at capacity ({message}); retry {a.retries} in {delay} s on the same session')
+            a.retry_task = self.d.task(self.d.retry(a, delay))
+            return
+        if kind in REFUSALS:
+            message = f"refused by vendor ({kind}): {message}. The session is intact: send a reworded message to resume it" + \
+                      (f'. Last completed command: {a.last_command}' if a.last_command else '')
+        elif kind == 'usageLimitExceeded': self.d.gpt_quota(a, message)
+        # A codex process can fail every later turn (a settings reload that failed), so after any other failure the
+        # next turn gets a new process that resumes the thread.
+        elif kind not in ('rateLimitExceeded', 'serverOverloaded'): a.restart = True
+        a.emit('error', message=self.d.redact(message), retryable=True, cause=kind)
+
+    async def unfinished(self, a, turn_id):
+        await asyncio.sleep(5)
+        if a.state in ('running', 'waiting_tool') and a.turn_id == turn_id: self.failed(a, a.turn_error or {}, 'failed', turn_id)
+
+    def helper_event(self, a, helper, method, p):
+        # A codex helper's steps go to its parent's log and read list only: no row, so nothing reaches a model.
+        item = p.get('item') or {}
+        if method == 'item/started': helper_seen(a, item)
+        if method != 'item/completed' or not (line := codex_activity(item)): return
+        helper_seen(a, item)
+        a.note(f"[{helper['path']}] {line}")
+        a.read_paths(codex_reads(item), helper['path'])
+        if item.get('type') == 'commandExecution': helper['commands'] = helper.get('commands', 0) + 1
 
     async def close(self):
         self.stopping, self.ready = True, False
@@ -835,6 +1005,11 @@ class Daemon:
                 lean = {'mcp_servers': {name: {'enabled': False} for name in user.get('mcp_servers', {}) if name != 'lord'},
                         'plugins': {name: {'enabled': False} for name in user.get('plugins', {})}}
                 if user.get('notify'): lean['notify'] = []
+                # Skills come from more places than the plugins listed in config.toml (a remote plugin cache, the
+                # skills folder); with these off, codex lists none and each request is about 3,700 tokens shorter.
+                if not a.record.get('tools'): lean['skills'] = {'include_instructions': False, 'bundled': {'enabled': False}}
+                # A read-only agent starts no codex helper agents.
+                if a.record.get('readonly'): lean['features'] = {'multi_agent': False}
                 params = {'cwd': a.cwd, 'model': a.model, 'approvalPolicy': 'never',
                           # @nosandbox: codex runs commands unconfined, as Claude Code's own agents do without its sandbox.
                           'sandbox': 'read-only' if a.record.get('readonly') else 'danger-full-access' if a.record.get('nosandbox') else 'workspace-write',
@@ -988,11 +1163,13 @@ class Daemon:
         for key in ('memory_gb', 'hang_s', 'wall_s'):
             if body.get(key) is not None and (not isinstance(body[key], (int, float)) or body[key] < 0 or (key == 'memory_gb' and body[key] == 0)):
                 raise ValueError(f'invalid {key}')
-        if any(not Path(x).expanduser().is_absolute() for x in body.get('dirs') or []): raise ValueError('every @dir must be an absolute path')
+        if body.get('nice') is not None and (isinstance(body['nice'], bool) or not isinstance(body['nice'], int) or not 0 <= body['nice'] <= 19):
+            raise ValueError('@nice must be a whole number from 0 to 19')
+        if relative := [x for x in body.get('dirs') or [] if not Path(x).expanduser().is_absolute()]: raise ValueError(f'@dir {relative[0]} is not an absolute path')
         dirs = [str(Path(x).expanduser().resolve()) for x in body.get('dirs') or []]
         if any(inside(canon(str(Path.home())), (canon(x),)) or (sys.platform == 'darwin' and inside('/System/Volumes/Data', (x,))) for x in dirs):
             raise ValueError('refusing / or a folder holding your home folder as an @dir')
-        if any(not Path(x).is_dir() for x in dirs): raise ValueError('every @dir must be an existing directory')
+        if missing := [x for x in dirs if not Path(x).is_dir()]: raise ValueError(f'@dir {missing[0]} is not an existing directory')
         for key in ('readonly', 'net', 'nosandbox'):
             if body.get(key) and not a.record.get(key):
                 # A sandbox change needs a new process (grok) or a reattached thread (codex).
@@ -1001,6 +1178,11 @@ class Daemon:
         # Per-agent overrides of the guards and of the lean vendor setup; any later /open may change them.
         for key in ('memory_gb', 'hang_s', 'wall_s'):
             if body.get(key) is not None: a.record[key] = body[key]
+        if body.get('nice') is not None and body['nice'] != a.record.get('nice', 0):
+            # Niceness is set when the vendor starts, so a change needs a new process; the session resumes in it.
+            a.record['nice'] = body['nice']
+            a.restart = True
+        if isinstance(body.get('session'), str) and body['session']: a.record['session'] = body['session']
         if body.get('tools') and not a.record.get('tools'):
             # The user's tool servers load at process start, so the agent gets a new process and resumes.
             a.record['tools'] = True
@@ -1025,7 +1207,8 @@ class Daemon:
         a.default_model = False
         # An opened agent counts as used, so pruning cannot take it before its turn starts.
         self.save(a)
-        return {'vendorSession': a.vendorSession, 'model': a.model, 'effort': a.effort}
+        settings = self.settings(a)
+        return {'vendorSession': a.vendorSession, **{k: v for k, v in settings.items() if k != 'codex_folder'}, 'line': settings_line(settings)}
 
     def known_models(self, a):
         vendor = self.backend(a)
@@ -1083,9 +1266,56 @@ class Daemon:
         a.base, a.tokens, a.turn_id = dict(a.total), usage({}), None
         a.finished.clear()
         a.dispatched, a.agy_step, a.rows = False, None, {}
-        a.note(f'turn: {a.family} {a.model} effort {a.effort}')
+        a.commands, a.retries, a.edited, a.last_command, a.turn_error, a.turn_body = 0, 0, False, None, None, body
+        a.turn_started = datetime.now(timezone.utc).isoformat(timespec='seconds')
+        a.settings = self.settings(a)
+        a.note(f'turn: {a.family} {a.model} effort {a.effort} · {settings_line(a.settings)}')
         self.save(a)
         a.turn_task = self.task(self.run_turn(a, body))
+
+    def settings(self, a):
+        # What the agent runs with this turn, the defaults included: the limits a guard stops it at, and its sandbox.
+        r, family = a.record, a.family
+        ceiling = r['memory_gb'] * 1048576 if r.get('memory_gb') else self.config.get('memory_ceiling_kb', 12 * 1024 * 1024)
+        hang = r['hang_s'] if r.get('hang_s') is not None else self.config[family].get('no_progress_s', 0)
+        folder = (Path(r['codexHome']) if r.get('codexHome') else self.user_codex_home) if family == 'gpt' else \
+            grok_home() if family == 'grok' else self.vendor_home / '.gemini'
+        return {'model': a.model, 'effort': a.effort, 'cwd': a.cwd, 'dirs': r.get('dirs', []),
+                'sandbox': 'read-only' if r.get('readonly') else 'none' if r.get('nosandbox') or family == 'gemini' else 'workspace-write',
+                'network': bool(r.get('net')) if family == 'gpt' else True, 'tools': bool(r.get('tools')), 'nice': r.get('nice', 0),
+                'memory_gb': round(ceiling / 1048576, 1), 'hang_s': hang or None, 'wall_s': r.get('wall_s') or None,
+                **({'codexHome': str(folder)} if family == 'gpt' else {}), 'codex_folder': str(folder)}
+
+    async def retry(self, a, delay):
+        # A turn that met "at capacity" before changing anything, sent again on the same session after a wait. The
+        # session already holds the task, so the retry asks it to go on rather than sending the task twice.
+        await asyncio.sleep(delay)
+        if a.cancel_requested or a.state not in ('running', 'waiting_tool'): return
+        self.backend(a).last = time.monotonic()
+        await self.run_turn(a, {**a.turn_body, 'text': 'Continue with the task above: the last attempt stopped because the model was at capacity.'})
+
+    def allowance(self, snapshot):
+        # codex's account limits as it last reported them (it sends them unasked during turns), merged as codex says:
+        # an update carries only what changed. Kept in allowance.json, one file every daemon replaces.
+        if not isinstance(snapshot, dict): return
+        try: found = json.loads((HOME / 'allowance.json').read_text(encoding='utf-8'))
+        except (OSError, ValueError): found = {}
+        gpt = {**(found.get('gpt') or {}), **{k: v for k, v in snapshot.items() if v is not None}, 'seen': datetime.now(timezone.utc).isoformat(timespec='seconds')}
+        try:
+            scratch = HOME / f'allowance.json.{os.getpid()}'
+            scratch.write_text(dumps({**found, 'gpt': gpt}), encoding='utf-8')
+            scratch.replace(HOME / 'allowance.json')
+        except OSError as error: self.log(f'allowance.json not written: {error}')
+
+    def gpt_quota(self, a, message):
+        # A spent codex allowance is refused until the window that ran out resets, as codex last reported it.
+        try: gpt = json.loads((HOME / 'allowance.json').read_text(encoding='utf-8')).get('gpt') or {}
+        except (OSError, ValueError): gpt = {}
+        resets = [w.get('resetsAt') for w in (gpt.get('primary'), gpt.get('secondary')) if isinstance(w, dict)
+                  and isinstance(w.get('resetsAt'), (int, float)) and (w.get('usedPercent') or 0) >= 100]
+        if not resets: return a.note('usage limit reached; codex named no reset time, so new turns are not refused')
+        reset = max(resets)
+        self.save_quota(('gpt', a.model), (reset / 1000 if reset > 1e12 else reset, message))
 
     async def run_turn(self, a, body):
         v = self.backend(a)
@@ -1148,6 +1378,10 @@ class Daemon:
             for future in list(a.calls.values()):
                 if not future.done(): future.set_result({'content': [{'type': 'text', 'text': 'interrupted'}], 'isError': True})
             started = a.family == 'gpt' and a.turn_id
+            if a.retry_task and not a.retry_task.done():
+                # Waiting to retry after "at capacity": no vendor turn is running.
+                a.retry_task.cancel()
+                a.emit('error', message='interrupted', retryable=False)
             if a.family == 'gpt':
                 # Before dispatch run_turn sees cancel_requested and ends the turn itself.
                 if a.turn_id: await v.rpc('turn/interrupt', {'threadId': a.vendorSession, 'turnId': a.turn_id})
@@ -1173,9 +1407,22 @@ class Daemon:
 
     def listed(self):
         self.refresh()
+        now = time.monotonic()
+        def quiet(a):
+            # Seconds since the vendor last reported anything, while its process runs.
+            v = self.vendors.get(a.agentId)
+            return round(now - v.last) if v and v.process and v.process.returncode is None and a.state in ('running', 'waiting_tool') else None
         return [{**{k: getattr(a, k) for k in ('agentId', 'family', 'model', 'effort', 'state', 'activity', 'cwd')},
                  'log': str(a.log_path), 'answer': str(a.answer_path) if a.answer_path.exists() else None,
-                 'usage': a.record.get('usage')} for a in self.agents.values()]
+                 'usage': a.record.get('usage'), 'quiet_s': quiet(a)} for a in self.agents.values()]
+
+    def allowances(self):
+        # Each vendor's allowance as last reported: codex's windows, and the quota resets Lord refuses turns until.
+        try: gpt = json.loads((HOME / 'allowance.json').read_text(encoding='utf-8')).get('gpt')
+        except (OSError, ValueError): gpt = None
+        self.load_quota()
+        return {'gpt': gpt, 'refused': [{'family': f, 'model': m, 'until': datetime.fromtimestamp(q[0], timezone.utc).isoformat(timespec='seconds'), 'reason': q[1]}
+                                        for (f, m), q in self.quota.items() if q[0] > time.time()]}
 
     async def mcp_call(self, a, name, args, token):
         if token != a.token: raise ValueError('lord tool call from an unknown process')
@@ -1212,8 +1459,14 @@ class Daemon:
         if method == 'GET':
             if path == '/health': return {'ok': True, 'pid': os.getpid(), 'version': VERSION}
             if path == '/agents': return self.listed()
+            if path == '/allowance': return self.allowances()
         elif method == 'POST':
-            if path == '/open': return await self.open(body)
+            if path == '/open':
+                # A refused launch leaves no agent log, so its reason is kept in lordd.log.
+                try: return await self.open(body)
+                except ValueError as error:
+                    self.log(f"{body.get('agentId')}: open refused: {error}")
+                    raise
             if path == '/prune': return await self.prune(body.get('days', self.config['prune_days']))
             a = self.agents[body['agentId']]
             if path == '/tool_result':
@@ -1234,7 +1487,16 @@ class Daemon:
                 if steered:
                     await self.backend(a).rpc('turn/steer', {'threadId': a.vendorSession, 'expectedTurnId': a.turn_id,
                         'input': [{'type': 'text', 'text': body['text']}]})
+                    a.note('message injected into the running turn: ' + body['text'])
                 return {'ok': True, 'steered': steered}
+            elif path == '/queue':
+                # A message for a running agent whose vendor takes none mid-turn: it becomes the next turn, started as
+                # soon as this one ends, and the answer delivered carries both results.
+                if a.state not in ('running', 'waiting_tool'): return {'ok': True, 'queued': False}
+                text = body['text'] if not a.followup else a.followup['text'] + '\n\n' + body['text']
+                a.followup = {**(a.followup or {'agentId': a.agentId}), 'text': text, 'queued': True}
+                a.note('message queued for the next turn: ' + body['text'])
+                return {'ok': True, 'queued': True}
             elif path in ('/interrupt', '/close'):
                 await self.interrupt(a)
                 if path == '/close':
@@ -1270,7 +1532,8 @@ class Daemon:
                     # A turn whose client went away keeps running; its result is delivered first and this
                     # text becomes the next turn in the same stream.
                     if a.state in ('running', 'waiting_tool') or a.undelivered():
-                        a.followup = body
+                        # A message queued while the turn ran goes first; this one follows it in the same turn.
+                        a.followup = {**body, 'text': a.followup['text'] + '\n\n' + body['text'], 'queued': True} if a.followup and a.followup.get('queued') else body
                         # The earlier turn's steps and narration stay unshown: only its result and any tool call it
                         # is waiting on carry over into the new turn.
                         a.carry[:] = [e for e in a.carry if e['type'] not in ('row', 'text', 'activity')]
@@ -1308,15 +1571,17 @@ class Daemon:
                                 body, a.followup = a.followup, None
                                 a.earlier = event['text'] if event['type'] == 'done' else 'It failed: ' + event['message']
                                 a.earlier_done = event['type'] == 'done'
+                                a.earlier_queued = bool(body.get('queued'))
                                 try:
                                     await self.begin_locked(a, body)
                                     continue
                                 except Exception as error: event = {'type': 'error', 'message': self.redact(error), 'retryable': False}
                             if event['type'] in ('done', 'error') and a.earlier:
-                                earlier = f'Result of the earlier task, which finished while Claude Code was disconnected:\n{a.earlier}\n\n'
+                                earlier = (f'Result of the task, before the message sent while it ran:\n{a.earlier}\n\n' if getattr(a, 'earlier_queued', False)
+                                           else f'Result of the earlier task, which finished while Claude Code was disconnected:\n{a.earlier}\n\n')
                                 # An earlier answer stays an answer, whole, when only the new message failed.
                                 event = ({**event, 'text': f'{earlier}Reply to the new message:\n{event["text"]}'} if event['type'] == 'done'
-                                         else {'type': 'done', 'text': f'{earlier}The new message failed: {event["message"]}', 'model': a.model, 'failed': True} if a.earlier_done
+                                         else {'type': 'done', 'text': f'{earlier}The new message failed: {event["message"]}', 'model': a.model, 'failed': True, 'record': event.get('record')} if a.earlier_done
                                          else {**event, 'message': f'{earlier}The new message failed: {event["message"]}'})
                                 a.earlier = None
                             if event['type'] == 'row' and not rows: event = {'type': 'activity', 'text': event['text']}
@@ -1438,9 +1703,8 @@ class Daemon:
                     a.state = previous
                     raise
                 removed.append(aid)
-                a.log_path.unlink(missing_ok=True)
-                a.log_path.with_suffix('.log.1').unlink(missing_ok=True)
-                a.answer_path.unlink(missing_ok=True)
+                for path in a.files(): path.unlink(missing_ok=True)
+                shutil.rmtree(a.answers_path, ignore_errors=True)
                 del self.agents[aid]
                 self.open_locks.pop(aid, None)
         self.pruned.update(removed)
@@ -1598,6 +1862,9 @@ def main():
     parser.add_argument('--days', type=float)
     args = parser.parse_args()
     os.umask(0o077)
+    # A neutral working folder: never the agent's tree, which a worktree's removal must find unused.
+    HOME.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chdir(HOME)
     if args.mcp is not None:
         asyncio.run(mcp(args.mcp))
         return
