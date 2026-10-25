@@ -25,7 +25,7 @@ answer becomes the agent's reply. No Claude tokens are spent on these turns.
 visible `lord: error` line), `lordd.py`, `config.json` (defaults; `~/.claude/lord/config.json` is merged over it per
 family), `tests/`, `sandbox/` (the two upstream Seatbelt policies, their `NOTICE` and Apache-2.0 license, and Lord's `tests.sbpl` and `grok.sbpl`), `README.md`, `PRIVACY.md`, `LICENSE`.
 Runtime files only in `~/.claude/lord/`: `lordd-<version>.sock` (600, folder 700) and `lordd-<version>.lock`, one pair per
-plugin version, since each version's plugin starts and talks to its own daemon (`LORD_DAEMON_SOCKET` overrides; daemons
+plugin version, since each version's plugin starts and talks to its own daemon (`LORD_DAEMON_SOCKET` overrides; keep an override outside folders a grok agent can write, which could delete it; daemons
 before 2.0.18 used `lordd.sock` and `lordd.lock`); `journal.jsonl` (one record per agent save: ids, vendor session, model,
 effort, cwd, options, last usage, created, used; never task text), shared by every daemon from 2.0.18: appends and
 rewrites hold `journal.lock`, and a rewrite keeps the newest record of each agent, from the file or the rewriting daemon's
