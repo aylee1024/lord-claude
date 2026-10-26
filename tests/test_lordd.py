@@ -2189,11 +2189,26 @@ def test_save_quota_keeps_a_reset_another_daemon_wrote_after_this_one_last_read(
     assert set(json.loads((tmp_path / 'quota.json').read_text())) == {'grok grok-4.7', 'gemini gemini-3.8-flash'}
 
 
-def test_every_gpt_agent_gets_live_web_search(rig):
+def test_every_gpt_agent_gets_live_web_search_on_start_and_resume(rig):
     # codex's search runs on OpenAI's side; unset, it is cached-only in every sandbox except none.
-    for agent, options in [('a', {}), ('b', {'readonly': True}), ('c', {'net': True}), ('d', {'tools': True})]:
-        rig.open('gpt', agent=agent, **options)
+    for agent, options in [('a', {}), ('b', {'readonly': True}), ('c', {'net': True}), ('d', {'tools': True}), ('e', {'nosandbox': True})]:
+        opened = rig.open('gpt', agent=agent, **options)
+        assert opened['web_search'] == 'live' and ' · web search live · ' in opened['line']
         assert [e['params'] for e in rig.audit() if e.get('method') == 'thread/start'][-1]['config']['web_search'] == 'live'
+    # codex keeps no web_search with a thread, so a resume that left it out would fall back to cached.
+    rig.turn('PING')
+    rig.open('gpt', nosandbox=True)
+    rig.turn('PING')
+    assert [e['params'] for e in rig.audit() if e.get('method') == 'thread/resume'][-1]['config']['web_search'] == 'live'
+
+
+@pytest.mark.parametrize('chosen', ['web_search = "disabled"', 'web_search = "cached"', '[features]\nweb_search_cached = true'])
+def test_a_web_search_mode_in_the_users_codex_config_wins(rig, chosen):
+    (rig.data / '.codex').mkdir(parents=True, exist_ok=True)
+    (rig.data / '.codex/config.toml').write_text(chosen + '\n')
+    opened = rig.open('gpt')
+    assert 'web_search' not in [e['params'] for e in rig.audit() if e.get('method') == 'thread/start'][-1]['config']
+    assert opened['web_search'] == 'per codex config' and ' · web search per codex config · ' in opened['line']
 
 
 def test_prune_removes_the_earlier_log_generation_too(rig):
@@ -2318,7 +2333,7 @@ def test_open_and_every_turn_state_the_effective_settings_with_their_defaults(ri
     # The niceness reported is the one the vendor runs at: the daemon's own, here the test's.
     assert opened['memory_gb'] == 12.0 and opened['wall_s'] == 900 and opened['hang_s'] is None and opened['nice'] == os.getpriority(os.PRIO_PROCESS, 0)
     assert opened['dirs'] == [str(rig.home.resolve())] and opened['sandbox'] == 'workspace-write' and opened['network'] is False
-    assert opened['line'].startswith(f"cwd {rig.home.resolve()} · dirs {rig.home.resolve()} · sandbox workspace-write · network off · tools off · nice {opened['nice']} · memory 12.0 GB")
+    assert opened['line'].startswith(f"cwd {rig.home.resolve()} · dirs {rig.home.resolve()} · sandbox workspace-write · network off · web search live · tools off · nice {opened['nice']} · memory 12.0 GB")
     rig.turn('PING')
     line = next(l for l in (rig.home / 'logs/a.log').read_text().splitlines() if ' turn: ' in l)
     assert line.endswith(f"turn: gpt {opened['model']} effort {opened['effort']} · {opened['line']}")
@@ -2848,6 +2863,7 @@ def test_tests_wiring_settings_environment_and_resume(tests_backend, rig):
             turn = next(e['params'] for e in audit if e.get('method') == 'turn/start')
             assert thread['environments'] == turn['environments'] == entries
             assert turn['sandboxPolicy'] == {'type': 'externalSandbox', 'networkAccess': 'restricted'}
+            assert thread['config']['web_search'] == 'live'
             assert turn['input'] == [{'type': 'text', 'text': 'PING'}]
             assert 'sandbox tests' in a.log_path.read_text()
             await v.close()
@@ -2855,6 +2871,7 @@ def test_tests_wiring_settings_environment_and_resume(tests_backend, rig):
             await d.attach(a)
             resumed = [e['params'] for e in rig.audit() if e.get('method') == 'thread/resume'][-1]
             assert resumed['environments'] == [{'environmentId': v.environment_id, 'cwd': a.cwd}]
+            assert resumed['config']['web_search'] == 'live'
             assert len([e for e in rig.audit() if e.get('exec_launch')]) == 2
             assert not list(d.journal.parent.rglob('*.sbpl'))
         finally: await d.close()

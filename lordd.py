@@ -69,6 +69,12 @@ def codex_config(folder):
         return tomllib.loads((folder / 'config.toml').read_text())
     except (OSError, ValueError): return {}
 
+def live_search(config):
+    # codex's web search runs on OpenAI's side, outside the sandbox. Unset, it searches only OpenAI's stored index in
+    # every sandbox but none, so Lord asks for live pages unless the user's config.toml picks a mode itself.
+    features = config.get('features')
+    return not ('web_search' in config or isinstance(features, dict) and ('web_search_cached' in features or 'web_search_request' in features))
+
 # What Lord's codex folder shares with the user's, as links: codex writes its login file in place and its settings
 # writer follows links, so both stay the user's own files. Threads and their database stay in Lord's folder, which
 # the Codex app, reading only the user's folder, does not list.
@@ -403,7 +409,7 @@ def allowance_buckets():
 def settings_line(s):
     # The effective settings as one log line and one line of the plugin's launch notice.
     return ' · '.join([f"cwd {s['cwd']}", f"dirs {', '.join(s['dirs']) or 'none'}", f"sandbox {s['sandbox']}",
-                       f"network {'on' if s['network'] else 'off'}", f"tools {'on' if s['tools'] else 'off'}", f"nice {s['nice']}",
+                       f"network {'on' if s['network'] else 'off'}", *([f"web search {s['web_search']}"] if 'web_search' in s else []), f"tools {'on' if s['tools'] else 'off'}", f"nice {s['nice']}",
                        f"memory {s['memory_gb']} GB", f"hang {s['hang_s'] or 'none'}{' s' if s['hang_s'] else ''}",
                        f"wall {s['wall_s'] or 'none'}{' s' if s['wall_s'] else ''}"])
 
@@ -1259,7 +1265,8 @@ class Daemon:
                 server.update(default_tools_approval_mode='approve', required=True, tool_timeout_sec=86400)
                 # The user's codex tool servers would start in every agent's process (about 0.5 GB each);
                 # agents get codex's own tools plus lord's, as the watchdog's --ignore-user-config runs did.
-                user = {} if a.record.get('tools') else codex_config(Path(a.record['codexHome']) if a.record.get('codexHome') else self.user_codex_home)
+                home = codex_config(Path(a.record['codexHome']) if a.record.get('codexHome') else self.user_codex_home)
+                user = {} if a.record.get('tools') else home
                 lean = {'mcp_servers': {name: {'enabled': False} for name in user.get('mcp_servers', {}) if name != 'lord'},
                         'plugins': {name: {'enabled': False} for name in user.get('plugins', {})}}
                 if user.get('notify'): lean['notify'] = []
@@ -1275,9 +1282,7 @@ class Daemon:
                 params = {'cwd': a.cwd, 'model': a.model, 'approvalPolicy': 'never',
                           # @nosandbox: codex runs commands unconfined, as Claude Code's own agents do without its sandbox.
                           'sandbox': 'read-only' if a.record.get('readonly') else 'danger-full-access' if a.record.get('nosandbox') else 'workspace-write',
-                          # codex's web search runs on OpenAI's side, outside the sandbox. Unset, it searches only
-                          # OpenAI's stored index in every sandbox but none; live fetches current pages.
-                          'config': {**lean, 'mcp_servers': {**lean['mcp_servers'], 'lord': server}, 'web_search': 'live',
+                          'config': {**lean, 'mcp_servers': {**lean['mcp_servers'], 'lord': server}, **({'web_search': 'live'} if live_search(home) else {}),
                                      'sandbox_workspace_write': {'network_access': bool(a.record.get('net')), 'writable_roots': a.record.get('dirs', [])}}}
                 if vendor.exec_process:
                     params.pop('sandbox')
@@ -1561,7 +1566,8 @@ class Daemon:
                 'network': bool(r.get('net') or r.get('nosandbox')) if family == 'gpt' else True, 'tools': bool(r.get('tools')),
                 'nice': max(r.get('nice', 0), os.getpriority(os.PRIO_PROCESS, 0)),
                 'memory_gb': round(ceiling / 1048576, 1), 'hang_s': hang or None, 'wall_s': r.get('wall_s') or None,
-                **({'codexHome': str(folder)} if family == 'gpt' else {}), 'codex_folder': str(folder)}
+                **({'codexHome': str(folder), 'web_search': 'live' if live_search(codex_config(folder)) else 'per codex config'} if family == 'gpt' else {}),
+                'codex_folder': str(folder)}
 
     async def retry(self, a, delay):
         # A turn that met "at capacity" before changing anything, sent again on the same session after a wait. The
