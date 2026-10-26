@@ -2189,6 +2189,13 @@ def test_save_quota_keeps_a_reset_another_daemon_wrote_after_this_one_last_read(
     assert set(json.loads((tmp_path / 'quota.json').read_text())) == {'grok grok-4.7', 'gemini gemini-3.8-flash'}
 
 
+def test_every_gpt_agent_gets_live_web_search(rig):
+    # codex's search runs on OpenAI's side; unset, it is cached-only in every sandbox except none.
+    for agent, options in [('a', {}), ('b', {'readonly': True}), ('c', {'net': True}), ('d', {'tools': True})]:
+        rig.open('gpt', agent=agent, **options)
+        assert [e['params'] for e in rig.audit() if e.get('method') == 'thread/start'][-1]['config']['web_search'] == 'live'
+
+
 def test_prune_removes_the_earlier_log_generation_too(rig):
     rig.open('gpt')
     rig.turn('PING')

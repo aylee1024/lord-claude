@@ -36,7 +36,7 @@ You can also put options on their own lines at the start of a task or message:
 | `@model <id>` | Use a different vendor model |
 | `@effort <level>` | Reasoning effort, `low` to `ultra`. The nearest level the model supports is used |
 | `@readonly` | Project files stay read-only: gpt writes nothing, grok still writes temp folders and shared session/runtime storage (gpt and grok only) |
-| `@net` | Turn on network for gpt; grok and gemini always have it |
+| `@net` | Turn on network for gpt's commands (its web search is always on); grok and gemini always have it |
 | `@tests` | gpt's test sandbox: loopback TCP, sysctl and psutil; writes confined. No direct internet; loopback reaches every local service, so a local proxy can pass traffic on. Not with `@readonly`, `@nosandbox`, `@net`, `@tools`. Refuses nested symlinks in working, `@dir`, temp or Lord-folder paths, and writable roots containing Lord's folder; use real paths and set TMPDIR to a real folder. For cwd and `@dir`, use the path without `/System/Volumes/Data` |
 | `@nosandbox` | Run gpt with no sandbox: it can run any command and write anywhere, as Claude Code's own agents can when its sandbox is off. For commands that need unrestricted access. Not with `@readonly` |
 | `@cwd <folder>` | The folder the agent works in |
@@ -60,6 +60,9 @@ gpt permissions measured on macOS with codex 0.164.0 (default `workspace-write`,
 | Write working folder and temp folder | Allowed | Allowed | Allowed |
 | Write outside those folders | Denied | Denied | Allowed |
 | Direct internet TCP and DNS | Denied | Denied | Allowed |
+| codex web search, current pages | Allowed | Allowed | Allowed |
+
+codex's web search runs at OpenAI, not on your Mac, so no sandbox setting blocks it, `@readonly` included. Lord sets it to live for every gpt agent; codex's default searches only OpenAI's stored copy of the web unless the sandbox is off. What the agent searches for or opens goes to OpenAI, which fetches the page.
 
 `@tests` loopback reaches every local TCP service on the machine. `/bin/ps` stays blocked because it is setuid; psutil works. Under `@tests`, every Unix socket bound to a path is denied to block control sockets in temp folders such as tmux's, which could let commands act outside the sandbox; `socketpair` and asyncio's internal pairs still work, as do `Pool` with spawn or fork and `ProcessPoolExecutor`, while `multiprocessing.Manager` and forkserver fail. Writes also cover `@dir` folders; `.git`, `.codex` and `.agents` at each writable project root stay read-only, including first-time creation, as in workspace-write. Launch and turn settings say `sandbox tests`.
 

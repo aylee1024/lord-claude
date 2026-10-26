@@ -107,7 +107,7 @@ waits undelivered, for up to `keep_undelivered_s` (a day).
 
 ## Vendor setup
 - codex: `codex app-server` per agent; `thread/start|resume` with cwd, `approvalPolicy: never`, sandbox
-  `workspace-write` (writable roots = cwd + `dirs`), `read-only`, or `danger-full-access` with `nosandbox` (network on), otherwise network per `net`, the lord MCP server, and the
+  `workspace-write` (writable roots = cwd + `dirs`), `read-only`, or `danger-full-access` with `nosandbox` (network on), otherwise network per `net`, `web_search: live` (codex's search runs at OpenAI; unset, it is cached-only in every sandbox but `danger-full-access`), the lord MCP server, and the
   user's codex MCP servers, codex plugins and notifier disabled unless `tools`; without `tools` also
   `skills: {include_instructions: false, bundled: {enabled: false}}` (codex lists skills from its skills folder and plugin
   caches, the remote ones included, which the plugin switch-off misses), and for `readonly` `features: {multi_agent: false, multi_agent_v2: false}` and `agents: {enabled: false}`

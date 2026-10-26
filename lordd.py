@@ -1275,7 +1275,9 @@ class Daemon:
                 params = {'cwd': a.cwd, 'model': a.model, 'approvalPolicy': 'never',
                           # @nosandbox: codex runs commands unconfined, as Claude Code's own agents do without its sandbox.
                           'sandbox': 'read-only' if a.record.get('readonly') else 'danger-full-access' if a.record.get('nosandbox') else 'workspace-write',
-                          'config': {**lean, 'mcp_servers': {**lean['mcp_servers'], 'lord': server},
+                          # codex's web search runs on OpenAI's side, outside the sandbox. Unset, it searches only
+                          # OpenAI's stored index in every sandbox but none; live fetches current pages.
+                          'config': {**lean, 'mcp_servers': {**lean['mcp_servers'], 'lord': server}, 'web_search': 'live',
                                      'sandbox_workspace_write': {'network_access': bool(a.record.get('net')), 'writable_roots': a.record.get('dirs', [])}}}
                 if vendor.exec_process:
                     params.pop('sandbox')
