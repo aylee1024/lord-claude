@@ -108,17 +108,20 @@ async def turn(sid, text, request_id=None):
         send({'method': 'item/completed', 'params': {'threadId': child, 'item': {'type': 'fileChange', 'id': 'k2', 'changes': [{'path': '/w/out.txt', 'kind': 'add', 'diff': '+y'}]}}})
         send({'method': 'turn/completed', 'params': {'threadId': sid, 'turn': {'id': tid, 'status': 'failed', 'error': {'message': 'Selected model is at capacity', 'codexErrorInfo': 'serverOverloaded'}}}})
         return
-    if text in ('CYBER', 'BUSY', 'BUSY_EDIT', 'ERRFIRST', 'SPENT') and FAMILY == 'gpt':
+    if text.startswith("Your last step was refused"):
+        text = 'CYBER' if session.get('policy_repeat') else 'POLICY RECOVERED'
+    if text in ('CYBER', 'CYBER_ONCE', 'BUSY', 'BUSY_EDIT', 'ERRFIRST', 'SPENT') and FAMILY == 'gpt':
         # A failed turn as codex classifies it (codexErrorInfo); BUSY and BUSY_EDIT fail as "at capacity", BUSY_EDIT
         # after a file edit; ERRFIRST sends the error before the turn's completion, which then carries none.
-        if text in ('CYBER', 'BUSY_EDIT'):
+        if text in ('CYBER', 'CYBER_ONCE', 'BUSY_EDIT'):
             item = {'type': 'fileChange', 'id': 'e1', 'changes': [{'path': 'a.txt', 'kind': 'add', 'diff': '+x'}]} if text == 'BUSY_EDIT' else \
                    {'type': 'commandExecution', 'id': 'c1', 'command': '/bin/zsh -lc "cat probe.py"', 'commandActions': [{'type': 'read', 'command': 'cat probe.py', 'name': 'probe.py', 'path': 'probe.py'}], 'cwd': session['cwd']}
             send({'method': 'item/completed', 'params': {'threadId': sid, 'item': {**item, 'aggregatedOutput': '', 'exitCode': 0}}})
         if text == 'SPENT':
             send({'method': 'account/rateLimits/updated', 'params': {'rateLimits': {'limitId': 'codex', 'primary': {'usedPercent': 100, 'windowDurationMins': 10080, 'resetsAt': int(__import__('time').time()) + 86400}, 'secondary': None}}})
             send({'method': 'account/rateLimits/updated', 'params': {'rateLimits': {'limitId': 'reserve', 'primary': {'usedPercent': 50, 'windowDurationMins': 10080, 'resetsAt': int(__import__('time').time()) + 3600}}}})
-        kind = {'CYBER': 'cyberPolicy', 'BUSY': 'serverOverloaded', 'BUSY_EDIT': 'serverOverloaded', 'ERRFIRST': 'usageLimitExceeded', 'SPENT': 'usageLimitExceeded'}[text]
+        session['policy_repeat'] = text == 'CYBER'
+        kind = {'CYBER': 'cyberPolicy', 'CYBER_ONCE': 'cyberPolicy', 'BUSY': 'serverOverloaded', 'BUSY_EDIT': 'serverOverloaded', 'ERRFIRST': 'usageLimitExceeded', 'SPENT': 'usageLimitExceeded'}[text]
         message = {'cyberPolicy': 'This content was flagged for possible cybersecurity risk', 'serverOverloaded': 'Selected model is at capacity'}.get(kind, 'You have hit your usage limit')
         error = {'message': message, 'codexErrorInfo': kind}
         if text == 'ERRFIRST':
@@ -164,7 +167,11 @@ async def turn(sid, text, request_id=None):
         session['crashed'] = True
         save(sid)
         os._exit(9)
-    if text == 'STEPS':
+    if text == 'BACKGROUND':
+        child = subprocess.Popen(['sleep', '300'], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        audit(command_pid=child.pid)
+        answer = 'JOB STARTED'
+    elif text == 'STEPS':
         # One command (long output ending in a token, exit code 2) and one file edit, shaped as each vendor reports them.
         output = 'x' * 3000 + ' sk-abcdefghijklmnopqrstuv'
         if FAMILY == 'gpt':
@@ -354,10 +361,14 @@ async def handle(value):
             if '--list-models' in sys.argv:
                 result['configOptions'].append({'id': 'model', 'currentValue': 'grok-4.7', 'options': [{'value': v} for v in ('grok-4.5', 'grok-4.7')]})
     elif method in ('thread/resume', 'session/load'):
+        if '--resume-limit-error' in sys.argv:
+            send({'id': rid, 'error': {'message': 'Separator is not found, and chunk exceed the limit'}})
+            return
         if p.get('environments'): assert p['environments'] == [{'environmentId': SESSIONS['environment'], 'cwd': p['cwd']}]
         sid = p.get('threadId') or p['sessionId']
         load(sid)
         result = {'thread': {'id': sid}} if FAMILY == 'gpt' else {'sessionId': sid}
+        if FAMILY == 'gpt' and '--large-resume' in sys.argv: result['history'] = 'x' * (40 * 1024 * 1024)
         if FAMILY == 'grok':
             update(sid, 'agent_message_chunk', content={'type': 'text', 'text': 'historical replay'})
     elif method == 'session/set_config_option':

@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import signal
 import stat
@@ -41,6 +42,8 @@ HOME = Path(os.environ.get('LORD_HOME', Path.home() / '.claude/lord')).expanduse
 LEGACY_SOCKET = HOME / 'lordd.sock'
 SOCKET = Path(os.environ['LORD_DAEMON_SOCKET']) if os.environ.get('LORD_DAEMON_SOCKET') else HOME / f'lordd-{VERSION}.sock'
 LIMIT = 8 * 1024 * 1024
+VENDOR_LIMIT = 1024 * 1024 * 1024
+MEMORY_CEILING_KB = 24 * 1024 * 1024
 # A row's output as Claude Code keeps it: the end of what the step printed, where errors land.
 ROW_OUTPUT = 2000
 EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max']
@@ -249,6 +252,7 @@ def tests_root(path, label):
     prefix = Path(*Path(os.path.abspath(Path(path).expanduser())).parts[:4])
     if label in ('cwd', '@dir') and len(prefix.parts) == 4 and canon(prefix) == canon('/System/Volumes/Data'):
         raise ValueError(f'@tests {label} {path} uses /System/Volumes/Data; use the path without /System/Volumes/Data')
+    if label in ('cwd', '@dir'): return canon(path)
     if link := nested_symlink_component(path):
         if label == "Lord's folder":
             raise ValueError(f"@tests needs Lord's folder {path} on a real path: {link} is a symlink; replace it with the folder it points to")
@@ -382,6 +386,48 @@ def codex_reads(item):
             path = str(action['path'])
             if not path.startswith('/') and item.get('cwd'): path = os.path.normpath(os.path.join(str(item['cwd']), path))
             found.append(({'listFiles': 'list'}.get(action['type'], action['type']), path))
+    known = {path for _, path in found}
+    return found + [('shell', path) for path in shell_reads(str(item.get('command') or ''), item.get('cwd')) if path not in known]
+
+def shell_reads(command, cwd=None):
+    try: words = shlex.split(command)
+    except ValueError: return []
+    if len(words) >= 3 and Path(words[0]).name in ('sh', 'bash', 'zsh') and words[1] in ('-c', '-lc', '-ic'):
+        return shell_reads(words[2], cwd)
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=';&|\n')
+        lexer.whitespace = ' \t\r'
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError: return []
+    commands, part = [], []
+    for token in [*tokens, ';']:
+        if token and all(c in ';&|\n' for c in token):
+            if part: commands.append(part)
+            part = []
+        else: part.append(token)
+    found = []
+    readers = ('cat', 'head', 'tail', 'sed', 'nl', 'wc', 'rg', 'grep', 'less')
+    for words in commands:
+        if not words or (name := Path(words[0]).name) not in readers: continue
+        if name == 'sed' and '-n' not in words[1:]: continue
+        pattern, skip, options = name in ('rg', 'grep', 'sed'), False, True
+        for word in words[1:]:
+            if skip: skip = False; continue
+            if options and word == '--': options = False; continue
+            if options and word.startswith('-') and word != '-':
+                if name in ('rg', 'grep', 'sed') and word in ('-e', '--regexp', '-f', '--file'):
+                    pattern, skip = False, True
+                elif name in ('rg', 'grep', 'sed') and word.startswith(('-e', '-f', '--regexp=', '--file=')): pattern = False
+                elif name in ('head', 'tail') and word in ('-n', '-c', '--lines', '--bytes'): skip = True
+                elif name == 'nl' and word in ('-b', '-d', '-f', '-h', '-i', '-l', '-n', '-s', '-v', '-w'): skip = True
+                elif name in ('rg', 'grep') and word in ('-g', '--glob', '-t', '--type', '-m', '--max-count', '-A', '-B', '-C', '--color', '--encoding', '--exclude', '--include'): skip = True
+                continue
+            if word in ('>', '>>', '<', '2>', '2>>'): skip = True; continue
+            if pattern: pattern = False; continue
+            if word == '-' or word.startswith(('>', '<')) or '$' in word or '`' in word: continue
+            path = os.path.normpath(os.path.join(str(cwd), word)) if cwd and not word.startswith('/') else word
+            if path not in found: found.append(path)
     return found
 
 def error_kind(error):
@@ -524,6 +570,27 @@ async def process_table():
             rss[pid] = kb
     return children, rss
 
+async def job_details(pids):
+    if not pids: return []
+    ps = await asyncio.create_subprocess_exec('/bin/ps', '-A', '-o', 'pid=,stat=,etime=,command=', stdout=-1, stderr=-3)
+    found = []
+    for row in (await ps.communicate())[0].decode('utf8', 'replace').splitlines():
+        fields = row.split(None, 3)
+        if len(fields) != 4 or not fields[0].isdigit() or int(fields[0]) not in pids or 'Z' in fields[1]: continue
+        pid, _, elapsed, command = fields
+        try: words = shlex.split(command)
+        except ValueError: words = []
+        if words and (Path(words[0]).name == 'codex-code-mode-host' or
+                      len(words) > 1 and Path(words[1]).name == 'lordd.py' and '--mcp' in words[2:]): continue
+        days, clock = elapsed.split('-', 1) if '-' in elapsed else ('0', elapsed)
+        seconds = 0
+        try:
+            for number in clock.split(':'): seconds = seconds * 60 + int(number)
+            seconds += int(days) * 86400
+        except ValueError: seconds = 0
+        found.append({'pid': int(pid), 'command': REDACT(command), 'age_s': seconds})
+    return sorted(found, key=lambda j: j['pid'])
+
 def tree(children, root):
     found, stack = [], [root]
     while stack:
@@ -590,6 +657,7 @@ class Agent:
         # This turn's commands, retries after "at capacity", and whether it edited a file; and codex's error for it.
         self.commands, self.retries, self.edited, self.last_command, self.turn_error, self.retry_task = 0, 0, False, None, None, None
         self.retry_waiting = False
+        self.policy_continues, self.memory_warned, self.jobs, self.stop_cause = 0, False, [], None
         self.final_text, self.restart, self.token = '', False, uuid.uuid4().hex
         self.default_model, self.agy_step = False, None
         # Each vendor tool step's result, by step id, for the plugin's row of it (/row).
@@ -612,7 +680,14 @@ class Agent:
         if self.reads is None:
             try: self.reads = set(self.reads_path.read_text(encoding='utf-8').splitlines())
             except OSError: self.reads = set()
-        lines = [line for line in (f'{kind} {path}' + (f' ({helper})' if helper else '') for kind, path in found) if line not in self.reads]
+        keys = {('read ' + line.split(' ', 1)[1]) if line.startswith('shell ') else line for line in self.reads}
+        lines = []
+        for kind, path in found:
+            line = f'{kind} {path}' + (f' ({helper})' if helper else '')
+            key = 'read ' + line.split(' ', 1)[1] if kind == 'shell' else line
+            if key not in keys:
+                lines.append(line)
+                keys.add(key)
         if not lines or READS_FULL in self.reads: return
         self.reads.update(lines)
         try: size = self.reads_path.stat().st_size
@@ -655,8 +730,8 @@ class Agent:
         # The turn as a program reads it: logs/<agentId>.json (the settings and every turn, the last 100 with their
         # answers in <agentId>.answers/), and the plugin's one-line footer on the answer.
         ended = datetime.now(timezone.utc).isoformat(timespec='seconds')
-        how = 'done' if kind == 'done' else 'interrupted' if value.get('message') == 'interrupted' or self.cancel_requested else f"error ({value.get('cause') or 'vendor'})"
-        settings = getattr(self, 'settings', None) or {}
+        how = 'refused' if kind == 'refused' else 'done' if kind == 'done' else 'interrupted' if value.get('message') == 'interrupted' or self.cancel_requested else f"error ({value.get('cause') or 'vendor'})"
+        settings = getattr(self, 'settings', None) or {k: self.record[k] for k in ('cwd', 'dirs', 'model', 'effort', 'codexHome') if k in self.record}
         transcript = transcript_path(self.family, self.vendorSession, self.cwd, settings.get('codex_folder'))
         try: saved = json.loads(self.record_path.read_text(encoding='utf-8'))
         except (OSError, ValueError): saved = {}
@@ -680,13 +755,16 @@ class Agent:
         mine = [h for h in self.helpers.values() if h['started'] >= started]
         turn = {'turn': number, 'started': started, 'ended': ended, 'ended_how': how,
                 'commands': getattr(self, 'commands', 0), 'retries': getattr(self, 'retries', 0),
+                'policy_continues': self.policy_continues, 'jobs': self.jobs,
+                **({'stop_cause': self.stop_cause} if self.stop_cause else {}),
                 'helpers': [h['thread'] for h in mine],
                 **({'usage': value.get('usage')} if kind == 'done' else {'error': str(value.get('message'))}),
                 **({'answer': str(answer)} if text and text.strip() else {})}
         kept = [*turns, turn][-100:]
         # Only the helpers the kept turns name, in the order they started, so the record stays as bounded as its turns.
         named = dict.fromkeys(t for k in kept for t in (k.get('helpers') if isinstance(k.get('helpers'), list) else []) if isinstance(t, str))
-        document = {'agentId': self.agentId, 'family': self.family, 'lordVersion': VERSION, 'session': self.record.get('session'),
+        document = {**{k: self.record[k] for k in ('readonly', 'net', 'nosandbox', 'tests', 'nosearch', 'tools', 'nice', 'memory_gb', 'hang_s', 'wall_s', 'created') if k in self.record},
+                    'agentId': self.agentId, 'family': self.family, 'lordVersion': VERSION, 'session': self.record.get('session'),
                     **{k: v for k, v in settings.items() if k != 'codex_folder'}, 'vendorSession': self.vendorSession,
                     'transcript': transcript, 'helpers': [self.helpers[t] for t in named if t in self.helpers], 'turns': kept}
         try:
@@ -701,7 +779,7 @@ class Agent:
         except OSError: pass
         helpers = [h.get('model') or '?' for h in mine]
         return {'ended_how': how, 'model': self.model, 'effort': self.effort, 'started': turn['started'], 'ended': ended,
-                'commands': turn['commands'], 'retries': turn['retries'], 'helpers': helpers, 'session': self.vendorSession}
+                'commands': turn['commands'], 'retries': turn['retries'], 'policy_continues': self.policy_continues, 'jobs': self.jobs, 'helpers': helpers, 'session': self.vendorSession}
 
     def undelivered(self):
         return bool(self.carry) or not self.events.empty()
@@ -713,6 +791,7 @@ class Agent:
             self.activity = value['text'][:300]
             self.note(value['text'])
         if kind == 'error':
+            if self.cancel_requested and self.stop_cause: value['message'] = 'interrupted: ' + self.stop_cause
             value['message'] = sign_in_hint(self.family, value['message'])
             self.note('error: ' + str(value['message']))
         if kind in ('done', 'error'):
@@ -809,7 +888,7 @@ class Vendor:
                     await self.start_exec(command[len(nice):-1], env, nice)
                 self.process = await asyncio.create_subprocess_exec(*command,
                     cwd=cwd, start_new_session=True, env=env,
-                    stdin=-1, stdout=-1, stderr=-1, limit=LIMIT)
+                    stdin=-1, stdout=-1, stderr=-1, limit=VENDOR_LIMIT)
                 if self.stopping:
                     await kill_tree(self.process)
                     raise RuntimeError('Vendor closed during start')
@@ -850,7 +929,7 @@ class Vendor:
             self.exec_process = await asyncio.create_subprocess_exec(*nice, '/usr/bin/sandbox-exec', '-p', profile, *params,
                 *command, 'exec-server', '--listen', 'ws://127.0.0.1:0', '--ws-auth', 'capability-token',
                 '--ws-token-sha256', hashlib.sha256(self.exec_token.encode()).hexdigest(),
-                cwd=self.agent.cwd, env=env, start_new_session=True, stdin=-1, stdout=-1, stderr=-1, limit=LIMIT)
+                cwd=self.agent.cwd, env=env, start_new_session=True, stdin=-1, stdout=-1, stderr=-1, limit=VENDOR_LIMIT)
         except OSError as error: raise RuntimeError(f'@tests exec-server could not start (requires macOS sandbox-exec): {error}') from None
         if self.stopping:
             await kill_tree(self.exec_process)
@@ -877,7 +956,35 @@ class Vendor:
         await self.kill()
 
     async def kill(self):
+        await self.update_jobs()
+        self.log_jobs()
         await asyncio.gather(kill_tree(self.process, self.descendants), kill_tree(self.exec_process, self.exec_descendants))
+        if self.agent: self.agent.jobs = []
+
+    async def update_jobs(self, children=None):
+        if not self.agent: return set()
+        if not self.process and not self.exec_process and not self.descendants and not self.exec_descendants:
+            self.agent.jobs = []
+            return set()
+        if children is None: children = (await process_table())[0]
+        parents = {pid: ppid for ppid, kids in children.items() for pid in kids}
+        pids = set()
+        for process, attr in ((self.process, 'descendants'), (self.exec_process, 'exec_descendants')):
+            known = getattr(self, attr, set())
+            live = set(tree(children, process.pid)) if process else set()
+            live |= {pid for pid in known if parents.get(pid) == 1 or parents.get(pid) in known}
+            setattr(self, attr, live - ({process.pid} if process else set()))
+            pids |= live
+        roots = {p.pid for p in (self.process, self.exec_process) if p}
+        self.agent.jobs = await job_details(pids - roots)
+        return pids
+
+    def log_jobs(self):
+        if not self.agent: return
+        for job in self.agent.jobs:
+            line = f"killing job {job['pid']}: {job['command']}"
+            self.agent.note(line)
+            self.d.log(f'{self.agent.agentId}: {line}')
 
     async def send(self, value):
         async with self.write_lock:
@@ -994,7 +1101,7 @@ class Vendor:
                     # agy's response joins every message of the turn; the answer is what it said after its last tool step, as
                     # for the other vendors, and the whole response only when it said nothing after one.
                     response = payload.get('response') if isinstance(payload.get('response'), str) else ''
-                    a.emit('done', text=a.answer if a.answer.strip() else response or a.answer, usage=usage(payload.get('usage', {})), model=a.model)
+                    self.d.task(self.d.finish(a, text=a.answer if a.answer.strip() else response or a.answer, usage=usage(payload.get('usage', {})), model=a.model))
             return
         if method == 'account/rateLimits/updated':
             self.d.allowance(p.get('rateLimits'))
@@ -1058,7 +1165,7 @@ class Vendor:
             if turn['status'] == 'completed' and not a.cancel_requested:
                 tokens = {**a.tokens, 'input_tokens': max(0, a.tokens['input_tokens'] - a.tokens['cache_read_input_tokens'])}
                 self.d.record_usage(a, tokens)
-                a.emit('done', text=a.final_text, usage=tokens, model=a.model)
+                self.d.task(self.d.finish(a, text=a.final_text, usage=tokens, model=a.model))
             elif a.cancel_requested or turn['status'] == 'interrupted':
                 a.emit('error', message='interrupted' if a.cancel_requested else str(said(turn.get('error')) or 'interrupted'), retryable=False)
             else: self.failed(a, turn.get('error') or a.turn_error or {}, turn['status'], turn.get('id'))
@@ -1074,16 +1181,23 @@ class Vendor:
     def failed(self, a, error, status, turn_id):
         # A codex turn that failed, by codex's own kind for it (codexErrorInfo).
         kind, message = error_kind(error), str(said(error) or status)
-        if kind == 'serverOverloaded' and not a.edited and a.retries < self.d.config.get('capacity_retries', 2):
-            # The model was at capacity before the turn changed anything: the same session tries again after a wait.
+        if kind == 'serverOverloaded' and a.retries < self.d.config.get('capacity_retries', 3):
             a.retries += 1
-            delay = self.d.config.get('capacity_retry_s', 30)
+            delay = self.d.config.get('capacity_retry_s', 30) * 4 ** (a.retries - 1)
             a.ended_turns.add(turn_id)
             a.turn_id, a.turn_error = None, None
             a.note(f'vendor at capacity ({message}); retry {a.retries} in {delay} s on the same session')
             # Waiting from now, so an interrupt handled before the retry task first runs still cancels it.
             a.retry_waiting = True
             a.retry_task = self.d.task(self.d.retry(a, delay))
+            return
+        if kind in REFUSALS and not a.policy_continues:
+            a.policy_continues += 1
+            a.ended_turns.add(turn_id)
+            a.turn_id, a.turn_error = None, None
+            a.note(f'vendor policy refusal ({kind}): {message}; continuing once on the same session')
+            a.retry_waiting = True
+            a.retry_task = self.d.task(self.d.retry(a, 0, "Your last step was refused by the vendor's policy filter. Continue the task without that step."))
             return
         if kind in REFUSALS:
             message = f"refused by vendor ({kind}): {message}. The session is intact: send a reworded message to resume it" + \
@@ -1194,6 +1308,54 @@ class Daemon:
         if a.agentId not in self.vendors: self.vendors[a.agentId] = Vendor(self, a.family, a)
         return self.vendors[a.agentId]
 
+    async def finish(self, a, **value):
+        await self.backend(a).update_jobs()
+        a.emit('done', **value)
+
+    def refused(self, body, message):
+        aid = body.get('agentId')
+        if not isinstance(aid, str) or not re.fullmatch(r'[A-Za-z0-9_-][A-Za-z0-9_.-]*', aid): return
+        known = self.agents.get(aid)
+        record = dict(known.record) if known else {'agentId': aid, 'family': body.get('family', 'gpt'),
+            'cwd': body.get('cwd', ''), 'model': body.get('model') or self.config.get(body.get('family', 'gpt'), {}).get('model', 'unknown'),
+            'effort': body.get('effort') or 'high'}
+        a = Agent(record)
+        a.turn_started = datetime.now(timezone.utc).isoformat(timespec='seconds')
+        try: a.settings = self.settings(a)
+        except (ValueError, TypeError, KeyError): pass
+        return a.turn_record('refused', {'message': self.redact(message)})
+
+    def restore(self, aid):
+        if not isinstance(aid, str) or not re.fullmatch(r'[A-Za-z0-9_-][A-Za-z0-9_.-]*', aid): raise ValueError('Invalid agent id')
+        self.refresh(aid)
+        path = HOME / 'logs' / f'{aid}.json'
+        if aid not in self.agents:
+            try: text = path.read_text(encoding='utf-8')
+            except FileNotFoundError: return {'found': False}
+            except OSError: text = ''
+            try:
+                saved = json.loads(text)
+                if not isinstance(saved, dict) or saved.get('family') not in ('gpt', 'grok', 'gemini'): raise ValueError('record is invalid')
+                if not all(isinstance(saved.get(k), str) and saved[k] for k in ('model', 'effort', 'cwd')): raise ValueError('record is incomplete')
+                if not isinstance(saved.get('vendorSession'), str) or not re.fullmatch(r'[A-Za-z0-9_.-]+', saved['vendorSession']): raise ValueError('vendor session is missing')
+                record = {k: saved[k] for k in ('family', 'model', 'effort', 'cwd', 'dirs', 'nice', 'memory_gb', 'hang_s', 'wall_s', 'tools', 'codexHome', 'vendorSession', 'session') if k in saved}
+                if not record.get('codexHome') or canon(record['codexHome']) == canon(self.user_codex_home): record.pop('codexHome', None)
+                record.update(agentId=aid, created=saved.get('created') or datetime.now(timezone.utc).isoformat())
+                record.update(readonly=saved.get('sandbox') == 'read-only' or bool(saved.get('readonly')),
+                              nosandbox=saved['family'] == 'gpt' and (saved.get('sandbox') == 'none' or bool(saved.get('nosandbox'))),
+                              tests=saved.get('sandbox') == 'tests' or bool(saved.get('tests')),
+                              net=bool(saved.get('network') or saved.get('net')), nosearch=saved.get('web_search') == 'off' or bool(saved.get('nosearch')))
+                a = Agent(record)
+                self.agents[aid] = a
+                self.save(a)
+                a.restored = True
+            except (ValueError, TypeError, KeyError) as error:
+                message = f'agent {aid} cannot be resumed ({error if isinstance(error, ValueError) and not isinstance(error, json.JSONDecodeError) else "record is invalid"}); launch a fresh agent'
+                self.refused({'agentId': aid}, message)
+                return {'found': True, 'error': message}
+        a = self.agents[aid]
+        return {'found': True, 'agent': {**self.settings(a), 'family': a.family, 'nosearch': bool(a.record.get('nosearch'))}}
+
     def service(self, home=None):
         # A codex process owned by no agent, for archiving pruned threads: one per codex folder.
         return self.vendors.setdefault(None if home is None else ('service', home), Vendor(self, 'gpt', codex_home=home))
@@ -1282,13 +1444,20 @@ class Daemon:
                 params = {'cwd': a.cwd, 'model': a.model, 'approvalPolicy': 'never',
                           # @nosandbox: codex runs commands unconfined, as Claude Code's own agents do without its sandbox.
                           'sandbox': 'read-only' if a.record.get('readonly') else 'danger-full-access' if a.record.get('nosandbox') else 'workspace-write',
-                          'config': {**lean, 'mcp_servers': {**lean['mcp_servers'], 'lord': server}, **({'web_search': 'live'} if live_search(home) else {}),
+                          'config': {**lean, 'mcp_servers': {**lean['mcp_servers'], 'lord': server}, **({'web_search': 'disabled'} if a.record.get('nosearch') else {'web_search': 'live'} if live_search(home) else {}),
                                      'sandbox_workspace_write': {'network_access': bool(a.record.get('net')), 'writable_roots': a.record.get('dirs', [])}}}
                 if vendor.exec_process:
                     params.pop('sandbox')
                     params['environments'] = vendor.environments()
                 if a.vendorSession: params['threadId'] = a.vendorSession
-                result = await vendor.rpc('thread/resume' if a.vendorSession else 'thread/start', params)
+                try: result = await vendor.rpc('thread/resume' if a.vendorSession else 'thread/start', params)
+                except Exception as error:
+                    if a.vendorSession and re.search(r'limit|too large|Separator is not found', str(error), re.I):
+                        path = transcript_path(a.family, a.vendorSession, a.cwd, a.record.get('codexHome') or self.user_codex_home)
+                        try: size = f'{Path(path).stat().st_size / 1048576:.0f}' if path else 'unknown'
+                        except OSError: size = 'unknown'
+                        raise RuntimeError(f'session too large to resume ({size} MB); start a fresh agent with a takeover brief') from None
+                    raise
                 a.vendorSession = result['thread']['id']
             elif a.family == 'grok':
                 server = self.server(a)
@@ -1364,10 +1533,11 @@ class Daemon:
             self.retire = True
             self.log(f'plugin {body["version"]} is newer than this daemon ({VERSION}); exiting once idle')
         aid, family = body['agentId'], body['family']
-        if not isinstance(aid, str) or not aid or family not in ('gpt', 'grok', 'gemini'): raise ValueError('Invalid agent or family')
+        if not isinstance(aid, str) or not re.fullmatch(r'[A-Za-z0-9_-][A-Za-z0-9_.-]*', aid) or family not in ('gpt', 'grok', 'gemini'): raise ValueError('Invalid agent or family')
         async with self.open_locks.setdefault(aid, asyncio.Lock()):
             self.refresh(aid)
             if body.get('tests') and family != 'gpt': raise ValueError('@tests is available for gpt only')
+            if body.get('nosearch') and family != 'gpt': raise ValueError('@nosearch is available for gpt only')
             if body.get('nosandbox') and family != 'gpt':
                 raise ValueError({'grok': '@nosandbox is available for gpt only; grok keeps its sandbox',
                                   'gemini': '@nosandbox is not needed for gemini: agy has no sandbox'}[family])
@@ -1377,6 +1547,9 @@ class Daemon:
                                   'gemini': '@dir is not needed for gemini: agy has no sandbox and can write outside its folder'}[family])
             if not Path(body['cwd']).expanduser().is_absolute(): raise ValueError('the working folder must be an absolute path')
             a = self.agents.get(aid)
+            if body.get('resume') and not (a and (a.state in ('running', 'waiting_tool') or a.undelivered())):
+                cause = 'record is missing' if not a or not a.record_path.is_file() else 'vendor session is missing' if not a.vendorSession else None
+                if cause: raise ValueError(f'agent {aid} cannot be resumed ({cause}); launch a fresh agent')
             if body.get('tests') or (a and a.record.get('tests')):
                 for clash in ('readonly', 'nosandbox', 'net', 'tools'):
                     if body.get(clash) or (a and a.record.get(clash)): raise ValueError(f'@tests cannot be used with @{clash}')
@@ -1408,7 +1581,7 @@ class Daemon:
             new = a is None
             saved = None if new else (json.loads(dumps(a.record)), a.restart)
             try: return await self.open_agent(aid, family, cwd, body, a)
-            except BaseException:
+            except BaseException as error:
                 # A first /open that fails leaves no agent behind, so a corrected retry starts clean; a refused
                 # later /open puts the agent's options back and reattaches with them on the next turn.
                 if new and self.agents.pop(aid, None) is not None:
@@ -1424,6 +1597,7 @@ class Daemon:
                 raise
 
     async def open_agent(self, aid, family, cwd, body, a):
+        resuming = a is not None
         if a is None:
             if not Path(cwd).is_dir(): raise ValueError('cwd must be a directory')
             config = self.config[family]
@@ -1431,7 +1605,7 @@ class Daemon:
             # older daemon, with own_home off, or for a codex setup the folder cannot share) resumes in the user's
             # folder, where its thread is.
             own = family == 'gpt' and config.get('own_home', True) and not codex_home_unshareable(self.user_codex_home)
-            a = Agent({**{k: body[k] for k in ('readonly', 'net', 'nosandbox', 'tests') if k in body}, 'agentId': aid,
+            a = Agent({**{k: body[k] for k in ('readonly', 'net', 'nosandbox', 'tests', 'nosearch') if k in body}, 'agentId': aid,
                 **({'codexHome': str(HOME / 'codex')} if own else {}),
                 'family': family, 'cwd': cwd, 'model': body.get('model') or config['model'],
                 'effort': body.get('effort') or config['effort'], 'created': datetime.now(timezone.utc).isoformat()})
@@ -1450,8 +1624,8 @@ class Daemon:
         dirs = [str(Path(x).expanduser().resolve()) for x in body.get('dirs') or []]
         if any(inside(canon(str(Path.home())), (canon(x),)) or (sys.platform == 'darwin' and inside('/System/Volumes/Data', (x, canon(x)))) for x in dirs):
             raise ValueError('refusing / or a folder holding your home folder as an @dir')
-        if missing := [x for x in dirs if not Path(x).is_dir()]: raise ValueError(f'@dir {missing[0]} is not an existing directory')
-        for key in ('readonly', 'net', 'nosandbox', 'tests'):
+        if missing := [x for x in body.get('dirs') or [] if not Path(x).expanduser().is_dir()]: raise ValueError(f'@dir {missing[0]} does not exist')
+        for key in ('readonly', 'net', 'nosandbox', 'tests', 'nosearch'):
             if body.get(key) and not a.record.get(key):
                 # A sandbox change needs a new process (grok) or a reattached thread (codex).
                 a.record[key] = True
@@ -1478,7 +1652,12 @@ class Daemon:
             a.generation = 0
         # A result held for this agent is handed over by /turn without the vendor, and a vendor that failed to start here
         # would strand it; the next turn's start attaches the vendor instead.
-        if not a.undelivered(): await self.attach(a)
+        if not a.undelivered():
+            try: await self.attach(a)
+            except Exception as error:
+                if resuming and a.vendorSession and not str(error).startswith('session too large to resume'):
+                    raise RuntimeError(f'agent {aid} cannot be resumed ({self.redact(error)}); launch a fresh agent') from None
+                raise
         # A model change applies at the next turn; refusing it here keeps the mod from adopting it. With a result held,
         # the turn's start checks it instead, after that result is handed over.
         if a.family == 'gemini' and body.get('model') and not a.undelivered(): await self.agy_efforts(body['model'])
@@ -1504,6 +1683,9 @@ class Daemon:
         if a.state != 'idle' or a.undelivered(): raise ValueError('Agent has a turn awaiting completion')
         a.cancel_requested, a.starting = False, True
         try: await self.begin_starting(a, body)
+        except Exception as error:
+            self.refused({'agentId': a.agentId}, error)
+            raise
         finally: a.starting = False
 
     def quota_spent(self, family, model):
@@ -1548,6 +1730,7 @@ class Daemon:
         a.finished.clear()
         a.dispatched, a.agy_step, a.rows = False, None, {}
         a.commands, a.retries, a.edited, a.last_command, a.turn_error, a.turn_body, a.retry_waiting = 0, 0, False, None, None, body, False
+        a.policy_continues, a.memory_warned, a.stop_cause = 0, False, None
         a.turn_started = datetime.now(timezone.utc).isoformat(timespec='seconds')
         a.settings = self.settings(a)
         a.note(f'turn: {a.family} {a.model} effort {a.effort} · {settings_line(a.settings)}')
@@ -1557,7 +1740,7 @@ class Daemon:
     def settings(self, a):
         # What the agent runs with this turn, the defaults included: the limits a guard stops it at, and its sandbox.
         r, family = a.record, a.family
-        ceiling = r['memory_gb'] * 1048576 if r.get('memory_gb') else self.config.get('memory_ceiling_kb', 12 * 1024 * 1024)
+        ceiling = r['memory_gb'] * 1048576 if r.get('memory_gb') else self.config.get('memory_ceiling_kb', MEMORY_CEILING_KB)
         hang = r['hang_s'] if r.get('hang_s') is not None else self.config[family].get('no_progress_s', 0)
         folder = (Path(r['codexHome']) if r.get('codexHome') else self.user_codex_home) if family == 'gpt' else \
             grok_home() if family == 'grok' else self.vendor_home / '.gemini'
@@ -1566,19 +1749,20 @@ class Daemon:
                 'network': bool(r.get('net') or r.get('nosandbox')) if family == 'gpt' else True, 'tools': bool(r.get('tools')),
                 'nice': max(r.get('nice', 0), os.getpriority(os.PRIO_PROCESS, 0)),
                 'memory_gb': round(ceiling / 1048576, 1), 'hang_s': hang or None, 'wall_s': r.get('wall_s') or None,
-                **({'codexHome': str(folder), 'web_search': 'live' if live_search(codex_config(folder)) else 'per codex config'} if family == 'gpt' else {}),
+                **({'codexHome': str(folder), 'web_search': 'off' if r.get('nosearch') else 'live' if live_search(codex_config(folder)) else 'per codex config'} if family == 'gpt' else {}),
                 'codex_folder': str(folder)}
 
-    async def retry(self, a, delay):
-        # A turn that met "at capacity" before changing anything, sent again on the same session after a wait. The
-        # session already holds the task, so the retry asks it to go on rather than sending the task twice.
+    async def retry(self, a, delay, text=None):
         owner = a.turn_body
         try: await asyncio.sleep(delay)
         finally: a.retry_waiting = False
         # Only the turn that met "at capacity": a later turn started meanwhile is not continued.
         if a.cancel_requested or a.state not in ('running', 'waiting_tool') or a.turn_body is not owner: return
         self.backend(a).last = time.monotonic()
-        await self.run_turn(a, {**a.turn_body, 'text': 'Continue with the task above: the last attempt stopped because the model was at capacity.'}, retry=True)
+        a.final_text = ''
+        text = text or ('Continue with the task above. Your previous turn stopped because the model was at capacity; check what you already finished before repeating anything.' if a.edited else
+                        'Continue with the task above: the last attempt stopped because the model was at capacity.')
+        await self.run_turn(a, {**a.turn_body, 'text': text}, retry=True)
 
     def allowance(self, snapshot):
         # codex's account limits as it last reported them (it sends them unasked during turns), merged as codex says:
@@ -1616,6 +1800,9 @@ class Daemon:
         v = self.backend(a)
         try:
             if a.cancel_requested:
+                if v:
+                    await v.close()
+                    a.generation = 0
                 a.emit('error', message='interrupted', retryable=False)
                 # With no client attached, an interrupted turn leaves nothing to deliver.
                 if not a.stream_lock.locked():
@@ -1650,7 +1837,7 @@ class Daemon:
                     tokens = json.loads(path.read_text()) if path.exists() else result.get('usage', {})
                     if tokens.get('turns'): tokens = tokens['turns'][-1]
                     self.record_usage(a, usage(tokens))
-                    a.emit('done', text=a.final_text, usage=usage(tokens), model=a.model)
+                    await self.finish(a, text=a.final_text, usage=usage(tokens), model=a.model)
             else:
                 text = body['text']
                 if body.get('schema'): text += '\nReturn JSON matching this schema: ' + dumps(body['schema'])
@@ -1665,7 +1852,10 @@ class Daemon:
     def user_codex_home(self):
         return Path(os.environ['CODEX_HOME']) if os.environ.get('CODEX_HOME') else self.vendor_home / '.codex'
 
-    async def interrupt(self, a):
+    async def interrupt(self, a, cause=None):
+        if isinstance(cause, str) and cause:
+            a.stop_cause = self.redact(cause)[:1000]
+            a.note('stop requested: ' + a.stop_cause)
         a.followup = a.earlier = None
         # A turn still starting (begin's awaits) is interrupted once it runs, through the path below; a start-up
         # longer than the wait ends as interrupted when it finishes.
@@ -1701,6 +1891,10 @@ class Daemon:
                 # stops that command, and the next turn resumes the thread in a new one.
                 await v.close()
                 a.generation = 0
+        v = self.vendors.get(a.agentId) if hasattr(self, 'vendors') else None
+        if v and a.state in ('idle', 'closed') and not getattr(a, 'starting', False):
+            await v.close()
+            a.generation = 0
         # An interrupted turn leaves nothing to deliver, also when it finished just before the interrupt arrived.
         if not a.stream_lock.locked():
             a.carry.clear()
@@ -1715,7 +1909,7 @@ class Daemon:
             return round(now - v.last) if v and v.process and v.process.returncode is None and a.state in ('running', 'waiting_tool') else None
         return [{**{k: getattr(a, k) for k in ('agentId', 'family', 'model', 'effort', 'state', 'activity', 'cwd')},
                  'log': str(a.log_path), 'answer': str(a.answer_path) if a.answer_path.exists() else None,
-                 'usage': a.record.get('usage'), 'quiet_s': quiet(a)} for a in self.agents.values()]
+                 'usage': a.record.get('usage'), 'quiet_s': quiet(a), 'jobs': a.jobs} for a in self.agents.values()]
 
     def allowances(self):
         # Each vendor's allowance as last reported: codex's windows, and the quota resets Lord refuses turns until.
@@ -1757,14 +1951,25 @@ class Daemon:
     async def route(self, method, path, body):
         if method == 'GET':
             if path == '/health': return {'ok': True, 'pid': os.getpid(), 'version': VERSION}
-            if path == '/agents': return self.listed()
+            if path == '/agents':
+                for v in self.vendors.values():
+                    if v.agent: await v.update_jobs()
+                return self.listed()
             if path == '/allowance': return self.allowances()
         elif method == 'POST':
+            if path == '/restore': return self.restore(body['agentId'])
+            if path == '/session_end':
+                for a in list(self.agents.values()):
+                    if body.get('session') and a.record.get('session') == body['session']:
+                        await self.interrupt(a, body.get('cause'))
+                        await self.backend(a).close()
+                        a.state = 'closed'
+                return {'ok': True}
             if path == '/open':
-                # A refused launch leaves no agent log, so its reason is kept in lordd.log.
                 try: return await self.open(body)
-                except ValueError as error:
+                except Exception as error:
                     self.log(f"{body.get('agentId')}: open refused: {error}")
+                    self.refused(body, error)
                     raise
             if path == '/prune': return await self.prune(body.get('days', self.config['prune_days']))
             a = self.agents[body['agentId']]
@@ -1800,7 +2005,7 @@ class Daemon:
                 a.note('message queued for the next turn: ' + self.redact(body['text'])[:300])
                 return {'ok': True, 'queued': True}
             elif path in ('/interrupt', '/close'):
-                await self.interrupt(a)
+                await self.interrupt(a, body.get('cause'))
                 if path == '/close':
                     a.state = 'closed'
                     await self.backend(a).close()
@@ -1938,7 +2143,7 @@ class Daemon:
             if now - pruned >= 3600:
                 pruned = now
                 self.task(self.prune(self.config['prune_days']))
-            busy = any(a.state in ('running', 'waiting_tool') or (a.undelivered() and now - self.last_request < self.config.get('keep_undelivered_s', 86400))
+            busy = any(a.state in ('running', 'waiting_tool') or a.jobs or (a.undelivered() and now - self.last_request < self.config.get('keep_undelivered_s', 86400))
                        for a in self.agents.values())
             idle_s = min(self.config['idle_exit_s'], self.config.get('retire_idle_s', 30)) if self.retire else self.config['idle_exit_s']
             if not self.requests and now - self.last_request >= idle_s and not busy:
@@ -1950,23 +2155,24 @@ class Daemon:
         for service in [v for v in self.vendors.values() if v.agent is None]:
             if service.process and not service.pending and now - service.last >= idle_s: await service.close()
         live = [v for v in self.vendors.values() if v.agent and v.process and v.process.returncode is None]
-        for v in live:
-            a = v.agent
-            # A warm process with no turn for the idle period is closed; the next turn resumes its session.
-            if a.state in ('idle', 'closed') and not a.lock.locked() and not a.stream_lock.locked() and now - v.last >= idle_s:
-                await v.close()
-        live = [v for v in live if v.process and v.process.returncode is None]
         if not live: return
         children, rss = await process_table()
         for v in live:
-            a, pids = v.agent, tree(children, v.process.pid)
-            v.descendants = set(pids) - {v.process.pid}
-            if v.exec_process:
-                extra = tree(children, v.exec_process.pid)
-                v.exec_descendants = set(extra) - {v.exec_process.pid}
-                pids = set(pids) | set(extra)
-            ceiling = a.record['memory_gb'] * 1048576 if a.record.get('memory_gb') else self.config.get('memory_ceiling_kb', 12 * 1024 * 1024)
+            a = v.agent
+            pids = await Vendor.update_jobs(v, children)
+            if a.state in ('idle', 'closed') and not a.jobs and not a.lock.locked() and not a.stream_lock.locked() and now - v.last >= idle_s:
+                await v.close()
+                continue
+            ceiling = a.record['memory_gb'] * 1048576 if a.record.get('memory_gb') else self.config.get('memory_ceiling_kb', MEMORY_CEILING_KB)
             used = sum(rss.get(pid, 0) for pid in pids)
+            if .85 * ceiling <= used <= ceiling and a.state in ('running', 'waiting_tool') and not a.memory_warned and (a.family != 'gpt' or a.turn_id):
+                text = f'Memory: {used / 1048576:.1f} GB of the {ceiling / 1048576:.1f} GB ceiling; at the ceiling Lord stops the turn and its processes.'
+                a.memory_warned = True
+                a.note(text)
+                if a.family == 'gpt' and a.turn_id:
+                    self.task(v.rpc('turn/steer', {'threadId': a.vendorSession, 'expectedTurnId': a.turn_id, 'input': [{'type': 'text', 'text': text}]}))
+                else: self.task(self.route('POST', '/queue', {'agentId': a.agentId, 'text': text}))
+                await asyncio.sleep(0)
             silent = a.record['hang_s'] if a.record.get('hang_s') is not None else self.config[a.family].get('no_progress_s', 0)
             if used > ceiling: v.reason = f'stopped: the {a.family} process tree used {used / 1048576:.1f} GB, over the {ceiling / 1048576:.1f} GB memory ceiling'
             elif silent and a.state == 'running' and now - v.last > silent and not getattr(a, 'retry_waiting', False): v.reason = f'stopped: {a.family} printed nothing for {silent} s while working'
@@ -1974,6 +2180,7 @@ class Daemon:
                 v.reason = f'stopped: the turn ran past its {wall} s wall-clock limit'
             else: continue
             self.log(f'{a.agentId}: {v.reason}')
+            Vendor.log_jobs(v)
             # The vendor's process group and every descendant by pid, since tool commands may leave the group.
             for process in (v.process, v.exec_process):
                 if process:
@@ -1993,7 +2200,7 @@ class Daemon:
             if lock.locked(): continue
             async with lock:
                 if self.agents.get(aid) is not a: continue
-                if a.stream_lock.locked() or a.state in ('running', 'waiting_tool') or datetime.fromisoformat(a.record.get('used', a.created)) >= cutoff: continue
+                if a.stream_lock.locked() or a.state in ('running', 'waiting_tool') or a.jobs or datetime.fromisoformat(a.record.get('used', a.created)) >= cutoff: continue
                 sid = a.vendorSession
                 if not sid or not re.fullmatch(r'[A-Za-z0-9_-]+', sid): continue
                 # Its codex cannot start to archive the thread, so the record stays for a later prune.

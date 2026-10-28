@@ -11,7 +11,7 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
   let streamFinished = false
   // Each /turn or /continue stream takes the next queued event list, else `events`; /row answers `replies.row`.
   const sequence: unknown[][] = []
-  const replies: { row: unknown; allowance?: unknown; steered?: boolean } = { row: { output: 'row output', stopped: false } }
+  const replies: { row: unknown; allowance?: unknown; steered?: boolean; agents?: any[]; roster?: any[]; restore?: any } = { row: { output: 'row output', stopped: false } }
   mock.env(on, { HOME: '/test', ...(socket ? { LORD_DAEMON_SOCKET: socket } : {}), ...env })
   let spawned = 'lord:gpt'
   const clock = mock.clock(on)
@@ -48,7 +48,7 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
   on('session.send', (_, e) => { deliveries.push(e.text); return { isDelivered: true } })
   on('session.receive', (_, e) => ({ text: e.text }))
   const roster: any[] = []
-  on('agent.list', () => ({ value: [{ id: 'a1', type: spawned }, ...roster] as any }))
+  on('agent.list', () => ({ value: replies.roster ?? [{ id: 'a1', type: spawned }, ...roster] as any }))
   const tools = { answer: { result: {}, text: 'child result', ref: 9 } as any }
   const toolCalls: any[] = []
   on('tool.call', (_, e) => { toolCalls.push(e); return tools.answer })
@@ -66,7 +66,7 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
     if (path === '/open' && JSON.parse(e.init!.body!).dirs?.includes('/bad')) return { value: { ok: false, status: 400, headers: {}, text: JSON.stringify({ error: 'every @dir must be an existing directory' }) } }
     if (path === '/health' && failures-- > 0) return { deny: 'socket unavailable' }
     if (path === '/agents' && failures > 0) return { deny: 'socket unavailable' }
-    const result = path === '/agents' ? (!fresh ? [{ agentId: 'a1', family: 'gpt', state: 'running', effort: 'ultra', model: 'fake-gpt', cwd: '/pinned' }]
+    const result = path === '/restore' ? replies.restore ?? { found: false } : path === '/agents' ? replies.agents ?? (!fresh ? [{ agentId: 'a1', family: 'gpt', state: 'running', effort: 'ultra', model: 'fake-gpt', cwd: '/pinned' }]
         : requests.some(x => x.path === '/open') ? [{ agentId: 'a1', family: 'gpt', state: 'running' }] : [])
       : path === '/health' ? { ok: true }
       : path === '/open' ? { vendorSession: 'v1', model: 'fake-gpt', effort: 'high' }
@@ -329,7 +329,7 @@ test('an abandoned vendor turn is interrupted from its completion dispatch', asy
   await spawn($)
   await step($, 'pending')
   await $.turn.complete({ agentId: 'a1', turnId: 't1', answer: '', durationMs: 1, isAborted: true, reason: 'aborted' })
-  expect(w.requests.filter(x => x.path === '/interrupt').map(x => x.body)).toEqual([{ agentId: 'a1' }])
+  expect(w.requests.filter(x => x.path === '/interrupt').map(x => x.body)).toEqual([{ agentId: 'a1', cause: 'aborted' }])
 })
 
 test('a failed connection starts the plugin daemon and retries', async ($, on) => {
@@ -1147,7 +1147,7 @@ test('a launch whose option lines Lord cannot read is refused before an agent st
   world(on)
   on('fs.read', (_, e) => CONFIGS(e.path))
   const call = (prompt: string) => $.tool.call({ tool: 'Agent', tool_use_id: 'L', subagent_type: 'lord:gpt', prompt, description: 'x' } as any) as Promise<any>
-  expect((await call('@efort max\nwork')).deny).toBe('lord: unknown option line: @efort max (options: @model, @effort, @cwd, @dir, @readonly, @net, @nosandbox, @tests, @tools, @memory, @hang, @wall, @nice)')
+  expect((await call('@efort max\nwork')).deny).toBe('lord: unknown option line: @efort max (options: @model, @effort, @cwd, @dir, @readonly, @net, @nosearch, @nosandbox, @tests, @tools, @memory, @hang, @wall, @nice)')
   expect((await call('@model gpt-6-astra\n@model gpt-6-luna\nwork')).deny).toBe('lord: option line repeated: @model gpt-6-luna (only @dir may be given more than once)')
   expect((await call('@dir /a\n@dir /b\nwork')).deny).toBeUndefined()
   // A line naming someone, with more than one word after it, is task text.
@@ -1160,7 +1160,7 @@ test('a launch result carries one line of the settings asked for, defaults inclu
   const call = (prompt: string) => $.tool.call({ tool: 'Agent', tool_use_id: 'L', subagent_type: 'lord:gpt', prompt, description: 'x' } as any) as Promise<any>
   expect((await call('@model gpt-6-astra\n@effort max\n@nice 10\n@dir /d\n@memory 20\n@wall 900\nwork')).context)
     .toEqual(['lord: requested gpt-6-astra max · cwd the agent\'s start folder · dirs /d · sandbox workspace-write · network off · tools off · nice 10 · memory 20 GB · hang none · wall 900 s'])
-  expect((await call('work')).context).toEqual(['lord: requested gpt-6.1-sol high · cwd the agent\'s start folder · dirs none · sandbox workspace-write · network off · tools off · nice 0 · memory 12 GB · hang none · wall none'])
+  expect((await call('work')).context).toEqual(['lord: requested gpt-6.1-sol high · cwd the agent\'s start folder · dirs none · sandbox workspace-write · network off · tools off · nice 0 · memory 24 GB · hang none · wall none'])
 })
 
 test('@nice reaches the daemon with the other limits', async ($, on) => {
@@ -1317,7 +1317,7 @@ test('@tests launch settings use only the existing settings line', async ($, on)
   const w = world(on)
   on('fs.read', (_, e) => CONFIGS(e.path))
   const reply: any = await $.tool.call({ tool: 'Agent', tool_use_id: 'L', subagent_type: 'lord:gpt', prompt: '@tests\nwork', description: 'x' } as any)
-  expect(reply.context).toEqual(["lord: requested gpt-6.1-sol high · cwd the agent's start folder · dirs none · sandbox tests · network off · tools off · nice 0 · memory 12 GB · hang none · wall none"])
+  expect(reply.context).toEqual(["lord: requested gpt-6.1-sol high · cwd the agent's start folder · dirs none · sandbox tests · network off · tools off · nice 0 · memory 24 GB · hang none · wall none"])
   expect(w.toolCalls.length).toBe(1)
 })
 
@@ -1388,4 +1388,111 @@ for (const first of ['tests', 'tools']) test(`@tests with @tools is refused afte
   await step($, `@${first}\nwork`)
   expect((await step($, `@${first === 'tests' ? 'tools' : 'tests'}\nwork`)).result.answer).toContain('@tests cannot be used with @tools')
   expect(w.requests.filter(x => x.path === '/open')).toHaveLength(1)
+})
+
+
+test('v225 @nosearch persists and is removed from the vendor task', async ($, on) => {
+  const w = world(on)
+  await spawn($)
+  await step($, '@nosearch\nwork')
+  await step($, 'again')
+  expect(w.requests.filter(x => x.path === '/open').map(x => x.body.nosearch)).toEqual([true, true])
+  expect(w.requests.filter(x => x.path === '/turn').map(x => x.body.text)).toEqual(['work', 'again'])
+})
+
+for (const family of ['grok', 'gemini']) test(`v225 @nosearch is refused for ${family}`, async ($, on) => {
+  const w = world(on)
+  await spawn($, `lord:${family}`)
+  expect((await step($, '@nosearch\nwork')).result.answer).toContain('@nosearch is available for gpt only')
+  expect(w.requests.filter(x => x.path === '/open')).toEqual([])
+})
+
+for (const cause of [undefined, 'vendor session is missing', 'record is invalid']) test(`v225 a stopped Lord record is restored or refused without Claude: ${cause}`, async ($, on) => {
+  const w = world(on)
+  w.replies.roster = []
+  w.replies.agents = []
+  w.replies.restore = cause ? { found: true, error: `agent a1 cannot be resumed (${cause}); launch a fresh agent` } : {
+    found: true, agent: { family: 'gpt', model: 'fake-gpt', effort: 'max', cwd: '/restored', sandbox: 'tests', network: false, nosearch: true, dirs: ['/extra'], memory_gb: 5, nice: 12 },
+  }
+  on('fs.read', (_, e) => e.path === '/test/.claude/lord/logs/a1.json' ? { value: cause === 'record is invalid' ? '{' : '{}' } : { deny: 'absent' })
+  const { result } = await step($, 'continue')
+  expect(w.modelCalls()).toBe(0)
+  expect(w.requests.find(x => x.path === '/restore')?.body).toEqual({ agentId: 'a1' })
+  if (cause) expect(result.answer).toBe(`lord: error: agent a1 cannot be resumed (${cause}); launch a fresh agent`)
+  else {
+    expect(result.answer).toBe('fake answer')
+    expect(w.requests.find(x => x.path === '/open')?.body).toMatchObject({ cwd: '/restored', model: 'fake-gpt', effort: 'max', tests: true, nosearch: true, memory_gb: 5, nice: 12, dirs: ['/extra'] })
+  }
+})
+
+test('v225 an unknown id without a Lord record keeps its model', async ($, on) => {
+  const w = world(on)
+  w.replies.roster = []
+  w.replies.agents = []
+  w.replies.restore = { found: false }
+  expect((await step($, 'work')).result.answer).toBe('MODEL CALLED')
+  expect(w.modelCalls()).toBe(1)
+})
+
+test('v225 footer and list show live jobs and policy continues', async ($, on) => {
+  const jobs = [{ pid: 12345, command: 'sleep 300', age_s: 8 }]
+  const w = world(on, [{ type: 'done', text: 'answer', record: { ...RECORD, jobs, policy_continues: 1 } }])
+  await spawn($)
+  expect((await step($, 'work')).result.answer).toContain('1 policy continue')
+  w.events.splice(0, w.events.length, { type: 'done', text: 'answer', record: { ...RECORD, jobs } })
+  expect((await step($, 'work')).result.answer).toContain('12345 sleep 300 (8 s)')
+  w.replies.agents = [{ agentId: 'a1', family: 'gpt', state: 'idle', jobs }]
+  expect((await $.command.run({ command: 'lord', args: '' })).text).toContain('12345 sleep 300 (8 s)')
+})
+
+test('v225 completion forwards the engine stop reason', async ($, on) => {
+  const w = world(on)
+  await spawn($)
+  await step($, 'work')
+  await $.turn.complete({ agentId: 'a1', turnId: 't1', answer: '', durationMs: 1, isAborted: true, reason: 'aborted' })
+  expect(w.requests.find(x => x.path === '/interrupt')?.body).toEqual({ agentId: 'a1', cause: 'aborted' })
+})
+
+test('v225 session end requests cleanup of its agents', async ($, on) => {
+  const w = world(on)
+  on('session.end', (_, e) => ({ sessionId: e.sessionId }))
+  await $.session.end({ sessionId: 'caller', reason: 'clear', resume: {} } as any)
+  expect(w.requests.find(x => x.path === '/session_end')?.body).toEqual({ session: 'caller', cause: 'session end: clear' })
+})
+
+
+test('v225 a Lord roster entry whose record is missing refuses resume', async ($, on) => {
+  const w = world(on)
+  w.replies.agents = []
+  w.replies.restore = { found: false }
+  expect((await step($, 'continue')).result.answer).toBe('lord: error: agent a1 cannot be resumed (record is missing); launch a fresh agent')
+  expect(w.modelCalls()).toBe(0)
+  expect(w.requests.filter(x => x.path === '/open')).toEqual([])
+})
+
+test('v225 an engine resume restores the old Lord identity before opening', async ($, on) => {
+  const w = world(on)
+  w.replies.agents = [{ agentId: 'a1', family: 'gpt', model: 'fake-gpt', effort: 'high', cwd: '/pinned' }]
+  await $.agent.spawn({ tool_use_id: 'resume1', prompt: 'continue', description: 'test', subagentType: 'lord:gpt', provider: { plugin: 'lord', tier: 'user' }, parentModel: 'haiku', background: true, fork: false, resume: { agentId: 'a1' } } as any)
+  await step($, 'continue')
+  expect(w.requests.find(x => x.path === '/open')?.body.resume).toBe(true)
+})
+
+
+test('v225 daemon resume failures keep the required error prefix', async ($, on) => {
+  const message = 'agent a1 cannot be resumed (vendor session is missing); launch a fresh agent'
+  world(on, [{ type: 'error', message: 'open: ' + message }])
+  await spawn($)
+  expect((await step($, 'continue')).result.answer).toBe('lord: error: ' + message)
+})
+
+
+test('v225 a Lord record takes precedence over an unrecognized roster type', async ($, on) => {
+  const w = world(on)
+  w.replies.agents = []
+  w.replies.restore = { found: true, agent: { family: 'gpt', cwd: '/restored', model: 'fake-gpt', effort: 'high' } }
+  on('fs.read', (_, e) => e.path === '/test/.claude/lord/logs/a1.json' ? { value: '{}' } : { deny: 'absent' })
+  await spawn($, 'general-purpose')
+  expect((await step($, 'continue')).result.answer).toBe('fake answer')
+  expect(w.modelCalls()).toBe(0)
 })

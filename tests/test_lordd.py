@@ -522,7 +522,7 @@ def test_interrupt_pending_mcp_keeps_other_turn_alive(rig, family):
         rig.request('/interrupt', {'agentId': 'b'})
         assert list(other)[-1]['type'] == 'error'
         assert rig.turn('PING', agent='b')[-1]['text'] == 'PONG'
-    assert len([e for e in rig.audit() if e.get('launch')]) == 2
+    assert len([e for e in rig.audit() if e.get('launch')]) == (2 if family == 'gpt' else 3)
 
 
 def test_codex_lord_tools_are_trusted_and_required(rig):
@@ -572,7 +572,7 @@ def test_interrupt_during_codex_start_does_not_kill_shared_process(rig, monkeypa
             v.rpc = gated
             await d.begin(a, {'text': 'PING'})
             await d.interrupt(a)
-            assert v.process.returncode is None and b.state == 'running'
+            assert v.process is None and b.state == 'running'
             release.set()
             await asyncio.wait_for(a.finished.wait(), 2)
             assert a.state == 'idle'
@@ -703,7 +703,7 @@ def test_interrupt_before_grok_prompt_is_dispatched(rig, monkeypatch):
             await d.interrupt(a)
             await asyncio.wait_for(a.finished.wait(), 2)
             await asyncio.sleep(.1)
-            assert v.process and v.process.returncode is None
+            assert v.process is None
             assert not any(e.get('method') == 'session/prompt' for e in rig.audit())
         finally:
             await d.close()
@@ -1402,6 +1402,8 @@ def test_agy_narration_before_a_tool_step_is_not_the_answer():
     m = load('lordd_agy')
     a = m.Agent({'agentId': 'g', 'family': 'gemini', 'cwd': '.', 'model': 'gemini-4-argon'}); a.state = 'running'
     d = object.__new__(m.Daemon); d.agents = {'g': a}; d.redact = str; d.save = lambda a: None
+    async def finish(agent, **value): agent.emit('done', **value)
+    d.finish, d.task = finish, asyncio.run
     v = m.Vendor(d, 'gemini', a)
     v.notification({'event': 'step_update', 'step_update': {'step_type': 'agent_response', 'text_delta': 'narration'}})
     v.notification({'event': 'step_update', 'step_update': {'step_type': 'run_command', 'command': 'ls'}})
@@ -2277,9 +2279,8 @@ def test_at_capacity_before_any_edit_retries_the_same_session(rig):
     assert 'vendor at capacity (Selected model is at capacity); retry 1' in (rig.home / 'logs/a.log').read_text()
     starts = [e['params'] for e in rig.audit() if e.get('method') == 'turn/start']
     assert len({s['threadId'] for s in starts}) == 1 and starts[-1]['input'][0]['text'].startswith('Continue with the task above')
-    # After an edit the turn is not repeated.
-    failed = rig.turn('BUSY_EDIT')[-1]
-    assert failed['type'] == 'error' and failed['record']['ended_how'] == 'error (serverOverloaded)' and failed['record']['retries'] == 0
+    done = rig.turn('BUSY_EDIT')[-1]
+    assert done['type'] == 'done' and done['record']['retries'] == 1
 
 
 def test_an_error_sent_before_the_turns_completion_keeps_its_kind_and_restarts_codex(rig):
@@ -2331,9 +2332,9 @@ def test_each_turn_has_a_record_a_kept_answer_and_a_footer_and_prune_removes_the
 def test_open_and_every_turn_state_the_effective_settings_with_their_defaults(rig):
     opened = rig.open('gpt', dirs=[str(rig.home)], wall_s=900)
     # The niceness reported is the one the vendor runs at: the daemon's own, here the test's.
-    assert opened['memory_gb'] == 12.0 and opened['wall_s'] == 900 and opened['hang_s'] is None and opened['nice'] == os.getpriority(os.PRIO_PROCESS, 0)
+    assert opened['memory_gb'] == 24.0 and opened['wall_s'] == 900 and opened['hang_s'] is None and opened['nice'] == os.getpriority(os.PRIO_PROCESS, 0)
     assert opened['dirs'] == [str(rig.home.resolve())] and opened['sandbox'] == 'workspace-write' and opened['network'] is False
-    assert opened['line'].startswith(f"cwd {rig.home.resolve()} · dirs {rig.home.resolve()} · sandbox workspace-write · network off · web search live · tools off · nice {opened['nice']} · memory 12.0 GB")
+    assert opened['line'].startswith(f"cwd {rig.home.resolve()} · dirs {rig.home.resolve()} · sandbox workspace-write · network off · web search live · tools off · nice {opened['nice']} · memory 24.0 GB")
     rig.turn('PING')
     line = next(l for l in (rig.home / 'logs/a.log').read_text().splitlines() if ' turn: ' in l)
     assert line.endswith(f"turn: gpt {opened['model']} effort {opened['effort']} · {opened['line']}")
@@ -2387,9 +2388,9 @@ def test_a_queued_message_runs_as_the_next_turn_and_the_answer_carries_both(rig)
 
 def test_a_refused_open_names_the_folder_and_is_logged(rig):
     conn, file, status, _ = rig.connect('/open', {'agentId': 'x', 'family': 'gpt', 'cwd': str(rig.home), 'dirs': [str(rig.home), '/no/such/dir']})
-    try: assert status == 400 and json.loads(file.read())['error'] == '@dir /no/such/dir is not an existing directory'
+    try: assert status == 400 and json.loads(file.read())['error'] == '@dir /no/such/dir does not exist'
     finally: file.close(); conn.close()
-    assert 'x: open refused: @dir /no/such/dir is not an existing directory' in (rig.home / 'lordd.log').read_text()
+    assert 'x: open refused: @dir /no/such/dir does not exist' in (rig.home / 'lordd.log').read_text()
 
 
 def test_the_daemon_and_its_vendors_helpers_run_from_lords_own_folder(rig):
@@ -2398,10 +2399,11 @@ def test_the_daemon_and_its_vendors_helpers_run_from_lords_own_folder(rig):
 
 
 
-def test_a_helpers_edit_counts_as_the_turns_edit_so_at_capacity_is_not_retried(rig):
+def test_a_helpers_edit_counts_as_the_turns_edit_during_capacity_retry(rig):
+    restart_with(rig, capacity_retry_s=.01)
     rig.open('gpt')
-    failed = rig.turn('HELPER_BUSY')[-1]
-    assert failed['type'] == 'error' and failed['record']['retries'] == 0 and failed['record']['ended_how'] == 'error (serverOverloaded)'
+    done = rig.turn('HELPER_BUSY')[-1]
+    assert done['type'] == 'done' and done['record']['retries'] == 1
 
 
 def test_messages_queued_one_after_another_keep_every_result(rig):
@@ -2946,6 +2948,8 @@ def test_tests_exec_server_tree_dies_with_vendor(tests_backend, rig, stop):
                 v.reason = 'stopped: test guard'
                 ex.kill()
             elif stop == 'idle':
+                os.kill(child, signal.SIGTERM)
+                await asyncio.sleep(.1)
                 v.last = 0
                 await d.guard(time.monotonic())
             else:
@@ -3004,7 +3008,7 @@ def test_tests_failed_start_is_bounded_and_reaps_both(tests_backend, rig, failur
 def test_tests_exec_start_preserves_vendor_home_and_creates_no_lord_files(tests_backend, rig, own_home):
     d, m, _ = tests_backend
     async def scenario():
-        a = types.SimpleNamespace(agentId='a', cwd=str(rig.home / 'work'), record={})
+        a = m['Agent']({'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home / 'work'), 'model': 'gpt-6.1-sol'})
         v = m['Vendor'](d, 'gpt', a)
         env = m['subscription_env']()
         if own_home: env['CODEX_HOME'] = str(d.journal.parent / 'codex')
@@ -3255,7 +3259,7 @@ print(json.dumps(result))
 
 
 @pytest.mark.parametrize('phase', ['first', 'enable', 'add_dir', 'start'])
-@pytest.mark.parametrize('kind', ['cwd_leaf', 'cwd_parent', 'dir_leaf', 'dir_parent', 'tmp_leaf', 'tmp_parent',
+@pytest.mark.parametrize('kind', ['tmp_leaf', 'tmp_parent',
                                  'home_leaf', 'home_parent', 'home_cwd', 'home_dir', 'home_tmp', 'home_tmp_alias', 'home_var_alias', 'home_var_leaf'])
 def test_tests_refuses_unsafe_layout_at_open_and_start(tests_backend, rig, monkeypatch, phase, kind):
     d, m, launched = tests_backend
@@ -4142,7 +4146,8 @@ def test_tests_watch_exec_kills_detached_child_recorded_by_guard(tmp_path):
     async def scenario():
         d = object.__new__(m.Daemon)
         d.stopping, d.config = False, {'idle_exit_s': 60, 'gpt': {}}
-        a = types.SimpleNamespace(state='running', record={}, family='gpt')
+        a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': str(tmp_path), 'model': 'gpt-6.1-sol'}); a.state = 'running'
+        d.log = lambda text: None
         v = m.Vendor(d, 'gpt', a)
         d.vendors = {'a': v}
         child = None
@@ -4175,3 +4180,317 @@ def test_tests_watch_exec_kills_detached_child_recorded_by_guard(tmp_path):
                 except ProcessLookupError: pass
             await v.close()
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('family', ['gpt', 'grok', 'gemini'])
+def test_v225_jobs_survive_idle_close_and_exit_then_stop(rig, family):
+    restart_with(rig, process_idle_s=.1, idle_exit_s=.3)
+    rig.open(family)
+    done = rig.turn('BACKGROUND')[-1]
+    pid = next(e['command_pid'] for e in rig.audit() if 'command_pid' in e)
+    try:
+        assert any(j['pid'] == pid and 'sleep' in j['command'] and j['age_s'] >= 0 for j in done['record']['jobs'])
+        assert json.loads((rig.home / 'logs/a.json').read_text())['turns'][-1]['jobs'] == done['record']['jobs']
+        time.sleep(.8)
+        assert rig.proc.poll() is None
+        os.kill(pid, 0)
+        assert any(j['pid'] == pid for j in rig.request('/agents')[0]['jobs'])
+        rig.request('/interrupt', {'agentId': 'a'})
+        deadline = time.monotonic() + 3
+        while True:
+            try: os.kill(pid, 0)
+            except ProcessLookupError: break
+            assert time.monotonic() < deadline
+            time.sleep(.02)
+        assert f'killing job {pid}: sleep' in (rig.home / 'logs/a.log').read_text()
+    finally:
+        try: os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError: pass
+
+
+def test_v225_finished_jobs_allow_normal_idle_close(rig):
+    restart_with(rig, process_idle_s=.1)
+    rig.open('gpt')
+    rig.turn('BACKGROUND')
+    pid = next(e['command_pid'] for e in rig.audit() if 'command_pid' in e)
+    os.kill(pid, signal.SIGTERM)
+    time.sleep(1.5)
+    rig.turn('PING')
+    assert len([e for e in rig.audit() if e.get('launch')]) == 2
+
+
+@pytest.mark.parametrize('prompt', ['BUSY_EDIT', 'HELPER_BUSY'])
+def test_v225_capacity_after_edits_continues_same_session(rig, prompt):
+    restart_with(rig, capacity_retry_s=.01)
+    rig.open('gpt')
+    done = rig.turn(prompt)[-1]
+    assert done['type'] == 'done' and done['record']['retries'] == 1
+    starts = [e['params'] for e in rig.audit() if e.get('method') == 'turn/start']
+    assert len({p['threadId'] for p in starts}) == 1
+    assert starts[-1]['input'][0]['text'] == 'Continue with the task above. Your previous turn stopped because the model was at capacity; check what you already finished before repeating anything.'
+
+
+def test_v225_capacity_backoff_and_default_three(tmp_path):
+    m = load('lordd_v225_backoff')
+    async def scenario():
+        d = object.__new__(m.Daemon); d.config = {}; d.redact = str; waits = []
+        d.retry = lambda a, delay: waits.append(delay)
+        d.task = lambda value: None
+        a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '/tmp/x', 'model': 'gpt-6.1-sol'})
+        a.state = 'running'
+        v = m.Vendor(d, 'gpt', a)
+        for i in range(4): v.failed(a, {'codexErrorInfo': 'serverOverloaded', 'message': 'capacity'}, 'failed', str(i))
+        return waits, a.retries
+    assert asyncio.run(scenario()) == ([30, 120, 480], 3)
+
+
+def test_v225_fake_vendor_40mb_resume(rig):
+    restart_with(rig, **{'gpt.program': [PYTHON, str(ROOT / 'tests/fakes/vendor.py'), 'gpt', str(rig.data), '--large-resume']})
+    sid = rig.open('gpt')['vendorSession']
+    rig.turn('remember')
+    rig.request('/close', {'agentId': 'a'})
+    assert rig.open('gpt')['vendorSession'] == sid
+    assert rig.turn('REMEMBER')[-1]['text'] == 'remember'
+
+
+@pytest.mark.parametrize('family', ['gpt', 'grok', 'gemini'])
+def test_v225_restore_from_turn_record_without_journal(rig, family):
+    opened = rig.open(family, memory_gb=3, nice=12)
+    rig.turn('remember')
+    rig.stop(); (rig.home / 'journal.jsonl').unlink(); rig.start()
+    result = rig.request('/restore', {'agentId': 'a'})
+    assert result['found'] and result['agent']['model'] == opened['model']
+    assert result['agent']['memory_gb'] == 3 and result['agent']['nice'] == 12
+    assert rig.open(family)['vendorSession'] == opened['vendorSession']
+    assert rig.turn('REMEMBER')[-1]['text'] == 'remember'
+
+
+@pytest.mark.parametrize('record', ['malformed', 'no-session'])
+def test_v225_restore_refuses_known_record_and_unknown_id_is_unaffected(rig, record):
+    logs = rig.home / 'logs'; logs.mkdir(exist_ok=True)
+    (logs / 'a.json').write_text('{' if record == 'malformed' else json.dumps({'family': 'gpt', 'cwd': str(rig.home), 'model': 'gpt-6.1-sol'}))
+    result = rig.request('/restore', {'agentId': 'a'})
+    assert result['found'] and 'agent a cannot be resumed' in result['error'] and 'launch a fresh agent' in result['error']
+    assert rig.request('/restore', {'agentId': 'unknown'}) == {'found': False}
+    assert json.loads((logs / 'a.json').read_text())['turns'][-1]['ended_how'] == 'refused'
+
+
+@pytest.mark.parametrize('chosen', ['', 'web_search = "live"', 'web_search = "cached"', '[features]\nweb_search_cached = true'])
+def test_v225_nosearch_overrides_config_on_start_and_resume(rig, chosen):
+    folder = rig.data / '.codex'; folder.mkdir(parents=True)
+    (folder / 'config.toml').write_text(chosen)
+    opened = rig.open('gpt', nosearch=True)
+    assert opened['web_search'] == 'off' and 'web search off' in opened['line']
+    rig.turn('PING')
+    rig.request('/close', {'agentId': 'a'})
+    rig.open('gpt')
+    configs = [e['params']['config'] for e in rig.audit() if e.get('method') in ('thread/start', 'thread/resume')]
+    assert len(configs) == 2 and all(c['web_search'] == 'disabled' for c in configs)
+
+
+def test_v225_default_memory_and_version():
+    m = load('lordd_v225_defaults')
+    d = object.__new__(m.Daemon); d.config = {'gpt': {}}
+    a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '/tmp/x', 'model': 'gpt-6.1-sol'})
+    assert d.settings(a)['memory_gb'] == 24
+    assert json.loads((ROOT / 'config.json').read_text())['memory_ceiling_kb'] == 24 * 1048576
+    assert json.loads((ROOT / '.claude-plugin/plugin.json').read_text())['version'] == '2.2.5'
+
+
+@pytest.mark.parametrize('phase', ['launch', 'resume'])
+def test_v225_refused_open_leaves_a_turn_record(rig, phase):
+    if phase == 'resume': rig.open('gpt'); rig.turn('PING')
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home), 'dirs': ['/no/such/folder']})
+    message = json.loads(file.read())['error']; file.close(); conn.close()
+    assert status == 400 and message == '@dir /no/such/folder does not exist'
+    record = json.loads((rig.home / 'logs/a.json').read_text())
+    assert record['turns'][-1]['ended_how'] == 'refused' and record['turns'][-1]['error'] == message
+    assert len(record['turns']) == (2 if phase == 'resume' else 1)
+
+
+@pytest.mark.parametrize('root', ['cwd', 'dir'])
+def test_v225_tests_symlink_roots_resolve_at_launch(tests_backend, rig, root):
+    d, _, launched = tests_backend
+    real = rig.home / 'real'; real.mkdir()
+    link = rig.home / 'link'; link.symlink_to(real, target_is_directory=True)
+    async def scenario():
+        try:
+            opened = await d.open({'agentId': 'a', 'family': 'gpt', 'cwd': str(link if root == 'cwd' else rig.home / 'work'), 'dirs': [str(link)] if root == 'dir' else [], 'tests': True})
+            assert str(real) in opened['line'] and str(link) not in opened['line']
+            args = next(argv for argv, _ in launched if '/usr/bin/sandbox-exec' in argv)
+            assert f'-DROOT_{0 if root == "cwd" else 1}={real}' in args
+        finally: await d.close()
+    asyncio.run(scenario())
+
+
+def test_v225_shell_reads_parse_real_multiline_text_and_deduplicate():
+    m = load('lordd_v225_shell')
+    a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '/tmp/x', 'model': 'gpt-6.1-sol'})
+    item = {'type': 'commandExecution', 'cwd': '/tmp/x', 'command': '/bin/zsh -lc \'cat a\ncat "b c"; head -n 2 d && tail -5 e || sed -n "1,5p" f | nl g; wc -l h; rg -n "pat" i; grep -e "pat" j; less k; cat a\'', 'commandActions': [{'type': 'read', 'path': 'a'}]}
+    a.read_paths(m.codex_reads(item))
+    lines = a.reads_path.read_text().splitlines()
+    assert lines == ['read /tmp/x/a', *[f'shell /tmp/x/{p}' for p in ('b c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k')]]
+
+
+def test_v225_policy_refusal_continues_once_same_session(rig):
+    rig.open('gpt')
+    done = rig.turn('CYBER_ONCE')[-1]
+    assert done['type'] == 'done' and done['record']['policy_continues'] == 1
+    starts = [e['params'] for e in rig.audit() if e.get('method') == 'turn/start']
+    assert len(starts) == 2 and starts[0]['threadId'] == starts[1]['threadId']
+    assert starts[-1]['input'][0]['text'] == "Your last step was refused by the vendor's policy filter. Continue the task without that step."
+    assert json.loads((rig.home / 'logs/a.json').read_text())['turns'][-1]['policy_continues'] == 1
+
+
+def test_v225_memory_warns_once_through_steer(tests_backend, rig):
+    d, m, _ = tests_backend
+    async def scenario():
+        try:
+            await d.open({'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home / 'work'), 'memory_gb': 1})
+            a = d.agents['a']; v = d.backend(a)
+            await d.begin(a, {'text': 'SLOW'})
+            while not a.turn_id: await asyncio.sleep(.01)
+            sent = []
+            async def rpc(method, params, **kw): sent.append((method, params)); return {}
+            v.rpc = rpc
+            async def table(): return {}, {v.process.pid: int(.86 * 1048576)}
+            m['process_table'] = table
+            await d.guard(time.monotonic()); await d.guard(time.monotonic())
+            assert len(sent) == 1 and sent[0][0] == 'turn/steer'
+            assert sent[0][1]['input'][0]['text'] == 'Memory: 0.9 GB of the 1.0 GB ceiling; at the ceiling Lord stops the turn and its processes.'
+            assert 'Memory: 0.9 GB' in a.log_path.read_text()
+        finally: await d.close()
+    asyncio.run(scenario())
+
+
+def test_v225_interrupt_records_engine_cause(rig):
+    rig.open('gpt')
+    stream = rig.stream('/turn', {'agentId': 'a', 'text': 'SLOW'})
+    next(stream)
+    rig.request('/interrupt', {'agentId': 'a', 'cause': 'no-progress watchdog'})
+    failed = list(stream)[-1]
+    assert 'no-progress watchdog' in failed['message']
+    assert json.loads((rig.home / 'logs/a.json').read_text())['turns'][-1]['stop_cause'] == 'no-progress watchdog'
+
+
+def test_v225_session_end_stops_idle_jobs(rig):
+    rig.open('gpt', session='caller')
+    rig.turn('BACKGROUND')
+    pid = next(e['command_pid'] for e in rig.audit() if 'command_pid' in e)
+    try:
+        rig.request('/session_end', {'session': 'caller', 'cause': 'session ended'})
+        with pytest.raises(ProcessLookupError): os.kill(pid, 0)
+    finally:
+        try: os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError: pass
+
+
+@pytest.mark.skipif(sys.platform != 'darwin', reason='macOS Seatbelt profile')
+def test_v225_tests_priority_and_pgrep(tmp_path):
+    m = load('lordd_v225_priority')
+    m.HOME = tmp_path / 'lord'
+    profile, params = m.tests_profile(str(tmp_path), [], {'TMPDIR': str(tmp_path / 'temp')})
+    before = os.getpriority(os.PRIO_PROCESS, 0)
+    lower = subprocess.run(['/usr/bin/sandbox-exec', '-p', profile, *params, '/usr/bin/nice', '-n', '10', PYTHON, '-c', 'import os; print(os.getpriority(os.PRIO_PROCESS, 0))'], capture_output=True, text=True, timeout=8)
+    assert lower.returncode == 0 and not lower.stderr and int(lower.stdout) == min(20, before + 10)
+    raising = subprocess.run(['/usr/bin/sandbox-exec', '-p', profile, *params, '/usr/bin/nice', '-n', '-5', PYTHON, '-c', 'import os; print(os.getpriority(os.PRIO_PROCESS, 0))'], capture_output=True, text=True, timeout=8)
+    assert 'Permission denied' in raising.stderr and int(raising.stdout) == before
+    decoy = subprocess.Popen([PYTHON, '-c', 'import time; time.sleep(30)', 'python-decoy'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        found = subprocess.run(['/usr/bin/sandbox-exec', '-p', profile, *params, '/usr/bin/pgrep', '-fl', 'python'], capture_output=True, text=True, timeout=8)
+        assert found.returncode == 0 and any(line.startswith(str(decoy.pid) + ' ') for line in found.stdout.splitlines())
+    finally: decoy.terminate(); decoy.wait(timeout=5)
+
+
+def test_v225_public_directives_and_version():
+    for name in ('README.md', 'CONTRACT.md', 'PRIVACY.md', 'agents/gpt.md'):
+        assert '@nosearch' in (ROOT / name).read_text(), name
+    assert json.loads((ROOT / '.claude-plugin/plugin.json').read_text())['version'] == '2.2.5'
+
+
+@pytest.mark.parametrize('options', [{}, {'readonly': True}, {'net': True}, {'nosandbox': True}, {'tests': True}])
+def test_v225_jobs_survive_in_every_gpt_mode(tests_backend, rig, options):
+    d, _, _ = tests_backend
+    async def scenario():
+        try:
+            await d.open({'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home / 'work'), **options})
+            a = d.agents['a']; v = d.backend(a)
+            await d.begin(a, {'text': 'BACKGROUND'})
+            await asyncio.wait_for(a.finished.wait(), 3)
+            pid = next(e['command_pid'] for e in rig.audit() if 'command_pid' in e)
+            v.last = 0
+            await d.guard(time.monotonic())
+            assert v.process is not None and v.process.returncode is None
+            os.kill(pid, 0)
+            if options.get('tests'):
+                child = next(e['child'] for e in rig.audit() if e.get('exec_launch'))
+                assert {pid, child} <= {j['pid'] for j in a.jobs}
+            await d.interrupt(a)
+            with pytest.raises(ProcessLookupError): os.kill(pid, 0)
+        finally: await d.close()
+    asyncio.run(scenario())
+
+
+def test_v225_oversized_resume_names_rollout_size_and_records_refusal(rig):
+    sid = rig.open('gpt')['vendorSession']
+    rig.turn('PING')
+    rig.stop()
+    folder = rig.data / '.codex/sessions/2026/01/01'; folder.mkdir(parents=True)
+    with (folder / f'rollout-test-{sid}.jsonl').open('wb') as file: file.truncate(33 * 1048576)
+    restart_with(rig, **{'gpt.program': [PYTHON, str(ROOT / 'tests/fakes/vendor.py'), 'gpt', str(rig.data), '--resume-limit-error']})
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home)})
+    message = json.loads(file.read())['error']; file.close(); conn.close()
+    assert status == 503 and message == 'session too large to resume (33 MB); start a fresh agent with a takeover brief'
+    record = json.loads((rig.home / 'logs/a.json').read_text())['turns'][-1]
+    assert record['ended_how'] == 'refused' and record['error'] == message
+
+
+def test_v225_restore_missing_vendor_session_refuses_visibly(rig):
+    sid = rig.open('gpt')['vendorSession']
+    rig.turn('PING')
+    rig.stop(); (rig.home / 'journal.jsonl').unlink(); (rig.data / f'{sid}.json').unlink(); rig.start()
+    assert rig.request('/restore', {'agentId': 'a'})['found']
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home)})
+    message = json.loads(file.read())['error']; file.close(); conn.close()
+    assert status == 503 and 'agent a cannot be resumed' in message and 'launch a fresh agent' in message
+    assert json.loads((rig.home / 'logs/a.json').read_text())['turns'][-1]['ended_how'] == 'refused'
+
+
+def test_v225_shell_reads_deduplicate_across_commands():
+    m = load('lordd_v225_reads_again')
+    a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '/tmp/x', 'model': 'gpt-6.1-sol'})
+    a.read_paths([('read', '/tmp/x/a')])
+    a.read_paths([('shell', '/tmp/x/a'), ('shell', '/tmp/x/b'), ('shell', '/tmp/x/b')])
+    a.read_paths([('read', '/tmp/x/b'), ('edit', '/tmp/x/b')])
+    assert a.reads_path.read_text().splitlines() == ['read /tmp/x/a', 'shell /tmp/x/b', 'edit /tmp/x/b']
+
+
+def test_v225_helper_processes_are_excluded_but_jobs_remain(tmp_path, monkeypatch):
+    m = load('lordd_v225_helper_jobs')
+    from unittest.mock import AsyncMock
+    output = b'101 S 01:02 /usr/bin/python3 /tmp/plugin/lordd.py --mcp a\n102 S 1-02:03:04 /tmp/codex-code-mode-host\n103 S 00:08 sleep 300\n104 Z 00:01 sleep 300\n'
+    monkeypatch.setattr(m.asyncio, 'create_subprocess_exec', AsyncMock(return_value=types.SimpleNamespace(communicate=AsyncMock(return_value=(output, b'')))))
+    assert asyncio.run(m.job_details({101, 102, 103, 104})) == [{'pid': 103, 'command': 'sleep 300', 'age_s': 8}]
+
+
+def test_v225_version_is_225():
+    assert json.loads((ROOT / '.claude-plugin/plugin.json').read_text())['version'] == '2.2.5'
+
+
+def test_v225_shell_options_do_not_become_read_paths():
+    m = load('lordd_v225_shell_options')
+    assert m.shell_reads('cat -e a > out; rg --glob "*.py" --regexp=needle b; sed -n -e "1p" c; nl -w 4 d', '/tmp/x') == ['/tmp/x/a', '/tmp/x/b', '/tmp/x/c', '/tmp/x/d']
+
+
+@pytest.mark.parametrize('missing', ['record', 'vendor-session'])
+def test_v225_known_resume_never_starts_a_new_conversation(rig, missing):
+    sid = rig.open('gpt', session='caller')['vendorSession']
+    rig.turn('PING')
+    rig.stop()
+    if missing == 'record': (rig.home / 'logs/a.json').unlink()
+    else: (rig.data / f'{sid}.json').unlink()
+    rig.start()
+    conn, file, status, _ = rig.connect('/open', {'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home), 'resume': True})
+    body = json.loads(file.read()); file.close(); conn.close()
+    assert status != 200 and 'agent a cannot be resumed' in body['error'] and 'launch a fresh agent' in body['error']
+    assert json.loads((rig.home / 'logs/a.json').read_text())['turns'][-1]['ended_how'] == 'refused'

@@ -5,7 +5,8 @@ import type { LordAgent as Agent, LordTask as Task } from '../types'
 // failed: the turn's new message failed though an earlier answer was delivered; model: the model the daemon ran.
 // record: the daemon's account of the finished turn, for the answer's footer.
 type Stream = { next: number; live: number; answer: string; shown: string; failed?: boolean; model?: string; record?: TurnRecord }
-type TurnRecord = { ended_how: string; model: string; effort: string; started: string; ended: string; commands: number; retries: number; helpers: string[]; session?: string }
+type Job = { pid: number; command: string; age_s: number }
+type TurnRecord = { ended_how: string; model: string; effort: string; started: string; ended: string; commands: number; retries: number; helpers: string[]; session?: string; jobs?: Job[]; policy_continues?: number }
 type Outcome = { tool?: { callId: string; name: string; input: Record<string, unknown> }; row?: { rowId: string; shell: boolean; title: string } }
 // A vendor's tool steps are drawn as rows: a shell command as a Bash row, any other step under the plugin's own tool for
 // that vendor, which Claude Code labels "lord - <family>". Neither runs anything; the plugin answers each with the
@@ -65,6 +66,7 @@ function task(text: string): Task {
     else if (/^@effort\s+(minimal|low|medium|high|xhigh|max|ultra)\s*$/.test(line)) result.effort = line.split(/\s+/)[1]
     else if (line === '@readonly') result.readonly = true
     else if (line === '@net') result.net = true
+    else if (line === '@nosearch') result.nosearch = true
     else if (line === '@nosandbox') result.nosandbox = true
     else if (line === '@tests') result.tests = true
     else if (/^@memory\s+\d+(\.\d+)?\s*$/.test(line)) result.limits = { ...result.limits, memory_gb: Number(line.split(/\s+/)[1]) }
@@ -75,7 +77,7 @@ function task(text: string): Task {
     else if (/^@cwd\s+\S/.test(line)) result.cwd = line.replace(/^@cwd\s+/, '')
     else if (/^@dir\s+\S/.test(line)) result.dirs = [...(result.dirs ?? []), line.replace(/^@dir\s+/, '')]
     // A known option written wrongly would end the options here and leave the rest (an @readonly, say) as task text.
-    else if (/^@(model|effort|readonly|net|nosandbox|tests|memory|hang|wall|tools|cwd|dir|nice)\b/.test(line)) { result.error = `option line not understood: ${line}`; break }
+    else if (/^@(model|effort|readonly|net|nosearch|nosandbox|tests|memory|hang|wall|tools|cwd|dir|nice)\b/.test(line)) { result.error = `option line not understood: ${line}`; break }
     // A misspelt option would otherwise run the task at a default (@efort max at high effort).
     else if (word) { result.error = `unknown option line: ${line} (options: ${OPTIONS})`; break }
     else break
@@ -86,10 +88,11 @@ function task(text: string): Task {
   return result
 }
 
-const OPTIONS = '@model, @effort, @cwd, @dir, @readonly, @net, @nosandbox, @tests, @tools, @memory, @hang, @wall, @nice'
+const OPTIONS = '@model, @effort, @cwd, @dir, @readonly, @net, @nosearch, @nosandbox, @tests, @tools, @memory, @hang, @wall, @nice'
 const KNOWN = new Set(OPTIONS.split(', ').map(option => option.slice(1)))
 
 function testsError(family: string, options: Partial<Task>): string | undefined {
+  if (options.nosearch && family !== 'gpt') return '@nosearch is available for gpt only'
   if (!options.tests) return undefined
   if (family !== 'gpt') return '@tests is available for gpt only'
   for (const clash of ['readonly', 'nosandbox', 'net'] as const)
@@ -110,11 +113,24 @@ function signed(text: string, record: TurnRecord | undefined): string {
   try { JSON.parse(text.trim()); return text } catch {}
   const time = (iso: unknown) => typeof iso === 'string' ? iso.slice(11, 19) + 'Z' : '?'
   const helpers = record.helpers?.length ? ` · ${record.helpers.length} helper${record.helpers.length > 1 ? 's' : ''} (${[...new Set(record.helpers)].join(', ')})` : ''
-  return `${text}\n\n[lord: ${record.ended_how} · ${record.model} ${record.effort} · ${time(record.started)} to ${time(record.ended)} · ${record.commands} command${record.commands === 1 ? '' : 's'}${helpers}${record.retries ? ` · ${record.retries} retr${record.retries > 1 ? 'ies' : 'y'} at capacity` : ''}${record.session ? ` · session ${record.session}` : ''}]`
+  return `${text}\n\n[lord: ${record.ended_how} · ${record.model} ${record.effort} · ${time(record.started)} to ${time(record.ended)} · ${record.commands} command${record.commands === 1 ? '' : 's'}${helpers}${record.retries ? ` · ${record.retries} retr${record.retries > 1 ? 'ies' : 'y'} at capacity` : ''}${record.policy_continues ? ` · ${record.policy_continues} policy continue` : ''}${record.jobs?.length ? ` · jobs: ${jobLine(record.jobs)}` : ''}${record.session ? ` · session ${record.session}` : ''}]`
+}
+
+function jobLine(jobs: Job[]): string { return jobs.map(job => `${job.pid} ${job.command} (${job.age_s} s)`).join('; ') }
+
+function stopCause(signal: AbortSignal): string | undefined {
+  const reason = signal.reason
+  if (typeof reason === 'string') return reason
+  if (reason instanceof Error) return reason.message
+  if (reason && typeof reason === 'object') {
+    const value = reason as Record<string, unknown>
+    for (const key of ['message', 'cause', 'reason', 'type']) if (typeof value[key] === 'string') return value[key]
+  }
+  return undefined
 }
 
 function errorLine(error: unknown): string {
-  return 'lord: error: ' + String(error instanceof Error ? error.message : error).replace(/\s+/g, ' ').trim()
+  return 'lord: error: ' + String(error instanceof Error ? error.message : error).replace(/\s+/g, ' ').trim().replace(/^(?:open|turn): ((?:session too large to resume|agent \S+ cannot be resumed)\b)/, '$1')
 }
 
 const HANDBACK = 'SubagentHandback'
@@ -426,11 +442,11 @@ async function launchLine($: EngineInterface, family: string, options: Task, eff
   const configs = [await read(`${await $.env.get('HOME')}/.claude/lord/config.json`), await read(`${$.plugin.root}/config.json`)]
   const setting = (pick: (c: any) => unknown) => configs.map(c => c && pick(c)).find(v => v !== undefined && v !== null)
   const model = options.model ?? setting(c => c[family]?.model) ?? 'default'
-  const memory = options.limits?.memory_gb ?? Math.round(Number(setting(c => c.memory_ceiling_kb) ?? 12 * 1048576) / 104857.6) / 10
+  const memory = options.limits?.memory_gb ?? Math.round(Number(setting(c => c.memory_ceiling_kb) ?? 24 * 1048576) / 104857.6) / 10
   const hang = options.limits?.hang_s ?? setting(c => c[family]?.no_progress_s)
   const sandbox = options.tests ? 'tests' : options.readonly ? 'read-only' : options.nosandbox || family === 'gemini' ? 'none' : 'workspace-write'
   return `lord: requested ${model} ${effort} · cwd ${options.cwd ?? 'the agent\'s start folder'} · dirs ${options.dirs?.join(', ') || 'none'} · sandbox ${sandbox}` +
-    ` · network ${family !== 'gpt' || options.net || options.nosandbox ? 'on' : 'off'} · tools ${options.limits?.tools ? 'on' : 'off'} · nice ${options.limits?.nice ?? 0}` +
+    ` · network ${family !== 'gpt' || options.net || options.nosandbox ? 'on' : 'off'}${options.nosearch ? ' · web search off' : ''} · tools ${options.limits?.tools ? 'on' : 'off'} · nice ${options.limits?.nice ?? 0}` +
     ` · memory ${memory} GB · hang ${hang ? hang + ' s' : 'none'} · wall ${options.limits?.wall_s ? options.limits.wall_s + ' s' : 'none'}`
 }
 
@@ -446,16 +462,45 @@ async function lordAgent($: EngineInterface, agentId: string): Promise<Agent | u
   const directory = (await $.state.get({ ...dirState, id: agentId })).value
   if (directory && !directories.has(agentId)) directories.set(agentId, directory)
   const listed = await $.agent.list().then(list => list.find(agent => agent.id === agentId), () => undefined)
-  if (listed && !listed.type.startsWith('lord:')) { others.add(agentId); return undefined }
-  let family = listed?.type.slice(5), cwd = directories.get(agentId)
+  if (listed && !listed.type.startsWith('lord:')) {
+    const record = /^[A-Za-z0-9_-][A-Za-z0-9_.-]*$/.test(agentId) && await $.fs.read(`${await $.env.get('HOME')}/.claude/lord/logs/${agentId}.json`).then(() => true, () => false)
+    if (!record) { others.add(agentId); return undefined }
+  }
+  let family = listed?.type.startsWith('lord:') ? listed.type.slice(5) : undefined, cwd = directories.get(agentId)
   // The daemon keeps an opened agent's settings, such as an @effort level beyond the Agent call's.
-  const known = await request($, '/agents').then(text => JSON.parse(text).find((a: any) => a.agentId === agentId), () => undefined)
+  let known = await request($, '/agents').then(text => JSON.parse(text).find((a: any) => a.agentId === agentId), () => undefined)
+  if (!known && /^[A-Za-z0-9_-][A-Za-z0-9_.-]*$/.test(agentId)) {
+    const record = await $.fs.read(`${await $.env.get('HOME')}/.claude/lord/logs/${agentId}.json`).then(String, () => undefined)
+    try {
+      if (record !== undefined || family) {
+        agents.set(agentId, { family: family ?? 'gpt' })
+        await connect($, new AbortController().signal)
+        known = await request($, '/agents').then(text => JSON.parse(text).find((a: any) => a.agentId === agentId), () => undefined)
+      }
+      if (!known) {
+        const restored = JSON.parse(await request($, '/restore', { agentId }))
+        if (restored.found) {
+          if (restored.error) throw new Error(restored.error)
+          known = restored.agent
+        } else if (record !== undefined || family) throw new Error(`agent ${agentId} cannot be resumed (record is missing); launch a fresh agent`)
+      }
+    } catch (error) {
+      if (record !== undefined || family) {
+        const message = String(error instanceof Error ? error.message : error)
+        const resumeError = message.includes(`agent ${agentId} cannot be resumed`) ? message : `agent ${agentId} cannot be resumed (${message}); launch a fresh agent`
+        agents.set(agentId, { family: family ?? 'gpt', resumeError })
+        return agents.get(agentId)
+      }
+    }
+  }
   if (!family) {
     // An id the roster does not name may still be a lord agent the daemon opened before a reload.
     if (!known) { others.add(agentId); return undefined }
     family = known.family
   }
-  agents.set(agentId, { family: family!, cwd: known?.cwd ?? cwd, opened: !!known, effort: known?.effort, model: known?.model })
+  agents.set(agentId, { family: family!, cwd: known?.cwd ?? cwd, opened: !!known, effort: known?.effort, model: known?.model,
+    ...(known?.sandbox ? { readonly: known.sandbox === 'read-only', nosandbox: known.sandbox === 'none' && family === 'gpt', tests: known.sandbox === 'tests', net: family === 'gpt' && !!known.network,
+      nosearch: known.nosearch || known.web_search === 'off', dirs: known.dirs, limits: { memory_gb: known.memory_gb, hang_s: known.hang_s, wall_s: known.wall_s, nice: known.nice, tools: known.tools } } : {}) })
   return agents.get(agentId)
 }
 
@@ -538,10 +583,11 @@ export const register: Register = on => {
     callEfforts.delete(e.tool_use_id)
     const r = await next(input)
     if (e.subagentType.startsWith('lord:') && r.agentId) {
-      const previous = agents.get(r.agentId)
+      others.delete(r.agentId)
+      const previous = agents.get(r.agentId) ?? (e.resume ? await lordAgent($, r.agentId) : undefined)
       // A resumed run arrives with the session's folder; an agent that already opened keeps its own.
       agents.set(r.agentId, { ...previous, family: e.subagentType.slice(5), cwd: previous?.opened ? previous.cwd : directories.get(r.agentId) ?? e.cwd ?? previous?.cwd,
-        worktree: previous?.worktree || isolated.has(e.tool_use_id) })
+        worktree: previous?.worktree || isolated.has(e.tool_use_id), ...(!previous && e.resume ? { resumeError: `agent ${r.agentId} cannot be resumed (record is missing); launch a fresh agent` } : {}) })
       isolated.delete(e.tool_use_id)
       await keep($, r.agentId)
     }
@@ -576,6 +622,7 @@ export const register: Register = on => {
     // A refused delivery holds for its own run only; a new run may deliver again.
     if (e.index === 0) agent.refused = undefined
     try {
+      if (agent.resumeError) throw new Error(agent.resumeError)
       if (agent.error) { const error = agent.error; delete agent.error; throw new Error(error.replace(/^lord: error: /, '')) }
       let outcome: Outcome | undefined
       agent.running = true
@@ -599,7 +646,7 @@ export const register: Register = on => {
           const known = await request($, '/agents').then(text => JSON.parse(text).find((a: any) => a.agentId === agentId), () => undefined)
           if (known) Object.assign(agent, { opened: true, cwd: known.cwd, effort: agent.effort ?? known.effort, model: agent.model ?? known.model })
         }
-        const chosen = merge({ text: '', model: agent.model, effort: agent.effort, readonly: agent.readonly, net: agent.net, nosandbox: agent.nosandbox, tests: agent.tests, dirs: agent.dirs, limits: agent.limits }, input)
+        const chosen = merge({ text: '', model: agent.model, effort: agent.effort, readonly: agent.readonly, net: agent.net, nosearch: agent.nosearch, nosandbox: agent.nosandbox, tests: agent.tests, dirs: agent.dirs, limits: agent.limits }, input)
         const error = testsError(agent.family, chosen)
         if (error) throw new Error(error)
         // Only an absolute @cwd replaces the worktree; a relative one would be under the main tree.
@@ -611,8 +658,8 @@ export const register: Register = on => {
         // A relative @dir is under the agent's working folder too.
         if (input.dirs) input.dirs = input.dirs.map(dir => /^[/~]/.test(dir) ? dir : `${input.cwd ?? (agent.opened ? agent.cwd : undefined) ?? base}/${dir}`)
         const cwd = input.cwd ?? (agent.opened ? agent.cwd : undefined) ?? directories.get(agentId) ?? agent.cwd ?? await $.session.cwd()
-        await request($, '/open', { agentId, family: agent.family, cwd, pin_cwd: !!input.cwd, path: await $.env.get('PATH'), version: await version($), session: await $.session.id().catch(() => undefined), model: chosen.model, effort: chosen.effort ?? e.effort, readonly: chosen.readonly, net: chosen.net, nosandbox: chosen.nosandbox, tests: chosen.tests, dirs: chosen.dirs, ...chosen.limits })
-        Object.assign(agent, { model: chosen.model, effort: chosen.effort, readonly: chosen.readonly, net: chosen.net, nosandbox: chosen.nosandbox, tests: chosen.tests, dirs: chosen.dirs, limits: chosen.limits })
+        await request($, '/open', { agentId, family: agent.family, cwd, resume: agent.opened || undefined, pin_cwd: !!input.cwd, path: await $.env.get('PATH'), version: await version($), session: await $.session.id().catch(() => undefined), model: chosen.model, effort: chosen.effort ?? e.effort, readonly: chosen.readonly, net: chosen.net, nosearch: chosen.nosearch, nosandbox: chosen.nosandbox, tests: chosen.tests, dirs: chosen.dirs, ...chosen.limits })
+        Object.assign(agent, { model: chosen.model, effort: chosen.effort, readonly: chosen.readonly, net: chosen.net, nosearch: chosen.nosearch, nosandbox: chosen.nosandbox, tests: chosen.tests, dirs: chosen.dirs, limits: chosen.limits })
         agent.opened = true
         agent.cwd = cwd
         agent.daemon = await socket($)
@@ -738,7 +785,9 @@ export const register: Register = on => {
       agent.continuing = false
       await keep($, agentId).catch(() => {})
       if (next.signal.aborted) {
-        if (!ending) try { await request($, '/interrupt', { agentId }, await daemonOf($, agent)) } catch {}
+        agent.stopCause = stopCause(next.signal)
+        await keep($, agentId).catch(() => {})
+        if (!ending) try { await request($, '/interrupt', { agentId, cause: agent.stopCause }, await daemonOf($, agent)) } catch {}
         throw error
       }
       // The result is the error alone, so a partial answer is never mistaken for a finished one; the
@@ -760,7 +809,10 @@ export const register: Register = on => {
     // A lord agent's turn never falls back to the stand-in model; anything else passes through.
     if (!e.agentId || !agents.has(e.agentId)) return yield* next(e)
     if (next.signal.aborted) {
-      if (!ending) try { await request($, '/interrupt', { agentId: e.agentId }, await daemonOf($, agents.get(e.agentId)!)) } catch {}
+      const agent = agents.get(e.agentId)!
+      agent.stopCause = stopCause(next.signal) ?? agent.stopCause
+      await keep($, e.agentId).catch(() => {})
+      if (!ending) try { await request($, '/interrupt', { agentId: e.agentId, cause: agent.stopCause }, await daemonOf($, agent)) } catch {}
       throw new Error('Lord turn interrupted')
     }
     const line = 'lord: error: turn hook failed'
@@ -866,7 +918,8 @@ export const register: Register = on => {
       // Aborting a dispatch also aborts its HTTP calls; completion has a fresh dispatch. A run Claude Code ended on its
       // own error leaves the vendor to finish its turn (never cut mid-edit); the daemon keeps that result.
       if ((e.isAborted || (agent.running && e.reason !== 'error')) && !ending) {
-        try { await request($, '/interrupt', { agentId: e.agentId }, await daemonOf($, agent)) } catch {}
+        try { await request($, '/interrupt', { agentId: e.agentId, cause: agent.stopCause ?? e.reason }, await daemonOf($, agent)) } catch {}
+        delete agent.stopCause
         agent.running = false
         await keep($, e.agentId)
       } else if (agent.running) {
@@ -880,9 +933,10 @@ export const register: Register = on => {
     return next(e)
   })
 
-  on('session.end', ($, e, next) => {
-    // /clear and an in-process resume end the conversation but not the process; their agents stay stoppable.
-    if (!['clear', 'resume'].includes(e.reason)) ending = true
+  on('session.end', async ($, e, next) => {
+    ending = !['clear', 'resume'].includes(e.reason)
+    const at = new Set([await socket($), ...[...agents.values()].map(agent => agent.daemon).filter((path): path is string => !!path)])
+    await Promise.all([...at].map(path => request($, '/session_end', { session: e.sessionId, cause: `session end: ${e.reason}` }, path).catch(() => {})))
     return next(e)
   })
 
@@ -909,7 +963,7 @@ export const register: Register = on => {
         const next = agents.get(agent.agentId)?.model
         const tokens = agent.usage ? ` ${agent.usage.input_tokens}+${agent.usage.cache_read_input_tokens} in ${agent.usage.output_tokens} out` : ''
         const quiet = typeof agent.quiet_s === 'number' ? ` (last vendor action ${agent.quiet_s} s ago)` : ''
-        return `${agent.agentId} ${agent.family} ${agent.model}${next && next !== agent.model ? ` (next: ${next})` : ''} ${agent.effort ?? ''} ${agent.state}${quiet}${tokens} ${agent.cwd ?? ''}${agent.activity ? ' — ' + agent.activity : ''}\n  log: ${agent.log}${agent.answer ? `\n  answer: ${agent.answer}` : ''}`
+        return `${agent.agentId} ${agent.family} ${agent.model}${next && next !== agent.model ? ` (next: ${next})` : ''} ${agent.effort ?? ''} ${agent.state}${quiet}${tokens} ${agent.cwd ?? ''}${agent.activity ? ' — ' + agent.activity : ''}\n  log: ${agent.log}${agent.answer ? `\n  answer: ${agent.answer}` : ''}${agent.jobs?.length ? `\n  jobs: ${jobLine(agent.jobs)}` : ''}`
       }).join('\n') || 'lord: no agents', ...allowanceLines(allowance)].join('\n') }
     } catch (error) { return { text: errorLine(error) } }
   })
