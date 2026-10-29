@@ -113,10 +113,14 @@ function signed(text: string, record: TurnRecord | undefined): string {
   try { JSON.parse(text.trim()); return text } catch {}
   const time = (iso: unknown) => typeof iso === 'string' ? iso.slice(11, 19) + 'Z' : '?'
   const helpers = record.helpers?.length ? ` · ${record.helpers.length} helper${record.helpers.length > 1 ? 's' : ''} (${[...new Set(record.helpers)].join(', ')})` : ''
-  return `${text}\n\n[lord: ${record.ended_how} · ${record.model} ${record.effort} · ${time(record.started)} to ${time(record.ended)} · ${record.commands} command${record.commands === 1 ? '' : 's'}${helpers}${record.retries ? ` · ${record.retries} retr${record.retries > 1 ? 'ies' : 'y'} at capacity` : ''}${record.policy_continues ? ` · ${record.policy_continues} policy continue` : ''}${record.jobs?.length ? ` · jobs: ${jobLine(record.jobs)}` : ''}${record.killed_jobs?.length ? ` · killed jobs: ${jobLine(record.killed_jobs)}` : ''}${record.memory_warning ? ` · ${record.memory_warning}` : ''}${record.session ? ` · session ${record.session}` : ''}]`
+  const killedLimit = Math.max(0, 5 - (record.jobs?.length ?? 0))
+  return `${text}\n\n[lord: ${record.ended_how} · ${record.model} ${record.effort} · ${time(record.started)} to ${time(record.ended)} · ${record.commands} command${record.commands === 1 ? '' : 's'}${helpers}${record.retries ? ` · ${record.retries} retr${record.retries > 1 ? 'ies' : 'y'} at capacity` : ''}${record.policy_continues ? ` · ${record.policy_continues} policy continue` : ''}${record.jobs?.length ? ` · jobs: ${jobLine(record.jobs, 5)}` : ''}${record.killed_jobs?.length ? ` · killed jobs: ${jobLine(record.killed_jobs, killedLimit)}` : ''}${record.memory_warning ? ` · ${record.memory_warning}` : ''}${record.session ? ` · session ${record.session}` : ''}]`
 }
 
-function jobLine(jobs: Job[]): string { return jobs.map(job => `${job.pid} ${job.command} (${job.age_s} s)`).join('; ') }
+function jobLine(jobs: Job[], limit = jobs.length): string {
+  const shown = jobs.slice(0, limit).map(job => `${job.pid} ${job.command} (${job.age_s} s)`).join('; ')
+  return shown + (jobs.length > limit ? `${shown ? '; ' : ''}and ${jobs.length - limit} more` : '')
+}
 
 function stopCause(signal: AbortSignal): string | undefined {
   const reason = signal.reason
@@ -894,7 +898,7 @@ export const register: Register = on => {
       if (!known || !['idle', 'closed'].includes(known.state)) return next(e)
       const result = JSON.parse(await request($, '/close', { agentId: e.task_id, cause: 'TaskStop', idle_only: true }, at))
       if (!result.closed) return next(e)
-      return { result: { message: `Stopped ${result.stopped_jobs} jobs for Lord agent ${e.task_id}.`, task_id: e.task_id, task_type: `lord:${known.family}` } }
+      return { result: { message: `Stopped ${result.stopped_jobs} jobs for Lord agent ${e.task_id}.${result.jobs?.length ? ` ${jobLine(result.jobs)}` : ''}`, task_id: e.task_id, task_type: `lord:${known.family}` } }
     } catch { return next(e) }
   })
 
@@ -951,7 +955,10 @@ export const register: Register = on => {
     if (['clear', 'resume'].includes(e.reason)) return next(e)
     ending = true
     const at = new Set([await socket($), ...[...agents.values()].map(agent => agent.daemon).filter((path): path is string => !!path)])
-    await Promise.all([...at].map(path => request($, '/session_end', { session: e.sessionId, cause: `session end: ${e.reason}` }, path).catch(() => {})))
+    await Promise.all([...at].map(async path => {
+      const ids = (await Promise.all([...agents.entries()].map(async ([id, agent]) => await daemonOf($, agent) === path ? id : undefined))).filter(Boolean)
+      return request($, '/session_end', { session: e.sessionId, ...(ids.length ? { agentIds: ids } : {}), cause: `session end: ${e.reason}` }, path).catch(() => {})
+    }))
     return next(e)
   })
 

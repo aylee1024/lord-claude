@@ -171,6 +171,27 @@ async def turn(sid, text, request_id=None):
         child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         audit(command_pid=child.pid)
         answer = 'JOB STARTED'
+    elif text == 'HELPER_UP':
+        server = session['server']
+        env = os.environ.copy()
+        extra = server.get('env', {})
+        env.update(extra if isinstance(extra, dict) else {v['name']: v['value'] for v in extra})
+        helper = subprocess.Popen([server['command'], *server['args']], stdin=subprocess.PIPE,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+        globals().setdefault('HELPERS', []).append(helper)
+        audit(helper_pid=helper.pid)
+        answer = 'HELPER UP'
+    elif text == 'FILTERED_BACKGROUND':
+        import tomllib
+        home = Path(os.environ.get('CODEX_HOME', DATA / '.codex'))
+        policy = tomllib.loads((home / 'config.toml').read_text())['shell_environment_policy']
+        env = {} if policy.get('inherit') == 'none' else os.environ.copy()
+        env.update(policy.get('set', {}))
+        env.update(session.get('shell_set', {}))
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'], env=env,
+                                 start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        audit(command_pid=child.pid, kept=env.get('KEEP'))
+        answer = 'FILTERED JOB'
     elif text == 'SHELL_BACKGROUND':
         child = subprocess.Popen(['/bin/zsh', '-c', 'while :; do /bin/sleep 1; done'], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         audit(shell_pid=child.pid)
@@ -364,7 +385,8 @@ async def handle(value):
             server = p['config']['mcp_servers']['lord']
         else:
             server = p['mcpServers'][0]
-        SESSIONS[sid] = {'memory': '', 'server': server, 'cwd': p['cwd']}
+        SESSIONS[sid] = {'memory': '', 'server': server, 'cwd': p['cwd'],
+                         'shell_set': p.get('config', {}).get('shell_environment_policy', {}).get('set', {})}
         save(sid)
         result = {'thread': {'id': sid}} if FAMILY == 'gpt' else {'sessionId': sid}
         if FAMILY == 'grok':
@@ -382,6 +404,7 @@ async def handle(value):
             send({'id': rid, 'error': {'message': 'conversation not found'}})
             return
         load(sid)
+        if FAMILY == 'gpt': SESSIONS[sid]['shell_set'] = p.get('config', {}).get('shell_environment_policy', {}).get('set', {})
         result = {'thread': {'id': sid}} if FAMILY == 'gpt' else {'sessionId': sid}
         if FAMILY == 'gpt' and '--large-resume' in sys.argv: result['history'] = 'x' * (40 * 1024 * 1024)
         if FAMILY == 'grok':
@@ -427,6 +450,12 @@ async def main():
         await asyncio.Event().wait()
         return
     audit(launch=True, argv=sys.argv[3:], path=os.environ.get('PATH', ''), grok_env={k: v for k, v in os.environ.items() if k.startswith('GROK_')}, env={k: v for k, v in os.environ.items() if 'must-not-reach' in v}, codex_home=os.environ.get('CODEX_HOME'), sqlite_home=os.environ.get('CODEX_SQLITE_HOME'), nice=os.getpriority(os.PRIO_PROCESS, 0), cwd=os.getcwd())
+    if '--startup-shell-tool' in sys.argv:
+        env = {k: v for k, v in os.environ.items() if not k.startswith('LORD_')}
+        helper = subprocess.Popen(['/bin/bash', '-c', '/bin/sleep 300 & wait'], env=env,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        globals().setdefault('HELPERS', []).append(helper)
+        audit(startup_tool=helper.pid)
     print('fixture Bearer fake-bearer-value', file=sys.stderr, flush=True)
     if FAMILY == 'gemini' and (DATA / 'start-quota-late').exists():
         # The same, with agy's stdout closed before its stderr line arrives.

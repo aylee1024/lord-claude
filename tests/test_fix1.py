@@ -117,16 +117,17 @@ def test_fix1_marker_parser_retains_only_pid_and_marker(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_fix1_no_marker_listing_without_vendor_or_jobs(monkeypatch):
+def test_fix1_idle_lookup_is_skipped_except_when_closing(monkeypatch):
     m = load('fix1_no_marker_listing')
     async def scenario():
-        lookup = AsyncMock(side_effect=AssertionError('unexpected environment listing'))
+        lookup = AsyncMock(return_value=m.ProcessMarkers())
         monkeypatch.setattr(m, 'process_markers', lookup)
-        a = agent(m); v = m.Vendor(types.SimpleNamespace(), 'gpt', a)
+        a = agent(m); v = m.Vendor(types.SimpleNamespace(log=lambda text: None), 'gpt', a)
         v.descendants = {10002}
         assert await v.update_jobs() == set()
-        await v.close()
         lookup.assert_not_called()
+        await v.close()
+        assert lookup.await_count == 2 and not v.descendants
     asyncio.run(scenario())
 
 

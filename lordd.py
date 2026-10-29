@@ -582,12 +582,12 @@ class Redactor:
     def __call__(self, value):
         value = str(value)
         for secret in sorted(self.secrets, key=len, reverse=True): value = value.replace(secret, '[REDACTED]')
-        value = re.sub(r'(?i)\bBearer[ \t]+[^\s\"\x27]+|\bsk-[\w-]{16,}|\beyJ[\w-]+\.[\w-]+\.[\w-]+|\bgh[pousr]_\w{20,}|\bgithub_pat_\w{20,}'
+        value = re.sub(r'(?i)\bBearer[ \t]+[^\s\"\x27]+|\bsk-[\w-]{16,}|\beyJ[\w-]{1,512}\.[\w-]{1,8192}\.[\w-]{1,2048}|\bgh[pousr]_\w{20,}|\bgithub_pat_\w{20,}'
                        r'|\bAKIA[0-9A-Z]{16}\b|\bAIza[\w-]{30,}|\bxox[abprs]-[\w-]{10,}|\bxai-\w{20,}', '[REDACTED]', value)
         # key=value, key: value and "key": "value", for the usual secret names.
         # Names may carry a prefix (GITHUB_TOKEN, client_secret, "access_token"); a scheme word (Basic, Token) goes with
         # its value.
-        return re.sub(r'(?i)(["\x27]?(?<![A-Za-z0-9])[\w-]{0,64}(?:api[-_]?key|authorization|password|passwd|secret|token)[\w-]{0,64}["\x27]?\s*[:=]\s*["\x27]?)'
+        return re.sub(r'(?i)(["\x27]?(?<![\w-])[\w-]{0,64}(?:api[-_]?key|authorization|password|passwd|secret|token)[\w-]{0,64}["\x27]?\s*[:=]\s*["\x27]?)'
                       r'(?!\[REDACTED\])(?:(?:basic|token|digest|bearer)\s+)?[^\s\"\x27,;}]+', r'\1[REDACTED]', value)
 
 async def process_table():
@@ -598,6 +598,7 @@ async def process_table():
             pid, ppid, kb = map(int, fields)
             children.setdefault(ppid, []).append(pid)
             rss[pid] = kb
+    if getattr(ps, 'returncode', 0): raise RuntimeError('process table lookup failed')
     return children, rss
 
 class ProcessMarkers(dict):
@@ -605,8 +606,11 @@ class ProcessMarkers(dict):
         super().__init__()
         self.visible, self.hosts, self.sockets = set(), set(), {}
 
+    def __repr__(self):
+        return f'ProcessMarkers({len(self)} pids)'
+
 async def process_markers():
-    # macOS hides some environments. Compare with plain command hashes, retaining no environment text.
+    # macOS appends visible environments to the plain command. Keep only markers from that verified suffix.
     found, plain = ProcessMarkers(), {}
     for environment in (False, True):
         ps = await asyncio.create_subprocess_exec('/bin/ps', '-Eww' if environment else '-ww', '-A', '-o', 'pid=,command=', stdout=-1, stderr=-3, limit=LIMIT)
@@ -614,12 +618,16 @@ async def process_markers():
             while row := await ps.stdout.readline():
                 fields = row.split(None, 1)
                 if len(fields) != 2 or not fields[0].isdigit(): continue
-                pid, command = int(fields[0]), fields[1]
+                pid, command = int(fields[0]), fields[1].rstrip(b'\r\n')
                 if not environment:
-                    plain[pid] = hashlib.sha256(command).digest()
-                    if Path(os.fsdecode(command.split(None, 1)[0])).name == 'codex-code-mode-host': found.hosts.add(pid)
+                    plain[pid] = (len(command), hashlib.sha256(command).digest())
+                    if tool_server(os.fsdecode(command)): found.hosts.add(pid)
                     continue
-                if pid in plain and hashlib.sha256(command).digest() != plain[pid]: found.visible.add(pid)
+                if pid not in plain: continue
+                size, digest = plain[pid]
+                if command[size:size + 1] != b' ' or hashlib.sha256(command[:size]).digest() != digest: continue
+                found.visible.add(pid)
+                command = command[size + 1:]
                 for pattern, values in ((rb'(?:^|\s)LORD_AGENT_ID=([^\s]+)(?=\s|$)', found),
                                         (rb'(?:^|\s)LORD_DAEMON_SOCKET=(.*?)(?= [^\s=]+=|$)', found.sockets)):
                     markers = re.findall(pattern, command)
@@ -632,6 +640,12 @@ async def process_markers():
         if ps.returncode: raise RuntimeError('process marker lookup failed')
     return found
 
+def tool_server(command):
+    try: words = shlex.split(command)
+    except ValueError: words = command.split()
+    return bool(words) and (Path(words[0]).name == 'codex-code-mode-host' or
+        len(words) > 1 and Path(words[1]).name == 'lordd.py' and '--mcp' in words[2:])
+
 async def job_details(pids):
     if not pids: return []
     ps = await asyncio.create_subprocess_exec('/bin/ps', '-A', '-o', 'pid=,stat=,etime=,command=', stdout=-1, stderr=-3)
@@ -641,9 +655,7 @@ async def job_details(pids):
         if len(fields) != 4 or not fields[0].isdigit() or int(fields[0]) not in pids or 'Z' in fields[1]: continue
         pid, _, elapsed, command = fields
         command = command[:300]
-        try: words = shlex.split(command)
-        except ValueError: words = []
-        if Path((words or command.split() or [''])[0]).name == 'codex-code-mode-host': continue
+        if tool_server(command): continue
         days, clock = elapsed.split('-', 1) if '-' in elapsed else ('0', elapsed)
         seconds = 0
         try:
@@ -651,6 +663,7 @@ async def job_details(pids):
             seconds += int(days) * 86400
         except ValueError: seconds = 0
         found.append({'pid': int(pid), 'command': REDACT(command), 'age_s': seconds})
+    if getattr(ps, 'returncode', 0): raise RuntimeError('job details lookup failed')
     return sorted(found, key=lambda j: j['pid'])
 
 def tree(children, root):
@@ -664,34 +677,53 @@ def marked_pids(markers, agent_id):
     sockets = getattr(markers, 'sockets', {})
     return {pid for pid, marker in markers.items() if marker == agent_id and sockets.get(pid) == str(SOCKET)}
 
-def job_pids(children, pids, roots, markers, agent_id):
-    excluded = set()
+def job_pids(children, pids, roots, markers, agent_id, startup=()):
+    excluded, servers = set(), set()
     hosts, visible = getattr(markers, 'hosts', set()), getattr(markers, 'visible', set())
     marked = marked_pids(markers, agent_id)
+    for pid in hosts | set(startup): servers.update(tree(children, pid))
     for pid in pids - roots:
-        if pid in hosts or (pid in visible and pid not in marked): excluded.update(tree(children, pid))
-    return ((pids - excluded) | marked) - roots - hosts
+        if pid in visible and pid not in marked: excluded.update(tree(children, pid))
+    return ((pids - excluded) | marked) - roots - servers
 
 def signal_all(pids, sig):
     for pid in pids:
         try: os.kill(pid, sig)
         except (ProcessLookupError, PermissionError): pass
 
-async def kill_tree(process, known=(), *, agent_id=None, others=(), on_jobs=None):
+async def kill_tree(process, known=(), *, agent_id=None, others=(), on_jobs=None, startup=(), on_error=None):
     # Tool commands can leave the vendor's process group, so every descendant is signalled by pid as well.
     # macOS answers killpg with EPERM when the group holds only zombies; the pid signals below still run.
     roots = [p for p in (process, *others) if p is not None]
     if not roots and not agent_id: return
-    logged = set()
+    logged, remembered, seen = set(), set(known), set()
+    def failed(error):
+        if on_error:
+            try: on_error(f'process cleanup lookup failed: {error}')
+            except Exception: pass
     for sig in (signal.SIGTERM, signal.SIGKILL):
-        children = (await process_table())[0]
-        markers = await process_markers() if agent_id else {}
+        fallback = False
+        try: children = (await process_table())[0]
+        except Exception as error:
+            children, fallback = {}, True
+            failed(error)
+        try: markers = await process_markers() if agent_id else {}
+        except Exception as error:
+            markers, fallback = {}, True
+            failed(error)
         marked = marked_pids(markers, agent_id)
-        pids = {pid for p in roots if p.returncode is None for pid in tree(children, p.pid)}
+        pids = seen | {pid for p in roots if p.returncode is None for pid in tree(children, p.pid)}
+        if fallback: pids.update(remembered)
         if on_jobs:
-            jobs = await job_details(job_pids(children, pids, {p.pid for p in roots}, markers, agent_id) - logged)
-            on_jobs(jobs)
-            logged.update(j['pid'] for j in jobs)
+            try:
+                jobs = await job_details(job_pids(children, pids, {p.pid for p in roots}, markers, agent_id, startup) - logged)
+                on_jobs(jobs)
+                logged.update(j['pid'] for j in jobs)
+            except Exception as error:
+                pids.update(remembered)
+                failed(error)
+        remembered.update(pids | marked)
+        seen.update(pids | marked)
         for p in roots:
             if p.returncode is not None: continue
             try: os.killpg(p.pid, sig)
@@ -735,7 +767,7 @@ class Agent:
         self.commands, self.retries, self.edited, self.last_command, self.turn_error, self.retry_task = 0, 0, False, None, None, None
         self.retry_waiting = False
         self.policy_continues, self.memory_warned, self.jobs, self.stop_cause = 0, False, [], None
-        self.memory_warning, self.killed_jobs, self.session_ended = None, [], False
+        self.memory_warning, self.killed_jobs, self.restart_jobs, self.session_ended = None, [], [], False
         self.final_text, self.restart, self.token = '', False, uuid.uuid4().hex
         self.default_model, self.agy_step = False, None
         # Each vendor tool step's result, by step id, for the plugin's row of it (/row).
@@ -771,7 +803,7 @@ class Agent:
         try: size = self.reads_path.stat().st_size
         except OSError: size = 0
         written = []
-        for line in (REDACT(line)[:2000] + '\n' for line in lines):
+        for line in (REDACT(line[:8192])[:2000] + '\n' for line in lines):
             if size + len(line.encode()) > READS_LIMIT:
                 written.append(READS_FULL + '\n')
                 self.reads.add(READS_FULL)
@@ -787,7 +819,7 @@ class Agent:
         # At 4 MB the log moves to <agentId>.log.1 (one earlier generation), so its newest records are always written.
         if self.log_path.exists() and self.log_path.stat().st_size >= 4 * 1024 * 1024: self.log_path.replace(self.log_path.with_suffix('.log.1'))
         # One line per record, so every line starts with its time: a multi-line command reads as one line.
-        line = re.sub(r'\r\n|[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]', ' ⏎ ', REDACT(text)[:2000])
+        line = re.sub(r'\r\n|[\r\n\v\f\x1c-\x1e\x85\u2028\u2029]', ' ⏎ ', REDACT(str(text)[:8192])[:2000])
         with self.log_path.open('a', encoding='utf-8') as file: file.write(f'{datetime.now(timezone.utc).isoformat()} {line}\n')
 
     def row(self, rid, kind, title, line=None):
@@ -795,14 +827,31 @@ class Agent:
         # (a Bash row); 'step' is any other tool step. The activity log keeps its usual line.
         if self.state not in ('running', 'waiting_tool') or rid in self.rows: return
         self.rows[rid] = asyncio.get_running_loop().create_future()
-        self.emit('row', rowId=rid, shell=kind == 'command', title=REDACT(title)[:2000], text=line or title)
+        self.emit('row', rowId=rid, shell=kind == 'command', title=REDACT(str(title)[:8192])[:2000], text=line or title)
 
     def row_done(self, rid, output, stopped=False):
         future = self.rows.get(rid)
         if future is None or future.done(): return
-        text = REDACT(output)
-        if len(text) > ROW_OUTPUT: text = f'[{len(text) - ROW_OUTPUT} earlier characters not shown]\n{text[-ROW_OUTPUT:]}'
+        text = REDACT(output[-(ROW_OUTPUT + 8192):])
+        if len(text) > ROW_OUTPUT: text = f'[{len(output) - ROW_OUTPUT} earlier characters not shown]\n{text[-ROW_OUTPUT:]}'
         future.set_result({'output': text, 'stopped': stopped})
+
+    def write_record(self, settings, turns=None, helpers=None):
+        if turns is None or helpers is None:
+            try: saved = json.loads(self.record_path.read_text(encoding='utf-8'))
+            except (OSError, ValueError): saved = {}
+            saved = saved if isinstance(saved, dict) else {}
+            if turns is None: turns = saved.get('turns') if isinstance(saved.get('turns'), list) else []
+            if helpers is None: helpers = saved.get('helpers') if isinstance(saved.get('helpers'), list) else []
+        document = {**{k: self.record[k] for k in ('readonly', 'net', 'nosandbox', 'tests', 'nosearch', 'tools', 'nice', 'memory_gb', 'hang_s', 'wall_s', 'created', 'dir_paths', 'cwd_paths') if k in self.record},
+                    'agentId': self.agentId, 'family': self.family, 'lordVersion': VERSION, 'session': self.record.get('session'),
+                    **{k: v for k, v in settings.items() if k != 'codex_folder'}, 'vendorSession': self.vendorSession,
+                    'transcript': transcript_path(self.family, self.vendorSession, self.cwd, settings.get('codex_folder')),
+                    'helpers': helpers, 'turns': turns}
+        self.record_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        scratch = self.record_path.with_name(self.record_path.name + '.tmp')
+        scratch.write_text(dumps(document) + '\n', encoding='utf-8')
+        scratch.replace(self.record_path)
 
     def turn_record(self, kind, value):
         # The turn as a program reads it: logs/<agentId>.json (the settings and every turn, the last 100 with their
@@ -810,7 +859,6 @@ class Agent:
         ended = datetime.now(timezone.utc).isoformat(timespec='seconds')
         how = 'refused' if kind == 'refused' else 'done' if kind == 'done' else 'interrupted' if value.get('message') == 'interrupted' or self.cancel_requested else f"error ({value.get('cause') or 'vendor'})"
         settings = getattr(self, 'settings', None) or {k: self.record[k] for k in ('cwd', 'dirs', 'model', 'effort', 'codexHome') if k in self.record}
-        transcript = transcript_path(self.family, self.vendorSession, self.cwd, settings.get('codex_folder'))
         try: saved = json.loads(self.record_path.read_text(encoding='utf-8'))
         except (OSError, ValueError): saved = {}
         saved = saved if isinstance(saved, dict) else {}
@@ -843,19 +891,13 @@ class Agent:
         kept = [*turns, turn][-100:]
         # Only the helpers the kept turns name, in the order they started, so the record stays as bounded as its turns.
         named = dict.fromkeys(t for k in kept for t in (k.get('helpers') if isinstance(k.get('helpers'), list) else []) if isinstance(t, str))
-        document = {**{k: self.record[k] for k in ('readonly', 'net', 'nosandbox', 'tests', 'nosearch', 'tools', 'nice', 'memory_gb', 'hang_s', 'wall_s', 'created', 'dir_paths', 'cwd_paths') if k in self.record},
-                    'agentId': self.agentId, 'family': self.family, 'lordVersion': VERSION, 'session': self.record.get('session'),
-                    **{k: v for k, v in settings.items() if k != 'codex_folder'}, 'vendorSession': self.vendorSession,
-                    'transcript': transcript, 'helpers': [self.helpers[t] for t in named if t in self.helpers], 'turns': kept}
         try:
             if text and text.strip():
                 self.answers_path.mkdir(parents=True, exist_ok=True, mode=0o700)
                 answer.write_text(REDACT(text), encoding='utf-8')
             # Every turn advances the number, so removing the answer 100 turns back keeps only the recorded turns'.
             (self.answers_path / f'{number - 100}.md').unlink(missing_ok=True)
-            scratch = self.record_path.with_name(self.record_path.name + '.tmp')
-            scratch.write_text(dumps(document) + '\n', encoding='utf-8')
-            scratch.replace(self.record_path)
+            self.write_record(settings, kept, [self.helpers[t] for t in named if t in self.helpers])
         except OSError: pass
         helpers = [h.get('model') or '?' for h in mine]
         return {'ended_how': how, 'model': self.model, 'effort': self.effort, 'started': turn['started'], 'ended': ended,
@@ -903,6 +945,7 @@ class Vendor:
         self.codex_home = codex_home
         self.process, self.serial, self.generation = None, 0, 0
         self.exec_process, self.exec_descendants, self.environment_id = None, set(), None
+        self.startup_children = None
         self.exec_error = ''
         self.last, self.reason, self.efforts, self.descendants = time.monotonic(), None, [], set()
         self.pending, self.models = {}, []
@@ -972,6 +1015,7 @@ class Vendor:
                 self.process = await asyncio.create_subprocess_exec(*command,
                     cwd=cwd, start_new_session=True, env=env,
                     stdin=-1, stdout=-1, stderr=-1, limit=VENDOR_LIMIT)
+                self.startup_children = None
                 if self.stopping:
                     await kill_tree(self.process)
                     raise RuntimeError('Vendor closed during start')
@@ -1002,6 +1046,9 @@ class Vendor:
                 raise
 
     async def start_exec(self, command, env, nice):
+        a = self.agent
+        pinned_folder('@cwd', a.cwd, a.record.get('cwd_paths', {a.cwd: a.cwd}))
+        for path in a.record.get('dirs', []): pinned_folder('@dir', path, a.record.get('dir_paths', {path: path}))
         validate_tests_layout(self.agent.cwd, self.agent.record.get('dirs', []), env)
         self.exec_token, self.environment_id = uuid.uuid4().hex, 'lord-' + uuid.uuid4().hex
         self.exec_descendants = set()
@@ -1038,16 +1085,19 @@ class Vendor:
         self.reason = self.reason or '@tests exec-server exited'
         await self.kill()
 
-    async def kill(self):
+    async def kill(self, *, lookup=True):
         async with self.kill_lock:
-            active = self.agent and (self.process or self.exec_process or self.agent.jobs)
-            await kill_tree(self.process, others=(self.exec_process,), agent_id=self.agent.agentId if active else None, on_jobs=self.log_jobs if active else None)
+            a = self.agent
+            known = self.descendants | self.exec_descendants | {j['pid'] for j in a.jobs} if a else self.descendants
+            await kill_tree(self.process, known, others=(self.exec_process,), agent_id=a.agentId if a and lookup else None,
+                            on_jobs=self.log_jobs if a else None, startup=self.startup_children or (), on_error=self.d.log)
+            self.descendants.clear(); self.exec_descendants.clear()
             if self.agent: self.agent.jobs = []
 
     async def update_jobs(self, children=None, markers=None):
         if not self.agent: return set()
         if not any(p and p.returncode is None for p in (self.process, self.exec_process)) and not self.agent.jobs:
-            self.agent.jobs = []
+            self.descendants.clear(); self.exec_descendants.clear()
             return set()
         if children is None: children = (await process_table())[0]
         if markers is None: markers = await process_markers()
@@ -1058,7 +1108,7 @@ class Vendor:
             pids |= live
         roots = {p.pid for p in (self.process, self.exec_process) if p}
         marked = marked_pids(markers, self.agent.agentId)
-        self.agent.jobs = await job_details(job_pids(children, pids, roots, markers, self.agent.agentId))
+        self.agent.jobs = await job_details(job_pids(children, pids, roots, markers, self.agent.agentId, getattr(self, 'startup_children', None) or ()))
         return pids | marked
 
     def log_jobs(self, jobs=None):
@@ -1088,7 +1138,7 @@ class Vendor:
         while line := await process.stderr.readline():
             text = line.decode('utf8', 'replace')
             self.d.log(text)
-            if process is self.exec_process: self.exec_error = (self.exec_error + self.d.redact(text))[-2000:]
+            if process is self.exec_process: self.exec_error = (self.exec_error + self.d.redact(text[-8192:]))[-2000:]
             if self.family == 'gemini' and text.startswith('AGY_ERROR: '): self.agy_error(text[len('AGY_ERROR: '):])
 
     def agy_error(self, text):
@@ -1129,11 +1179,13 @@ class Vendor:
             self.d.log(error)
             try:
                 await self.close(reason or self.error or str(error))
+            except Exception as cleanup: self.d.log(f'vendor crash cleanup failed: {cleanup}')
+            finally:
                 for a in self.d.agents.values():
                     if self.d.backend(a) is self:
                         a.generation = 0
                         a.emit('error', message=self.d.redact(reason or self.error or error), retryable=not (reason or self.error))
-            finally: self.reaped.set()
+                self.reaped.set()
 
     async def request(self, value):
         method, p = value['method'], value.get('params', {})
@@ -1304,14 +1356,15 @@ class Vendor:
         if item.get('type') == 'commandExecution': helper['commands'] = helper.get('commands', 0) + 1
         if item.get('type') == 'fileChange': a.edited = True
 
-    async def close(self, error='Vendor closed'):
+    async def close(self, error='Vendor closed', *, lookup=True):
         self.stopping, self.ready = True, False
         process, ex = self.process, self.exec_process
-        await self.kill()
-        for future in [*self.pending.values(), getattr(self, 'initialized', None)]:
-            if future and not future.done(): future.set_exception(RuntimeError(error))
-        if self.process is process: self.process = None
-        if self.exec_process is ex: self.exec_process = None
+        try: await self.kill(lookup=lookup)
+        finally:
+            for future in [*self.pending.values(), getattr(self, 'initialized', None)]:
+                if future and not future.done(): future.set_exception(RuntimeError(error))
+            if self.process is process: self.process = None
+            if self.exec_process is ex: self.exec_process = None
 
 class Daemon:
     def __init__(self):
@@ -1371,7 +1424,7 @@ class Daemon:
 
     def log(self, text):
         path = HOME / 'lordd.log'
-        line = f'{datetime.now(timezone.utc).isoformat()} {self.redact(text).strip()[:8192]}\n'
+        line = f'{datetime.now(timezone.utc).isoformat()} {self.redact(str(text)[:16384]).strip()[:8192]}\n'
         if path.exists() and path.stat().st_size + len(line.encode()) > 1024 * 1024: path.replace(HOME / 'lordd.log.1')
         with path.open('a', encoding='utf-8') as file: file.write(line)
 
@@ -1416,7 +1469,7 @@ class Daemon:
         if aid not in self.agents:
             try: text = path.read_text(encoding='utf-8')
             except FileNotFoundError: return {'found': False}
-            except OSError: text = ''
+            except OSError as error: raise RuntimeError(f'agent {aid} record could not be read; retry later: {self.redact(error)}') from None
             try:
                 saved = json.loads(text)
                 if not isinstance(saved, dict) or saved.get('family') not in ('gpt', 'grok', 'gemini'): raise ValueError('record is invalid')
@@ -1529,6 +1582,7 @@ class Daemon:
                           # @nosandbox: codex runs commands unconfined, as Claude Code's own agents do without its sandbox.
                           'sandbox': 'read-only' if a.record.get('readonly') else 'danger-full-access' if a.record.get('nosandbox') else 'workspace-write',
                           'config': {**lean, 'mcp_servers': {**lean['mcp_servers'], 'lord': server}, **({'web_search': 'disabled'} if a.record.get('nosearch') else {'web_search': 'live'} if live_search(home) else {}),
+                                     'shell_environment_policy': {'set': {'LORD_AGENT_ID': a.agentId, 'LORD_DAEMON_SOCKET': str(SOCKET)}},
                                      'sandbox_workspace_write': {'network_access': bool(a.record.get('net')), 'writable_roots': a.record.get('dirs', [])}}}
                 if vendor.exec_process:
                     params.pop('sandbox')
@@ -1561,6 +1615,8 @@ class Daemon:
                     await vendor.rpc('session/set_config_option', {'sessionId': a.vendorSession, 'configId': key, 'value': value})
             a.generation = vendor.generation
             self.save(a)
+            if vendor.startup_children is None:
+                vendor.startup_children = set((await process_table())[0].get(vendor.process.pid, []))
 
     async def effort(self, a, requested=None):
         # The requested level, or the nearest one the vendor lists for this model.
@@ -1680,7 +1736,7 @@ class Daemon:
                 # later /open puts the agent's options back and reattaches with them on the next turn.
                 if new and self.agents.pop(aid, None) is not None:
                     vendor = self.vendors.pop(aid, None)
-                    if vendor: await vendor.close()
+                    if vendor: await vendor.close(lookup=bool(vendor.process or vendor.exec_process or vendor.generation))
                     self.compact((aid,))
                 elif saved and a.record != saved[0]:
                     # Saved, so a daemon restart does not bring the refused options back; a new process drops any
@@ -1742,7 +1798,9 @@ class Daemon:
             if a.record.get('tests'): a.restart = True
         if a.restart and a.state not in ('running', 'waiting_tool'):
             a.restart = False
+            before = len(a.killed_jobs)
             await self.backend(a).close()
+            a.restart_jobs.extend(a.killed_jobs[before:])
             a.generation = 0
         # A result held for this agent is handed over by /turn without the vendor, and a vendor that failed to start here
         # would strand it; the next turn's start attaches the vendor instead.
@@ -1763,6 +1821,7 @@ class Daemon:
         # An opened agent counts as used, so pruning cannot take it before its turn starts.
         self.save(a)
         settings = self.settings(a)
+        a.write_record(settings)
         return {'vendorSession': a.vendorSession, **{k: v for k, v in settings.items() if k != 'codex_folder'}, 'line': settings_line(settings)}
 
     def known_models(self, a):
@@ -1802,6 +1861,7 @@ class Daemon:
     async def begin_starting(self, a, body):
         self.quota_refusal(a.family, body.get('model') or a.model, a)
         if a.turn_task: await asyncio.gather(a.turn_task, return_exceptions=True)
+        a.killed_jobs, a.restart_jobs = a.restart_jobs, []
         previous = (a.model, a.effort)
         a.model = body.get('model') or a.model
         try:
@@ -1950,7 +2010,7 @@ class Daemon:
 
     async def interrupt(self, a, cause=None):
         if isinstance(cause, str) and cause:
-            a.stop_cause = self.redact(cause)[:1000]
+            a.stop_cause = self.redact(cause[:8192])[:1000]
             a.note('stop requested: ' + a.stop_cause)
         a.followup = a.earlier = None
         # A turn still starting (begin's awaits) is interrupted once it runs, through the path below; a start-up
@@ -2055,8 +2115,9 @@ class Daemon:
         elif method == 'POST':
             if path == '/restore': return self.restore(body['agentId'])
             if path == '/session_end':
+                ids = body.get('agentIds') if isinstance(body.get('agentIds'), list) else []
                 for a in list(self.agents.values()):
-                    if body.get('session') and a.record.get('session') == body['session']:
+                    if a.agentId in ids or body.get('session') and a.record.get('session') == body['session']:
                         a.session_ended = True
                         a.note(body.get('cause') or 'session ended')
                         if a.state not in ('running', 'waiting_tool') and not getattr(a, 'starting', False):
@@ -2092,7 +2153,7 @@ class Daemon:
                 if steered:
                     await self.backend(a).rpc('turn/steer', {'threadId': a.vendorSession, 'expectedTurnId': a.turn_id,
                         'input': [{'type': 'text', 'text': body['text']}]})
-                    a.note('message injected into the running turn: ' + self.redact(body['text'])[:300])
+                    a.note('message injected into the running turn: ' + self.redact(body['text'][:8192])[:300])
                 return {'ok': True, 'steered': steered}
             elif path == '/queue':
                 # A message for a running agent whose vendor takes none mid-turn: it becomes the next turn, started as
@@ -2100,7 +2161,7 @@ class Daemon:
                 if a.state not in ('running', 'waiting_tool'): return {'ok': True, 'queued': False}
                 text = body['text'] if not a.followup else a.followup['text'] + '\n\n' + body['text']
                 a.followup = {**(a.followup or {'agentId': a.agentId}), 'text': text, 'queued': True}
-                a.note('message queued for the next turn: ' + self.redact(body['text'])[:300])
+                a.note('message queued for the next turn: ' + self.redact(body['text'][:8192])[:300])
                 return {'ok': True, 'queued': True}
             elif path in ('/interrupt', '/close'):
                 if path == '/close' and body.get('idle_only') and (a.state in ('running', 'waiting_tool') or getattr(a, 'starting', False)):
@@ -2110,7 +2171,7 @@ class Daemon:
                 if path == '/close':
                     a.state = 'closed'
                     await self.backend(a).close()
-                    if body.get('idle_only'): return {'ok': True, 'closed': True, 'stopped_jobs': len(a.killed_jobs) - before}
+                    if body.get('idle_only'): return {'ok': True, 'closed': True, 'stopped_jobs': len(a.killed_jobs) - before, 'jobs': a.killed_jobs[before:]}
             else: raise ValueError('Unknown endpoint')
             return {'ok': True}
         raise ValueError('Unknown endpoint')
