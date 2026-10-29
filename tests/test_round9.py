@@ -170,7 +170,10 @@ def test_r9_sending_held_folders_creates_no_ticket(scope, family, folder):
     a.family = a.record['family'] = family
     target = work if folder == 'cwd' else extra
     for _ in range(65):
-        d.confine_call(a, 'SendMessage', {'to': a.agentId, 'message': f'@{folder} {target}\nnext item'}, m.delegation_access(a))
+        data = {'to': a.agentId, 'message': f'@{folder} {target}\nnext item'}
+        if family == 'grok' and folder == 'dir':
+            with pytest.raises(ValueError, match='not available for grok'): d.confine_call(a, 'SendMessage', data, m.delegation_access(a))
+        else: d.confine_call(a, 'SendMessage', data, m.delegation_access(a))
         assert d.message_tickets(a) == []
     assert not list((m.HOME / 'launches').glob('*.json'))
 

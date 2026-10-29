@@ -2283,13 +2283,14 @@ class Daemon:
                 # stopped as any turn is (run_turn interrupts it when codex names the turn).
                 a.retry_task.cancel()
                 a.emit('error', message='interrupted', retryable=False)
-            if a.family == 'gpt':
-                # Before dispatch run_turn sees cancel_requested and ends the turn itself.
-                if a.turn_id:
-                    try: await v.rpc('turn/interrupt', {'threadId': a.vendorSession, 'turnId': a.turn_id})
-                    except Exception as error: self.log(f'{a.agentId}: turn interrupt failed: {error}')
-            elif a.family == 'grok':
-                if a.dispatched: await v.send({'method': 'session/cancel', 'params': {'sessionId': a.vendorSession}})
+            if a.family in ('gpt', 'grok'):
+                try:
+                    async with asyncio.timeout(10):
+                        # Before dispatch run_turn sees cancel_requested and ends the turn itself.
+                        if a.family == 'gpt':
+                            if a.turn_id: await v.rpc('turn/interrupt', {'threadId': a.vendorSession, 'turnId': a.turn_id})
+                        elif a.dispatched: await v.send({'method': 'session/cancel', 'params': {'sessionId': a.vendorSession}})
+                except Exception as error: self.log(f'{a.agentId}: turn interrupt failed: {error}')
             else:
                 await v.close()
                 a.generation = 0
@@ -2377,7 +2378,11 @@ class Daemon:
         for i, line in enumerate(lines):
             folder = re.match(r'^@(cwd|dir)[' + re.escape(OPTION_SPACE) + r']+(.+)$', line, re.S)
             if not folder: continue
+            if tool == 'SendMessage' and folder[1] == 'dir' and target.family == 'grok':
+                raise ValueError(f'lord: {line} is not available for grok: its sandbox confines writes to the working folder; use @cwd')
             path = folder_path(line, folder[2])
+            if tool == 'SendMessage' and folder[1] == 'cwd' and (target.record.get('used') or getattr(target, 'turn_started', None)) and path != canon(target.cwd):
+                raise ValueError(f'lord: {line} cannot change agent {target.agentId}: @cwd is fixed at the first turn ({target.cwd})')
             lines[i] = f'@{folder[1]} {path}'
             folders.append(path)
             changed = True
@@ -2471,7 +2476,9 @@ class Daemon:
             if add or consume:
                 if tickets:
                     path.parent.mkdir(mode=0o700, exist_ok=True)
-                    path.write_text(dumps(tickets) + '\n')
+                    temporary = path.with_name(path.name + '.tmp')
+                    temporary.write_text(dumps(tickets) + '\n')
+                    temporary.replace(path)
                 else: path.unlink(missing_ok=True)
             return tickets
 
