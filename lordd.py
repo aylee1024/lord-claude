@@ -289,13 +289,15 @@ def grok_profile(cwd, readonly, env):
         'AGENT': cwd, 'TMP': env.get('TMPDIR') or '/tmp', 'PRIVATE_TMP': '/private/tmp',
         'GROK_HOME': grok_home(), 'SESSIONS': grok_home() / 'sessions', 'KEY': HOME / 'control.header', 'REAL_KEY': real_home / 'control.header',
         'TEMP_KEY': HOME / '.control.header', 'REAL_TEMP_KEY': real_home / '.control.header',
-        'LORD_HOME': HOME, 'REAL_LORD_HOME': real_home, 'SOCKET': Path(canon(SOCKET.parent)) / SOCKET.name}.items()}
+        'LORD_HOME': HOME, 'REAL_LORD_HOME': real_home, 'PLUGIN': HERE.parent,
+        'SOCKET': Path(canon(SOCKET.parent)) / SOCKET.name}.items()}
     params['SOCKET_LOGICAL'] = str(SOCKET)
+    params['PLUGIN_LOGICAL'] = os.path.abspath(HERE.parent)
     if not readonly: profile += '\n(allow file-write* (subpath (param "AGENT")))'
     protected = grok_project_paths(cwd)
     writable = [params[name] for name in ('TMP', 'PRIVATE_TMP', 'SESSIONS')] + ([] if readonly else [params['AGENT']])
     ancestors = {Path(root) for root in writable}
-    for path in protected | {HOME, real_home, HOME / 'control.header', real_home / 'control.header', Path(params['TMP'])}:
+    for path in protected | {HOME, real_home, HERE.parent, HOME / 'control.header', real_home / 'control.header', Path(params['TMP'])}:
         for spelling in (path, Path(canon(path))):
             ancestors.update(p for p in spelling.parents if p.is_dir() and (inside(str(p), writable) or inside(canon(p), writable)))
     # Preserve a symlink's directory entry as well as its target without putting path text into Scheme.
@@ -311,6 +313,7 @@ def grok_profile(cwd, readonly, env):
         return text
     profile += rule('lord-protect-path', 'HOME_PATH', HOME)
     profile += rule('lord-protect-path', 'REAL_HOME_PATH', real_home)
+    profile += rule('lord-protect-path', 'PLUGIN_PATH', HERE.parent)
     for i, path in enumerate(sorted(protected)):
         profile += rule('lord-protect-path', f'PROTECTED_{i}', path)
     for i, path in enumerate(sorted(ancestors)):
@@ -369,7 +372,8 @@ def tests_profile(cwd, dirs, env):
     roots, tmp, private_tmp = tests_paths(cwd, dirs, env)
     params = {'TMP': tmp, 'PRIVATE_TMP': private_tmp,
               'KEY': canon(HOME / 'control.header'), 'TEMP_KEY': canon(HOME / '.control.header'),
-              'LORD_HOME': canon(HOME), 'LORD_HOME_LOGICAL': normalize_system_aliases(HOME)}
+              'LORD_HOME': canon(HOME), 'LORD_HOME_LOGICAL': normalize_system_aliases(HOME),
+              'PLUGIN': canon(HERE.parent), 'PLUGIN_LOGICAL': normalize_system_aliases(HERE.parent)}
     daemon = codex_daemon_directory()
     params['CODEX_DAEMON'] = str(daemon)
     roots = list(dict.fromkeys(roots))
@@ -386,10 +390,11 @@ def tests_profile(cwd, dirs, env):
         params[name] = path
         profile += f'\n(lord-protect-metadata (param "{name}"))'
     profile += '\n(lord-protect-home (param "LORD_HOME"))\n(lord-protect-home (param "LORD_HOME_LOGICAL"))\n(lord-protect-daemon (param "CODEX_DAEMON"))'
+    profile += '\n(lord-protect-home (param "PLUGIN"))\n(lord-protect-home (param "PLUGIN_LOGICAL"))'
     writable = [*roots, params['TMP'], params['PRIVATE_TMP']]
     canonical_writable = [canon(root) for root in writable]
     ancestors = set(writable) | {str(path) for path in daemon.parents}
-    for path in protected | {params['KEY'], params['LORD_HOME'], params['LORD_HOME_LOGICAL'], params['TMP']}:
+    for path in protected | {params['KEY'], params['LORD_HOME'], params['LORD_HOME_LOGICAL'], params['PLUGIN'], params['PLUGIN_LOGICAL'], params['TMP']}:
         ancestors.update(str(parent) for parent in Path(path).parents if inside(str(parent), writable) or inside(canon(parent), canonical_writable))
     for i, path in enumerate(sorted(ancestors)):
         name = f'ANCESTOR_{i}'
@@ -592,12 +597,14 @@ def check_pins(a):
 def gpt_permissions(a):
     r = a.record
     homes = {os.path.abspath(HOME), canon(HOME)}
+    protected = homes | {os.path.abspath(HERE.parent), canon(HERE.parent)}
     filesystem = {'/': 'read', '/**/control.header': 'deny', '/**/.control.header': 'deny'}
     if not r.get('readonly'):
-        for path in [a.cwd, *r.get('dirs', []), os.environ.get('TMPDIR') or '/tmp', '/private/tmp']:
-            if not inside(canon(path), homes): filesystem[canon(path)] = 'write'
+        folders = [r.get('cwd_paths', {}).get(a.cwd, a.cwd), *(r.get('dir_paths', {}).get(path, path) for path in r.get('dirs', []))]
+        for path in [*folders, canon(os.environ.get('TMPDIR') or '/tmp'), canon('/private/tmp')]:
+            if not inside(path, protected): filesystem[path] = 'write'
+    for path in protected: filesystem[path] = 'read'
     for path in homes:
-        filesystem[path] = 'read'
         for name in ('control.header', '.control.header'): filesystem[str(Path(path) / name)] = 'deny'
     name = 'lord-' + uuid.uuid4().hex
     return {'default_permissions': name, 'permissions': {name: {'filesystem': filesystem,
@@ -897,7 +904,7 @@ def redact_tail(text, limit, redact, *, details=False):
     if len(text) <= limit:
         shown, omitted = redact(text), 0
     else:
-        start = max(0, len(text) - limit - 64)
+        start = max(0, len(text) - limit - 8192)
         shown, cut, positions = redact(text[start:], cut=len(text) - limit - start)
         cut = max(cut, len(shown) - limit)
         value = r'[^\s\"\x27,\[\]{}:;]'
@@ -1133,12 +1140,7 @@ class Vendor:
             if self.process or self.exec_process: await self.close()
             self.stopping = False
             self.readonly = bool(self.agent and self.agent.record.get('readonly'))
-            config = self.d.config[self.family]
-            command = config.get('program', {'gpt': 'codex', 'grok': 'grok', 'gemini': 'agy'}[self.family])
-            command = list(command) if isinstance(command, list) else [command]
-            # A missing program leaves no vendor setup behind.
-            if not shutil.which(command[0], path=subscription_env().get('PATH')):
-                raise RuntimeError(f'{command[0]} was not found; {INSTALL[self.family]}')
+            command = self.d.vendor_program(self.family, self.agent)
             if self.agent:
                 check_pins(self.agent)
                 self.d.message_folders(self.agent)
@@ -1684,6 +1686,20 @@ class Daemon:
         # A codex process owned by no agent, for archiving pruned threads: one per codex folder.
         return self.vendors.setdefault(None if home is None else ('service', home), Vendor(self, 'gpt', codex_home=home))
 
+    def vendor_program(self, family, agent=None):
+        command = self.config[family].get('program', {'gpt': 'codex', 'grok': 'grok', 'gemini': 'agy'}[family])
+        command = list(command) if isinstance(command, list) else [command]
+        found = shutil.which(command[0], path=subscription_env().get('PATH'))
+        if not found: raise RuntimeError(f'{command[0]} was not found; {INSTALL[family]}')
+        command[0] = os.path.abspath(found)
+        agents = [*getattr(self, 'agents', {}).values(), *([agent] if agent else [])]
+        folders = [path for a in agents for path in [a.cwd, *a.record.get('dirs', [])]]
+        folders += [os.environ.get('TMPDIR') or '/tmp', '/private/tmp']
+        roots = {spelling for path in folders for spelling in (os.path.abspath(path), canon(path))}
+        if any(inside(path, roots) for path in (command[0], canon(command[0]))):
+            raise RuntimeError(f'vendor program {command[0]} is inside an agent working, @dir or temp folder; install it outside those folders')
+        return command
+
     async def agy_mcp(self, program):
         # agy has no per-run MCP option. One user-level entry serves every agy process; the server reads its
         # agent id from LORD_AGENT_ID and lists no tools in agy sessions the daemon did not start. It is added (or
@@ -1735,7 +1751,6 @@ class Daemon:
     async def attach(self, a):
         async with a.lock:
             vendor = self.backend(a)
-            tickets = self.message_tickets(a)
             try: await vendor.ensure()
             except Exception as error:
                 # A start that failed on a spent quota is not retried. An agent never saved yet has no log pruning would
@@ -1806,7 +1821,6 @@ class Daemon:
             self.save(a)
             if vendor.startup_children is None:
                 vendor.startup_children = set((await process_table())[0].get(vendor.process.pid, []))
-            return tickets
 
     async def effort(self, a, requested=None):
         # The requested level, or the nearest one the vendor lists for this model.
@@ -1822,11 +1836,11 @@ class Daemon:
         # Before grok reports its levels (a resumed session may not), its documented range applies.
         elif a.family == 'grok': allowed = self.backend(a).efforts or ['low', 'medium', 'high', 'xhigh']
         else:
-            try: allowed = await self.agy_efforts(a.model)
+            try: allowed = await self.agy_efforts(a.model, a)
             except ValueError:
                 # agy listed its models, and this one is not among them.
                 self.unlisted(a, 'agy', sorted(self.agy_models), next(iter(self.agy_models)))
-                allowed = await self.agy_efforts(a.model)
+                allowed = await self.agy_efforts(a.model, a)
         if allowed and value not in allowed:
             value = min((v for v in allowed if v in RANKS), key=lambda v: abs(RANKS.index(v) - RANKS.index(value)), default=value)
         a.effort = value
@@ -1838,12 +1852,10 @@ class Daemon:
         self.log(f'{a.agentId}: {tool} does not offer {a.model}; using {fallback}')
         a.model = fallback
 
-    async def agy_efforts(self, model):
+    async def agy_efforts(self, model, agent=None):
         # agy lists each model once per effort level, as <model>-<level>.
         if model not in self.agy_levels:
-            config = self.config['gemini']
-            program = config.get('program', 'agy')
-            program = list(program) if isinstance(program, list) else [program]
+            program = self.vendor_program('gemini', agent)
             code, out = await run_quick([*program, 'models'])
             listed = [line.split('\t')[0].strip() for line in out.splitlines()] if code == 0 else []
             ids = set(listed)
@@ -1887,7 +1899,11 @@ class Daemon:
             cwd_paths = dict(a.record.get('cwd_paths', {a.cwd: a.cwd}) if a else {})
             launch = body.get('launch')
             checked = self.launch_folders(launch, agent_id=aid) if launch else []
-            if a: checked += self.message_folders(a)
+            messages = {}
+            if a:
+                applying = list(body.get('dirs') or [])
+                if body.get('pin_cwd') or body['cwd'] != a.cwd: applying.append(body['cwd'])
+                checked += self.message_folders(a, applying=applying, checks=messages)
             checked = set(checked)
             if a:
                 pinned_folder('@cwd', a.cwd, cwd_paths, checked)
@@ -1928,6 +1944,8 @@ class Daemon:
             try:
                 opened = await self.open_agent(aid, family, cwd, body, a, cwd_paths, dir_paths)
                 if launch: self.consume_launch(launch, aid)
+                pinned = {cwd, *dir_paths.values()}
+                self.consume_messages(self.agents[aid], [ticket for ticket, folders in messages.items() if set(folders) <= pinned])
                 return opened
             except BaseException as error:
                 # A first /open that fails leaves no agent behind, so a corrected retry starts clean; a refused
@@ -2002,23 +2020,21 @@ class Daemon:
             a.generation = 0
         # A result held for this agent is handed over by /turn without the vendor, and a vendor that failed to start here
         # would strand it; the next turn's start attaches the vendor instead.
-        tickets = []
         if not a.undelivered():
-            try: tickets = await self.attach(a) or []
+            try: await self.attach(a)
             except Exception as error:
                 if resuming and a.vendorSession and re.search(r'\b(?:conversation|thread|session|rollout)(?:\s+[a-f0-9-]{8,})?\s+(?:(?:is|was)\s+)?(?:not found|does not exist|missing)\b|\bno (?:conversation|thread|session|rollout) found\b|\bmissing (?:conversation|thread|session|rollout)\s*$', str(error), re.I):
                     raise RuntimeError(f'agent {aid} cannot be resumed ({self.redact(error)}); launch a fresh agent') from None
                 raise
         # A model change applies at the next turn; refusing it here keeps the mod from adopting it. With a result held,
         # the turn's start checks it instead, after that result is handed over.
-        if a.family == 'gemini' and body.get('model') and not a.undelivered(): await self.agy_efforts(body['model'])
+        if a.family == 'gemini' and body.get('model') and not a.undelivered(): await self.agy_efforts(body['model'], a)
         if body.get('model') and not a.undelivered() and (models := self.known_models(a)) and body['model'] not in models:
             raise ValueError(f'unknown {a.family} model {body["model"]}; {a.family} lists {", ".join(models)}')
         if a.state == 'closed': a.state = 'idle'
         a.session_ended = False
         a.default_model = False
         # An opened agent counts as used, so pruning cannot take it before its turn starts.
-        self.consume_messages(a, tickets)
         self.save(a)
         settings = self.settings(a)
         a.write_record(settings)
@@ -2073,13 +2089,12 @@ class Daemon:
             if a.family in ('grok', 'gemini') and previous != (a.model, a.effort):
                 if a.family == 'gemini': await self.backend(a).close()
                 a.generation = 0
-            tickets = await self.attach(a) or []
+            await self.attach(a)
         except BaseException:
             if (a.model, a.effort) != previous:
                 a.model, a.effort = previous
                 a.generation = 0
             raise
-        self.consume_messages(a, tickets)
         if a.turn_id: a.ended_turns.add(a.turn_id)
         a.state, a.answer, a.final_text, a.items = 'running', '', '', {}
         a.base, a.tokens, a.turn_id = dict(a.total), usage({}), None
@@ -2372,9 +2387,24 @@ class Daemon:
             except (OSError, ValueError): return
             if isinstance(entry, dict) and entry.get('agentId') == agent_id: path.unlink(missing_ok=True)
 
-    def message_folders(self, a):
-        tickets = self.message_tickets(a)
-        checked = {path for ticket in tickets for path in self.launch_folders(ticket, agent_id=a.agentId)}
+    def message_folders(self, a, *, applying=(), checks=None):
+        checked, stale, expired = set(), [], False
+        applying = {normalize_system_aliases(path) for path in applying}
+        for ticket in self.message_tickets(a):
+            path = HOME / 'launches' / f'{ticket}.json'
+            with self.journal_lock():
+                try: entry = json.loads(path.read_text()) if path.stat().st_size <= LIMIT else None
+                except (OSError, ValueError): entry = None
+            if entry is None or (isinstance(entry, dict) and isinstance(entry.get('expires'), (int, float)) and entry['expires'] <= time.time()):
+                stale.append(ticket)
+                folders = entry.get('folders', []) if isinstance(entry, dict) else []
+                expired |= isinstance(folders, list) and any(isinstance(folder, str) and folder in applying for folder in folders)
+                continue
+            folders = self.launch_folders(ticket, agent_id=a.agentId)
+            if checks is not None: checks[ticket] = folders
+            checked.update(folders)
+        self.consume_messages(a, stale)
+        if expired: raise ValueError('delegated message folder check expired; send the folder option again')
         for path in checked: pinned_folder('@dir', path, {}, checked)
         return list(checked)
 

@@ -30,7 +30,9 @@
   (literal (param "TEMP_KEY")) (literal (param "REAL_TEMP_KEY")))
 (deny file-write*
   (subpath (param "LORD_HOME"))
-  (subpath (param "REAL_LORD_HOME")))
+  (subpath (param "REAL_LORD_HOME"))
+  (subpath (param "PLUGIN"))
+  (subpath (param "PLUGIN_LOGICAL")))
 (deny mach-lookup (xpc-service-name-prefix ""))
 (deny system-fcntl (fcntl-command 80 110))
 
