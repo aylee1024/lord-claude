@@ -691,19 +691,20 @@ def test_environment_scrub_applies_to_every_vendor(rig, family):
 
 @pytest.mark.parametrize('readonly', [False, True])
 @pytest.mark.parametrize('net', [False, True])
-def test_codex_permission_policy_applies_to_every_turn(rig, readonly, net):
+def test_codex_permission_policy_applies_to_every_turn(rig, tmp_path, readonly, net):
     if readonly and net:
         # With network on, codex can reach local services, so read-only would not hold.
         conn, file, status, _ = rig.connect('/open', {'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home), 'readonly': True, 'net': True})
         reply = json.loads(file.read()); file.close(); conn.close()
         assert status == 400 and 'not read-only' in reply['error']
         return
-    rig.open('gpt', readonly=readonly, net=net)
+    rig.open('gpt', cwd=str(tmp_path), readonly=readonly, net=net)
     rig.turn('PING')
     params = next(e['params'] for e in rig.audit() if e.get('method') == 'turn/start')
     assert 'sandboxPolicy' not in params
     profile = gpt_profile(rig)
-    assert profile['filesystem'].get(str(rig.home.resolve())) == (None if readonly else 'write')
+    assert profile['filesystem'].get(str(tmp_path.resolve())) == (None if readonly else 'write')
+    assert profile['filesystem'][str(rig.home.resolve())] == 'read'
     assert profile['network']['enabled'] is net
 
 
@@ -850,10 +851,10 @@ def test_grok_runs_without_claude_or_cursor_imports(rig):
     assert {k for k, v in env.items() if v == 'false'} == {f'GROK_{a}_{b}_ENABLED' for a in ('CLAUDE', 'CURSOR') for b in ('MCPS', 'HOOKS', 'SKILLS')}
 
 
-def test_dirs_become_codex_writable_roots_and_reattach(rig):
-    extra = rig.home / 'extra'; extra.mkdir()
-    rig.open('gpt')
-    rig.open('gpt', dirs=[str(extra)])
+def test_dirs_become_codex_writable_roots_and_reattach(rig, tmp_path):
+    extra, work = tmp_path / 'extra', tmp_path / 'work'; extra.mkdir(); work.mkdir()
+    rig.open('gpt', cwd=str(work))
+    rig.open('gpt', cwd=str(work), dirs=[str(extra)])
     starts = [e['params'] for e in rig.audit() if e.get('method') in ('thread/start', 'thread/resume')]
     assert gpt_profile(rig)['filesystem'][str(extra.resolve())] == 'write'
     rig.turn('PING')
@@ -1001,12 +1002,12 @@ def test_each_turn_saves_its_final_answer_to_a_file(rig):
     assert path.read_text() == 'second answer'
 
 
-def test_a_later_readonly_reattaches_with_the_read_only_sandbox(rig):
-    rig.open('gpt')
+def test_a_later_readonly_reattaches_with_the_read_only_sandbox(rig, tmp_path):
+    rig.open('gpt', cwd=str(tmp_path))
     rig.turn('PING')
-    rig.open('gpt', readonly=True)
+    rig.open('gpt', cwd=str(tmp_path), readonly=True)
     rig.turn('PING')
-    assert gpt_profile(rig)['filesystem'].get(str(rig.home.resolve())) is None
+    assert gpt_profile(rig)['filesystem'].get(str(tmp_path.resolve())) is None
 
 
 def test_nosandbox_runs_codex_unconfined_and_a_later_readonly_is_refused(rig):
@@ -1500,7 +1501,7 @@ def test_an_earlier_codex_turn_completing_before_the_new_turn_id_is_ignored():
         a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6.1-sol', 'vendorSession': 's'})
         a.turn_id = 'old'
         d = object.__new__(m.Daemon); d.quota = {}; d.agents = {'a': a}; d.redact = str; d.save = lambda a: None; d.config = {'gpt': {}}
-        d.effort, d.attach = AsyncMock(), AsyncMock()
+        d.effort, d.attach = AsyncMock(), AsyncMock(return_value=[])
         d.task = lambda coroutine: coroutine.close()
         await d.begin_locked(a, {'text': 'new'})
         m.Vendor(d, 'gpt', a).notification({'method': 'turn/completed', 'params': {'threadId': 's', 'turn': {'id': 'old', 'status': 'interrupted'}}})

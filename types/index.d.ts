@@ -8,6 +8,6 @@ export type LordAgent = { family: string; owned?: boolean; cwd?: string; running
 declare module 'claude-code' {
   interface PluginState {
     // A reload of the plugin's code empties its module variables mid-turn; these carry a turn in flight across one.
-    lord: { agent: StateFamily<LordAgent>; start: StateFamily<LordTask | null>; dir: StateFamily<string>; launch: StateFamily<{ daemon: string } | null> }
+    lord: { agent: StateFamily<LordAgent>; start: StateFamily<LordTask | null>; dir: StateFamily<string>; launch: StateFamily<{ daemon: string; agentId?: string } | null> }
   }
 }

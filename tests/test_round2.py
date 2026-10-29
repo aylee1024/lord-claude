@@ -195,7 +195,8 @@ def test_r2_redaction_128kb_finishes_under_half_second(shape):
 def test_r2_redact_then_trim_sites_bound_input(tmp_path, monkeypatch):
     m = load('r2_trim_margin'); m.HOME = tmp_path
     sizes = []
-    def redact(text): sizes.append(len(str(text))); return str(text)
+    original = m.REDACT
+    def redact(text, **kwargs): sizes.append(len(str(text))); return original(text, **kwargs)
     monkeypatch.setattr(m, 'REDACT', redact)
     async def scenario():
         a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '/tmp/x', 'model': 'fake'})

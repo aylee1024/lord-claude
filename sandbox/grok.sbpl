@@ -26,7 +26,8 @@
 (allow mach-lookup (global-name "com.apple.trustd.agent"))
 (allow sysctl-read)
 (allow process-info*)
-(deny file-read* (literal (param "KEY")) (literal (param "REAL_KEY")))
+(deny file-read* (literal (param "KEY")) (literal (param "REAL_KEY"))
+  (literal (param "TEMP_KEY")) (literal (param "REAL_TEMP_KEY")))
 (deny file-write*
   (subpath (param "LORD_HOME"))
   (subpath (param "REAL_LORD_HOME")))

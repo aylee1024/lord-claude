@@ -135,7 +135,7 @@ PREFIXES = ['Bearer ', 'Authorization: Bearer ', 'api_token: ', '"access_token":
 @pytest.mark.parametrize('prefix', PREFIXES)
 def test_r5_every_credential_prefix_cut_is_redacted(scope, monkeypatch, site, prefix):
     d, a, m, *_ = scope
-    limit = m.ROW_OUTPUT + 8192 if site == 'row' else 8192
+    limit = m.ROW_OUTPUT
     secret = 'Q' * (limit - 1200)
     if prefix == 'AKIA': secret = 'Q' * 16
     if prefix == 'eyJ':
@@ -144,8 +144,8 @@ def test_r5_every_credential_prefix_cut_is_redacted(scope, monkeypatch, site, pr
     line = prefix + secret
     original, redacted = m.REDACT, []
     assert 'Q' * 16 not in original(line)
-    def redact(value):
-        result = original(value); redacted.append(result); return result
+    def redact(value, **kwargs):
+        result = original(value, **kwargs); redacted.append(result[0] if isinstance(result, tuple) else result); return result
     monkeypatch.setattr(m, 'REDACT', redact); d.redact = redact; d.log = lambda text: None
     async def run():
         for case in range(2 * len(prefix)):
@@ -166,10 +166,10 @@ def test_r5_every_credential_prefix_cut_is_redacted(scope, monkeypatch, site, pr
     asyncio.run(run())
 
 
-def test_r5_cut_uses_nearby_newline_or_discards_partial_line(scope):
+def test_r5_cut_keeps_redaction_and_discards_only_the_partial_run(scope):
     _, _, m, *_ = scope
-    assert m.redact_tail('old\nBearer decoy\nend', 18, m.REDACT).startswith('[REDACTED]')
-    assert m.redact_tail('old\n' + 'x' * 300 + ' Bearer decoy\nend', 18, m.REDACT) == 'end'
+    assert m.redact_tail('old\nBearer decoy\nend', 18, m.REDACT).endswith('[REDACTED]\nend')
+    assert m.redact_tail('old\n' + 'x' * 300 + ' Bearer decoy\nend', 18, m.REDACT).endswith('[REDACTED]\nend')
 
 
 @pytest.mark.parametrize('restart', [False, True])

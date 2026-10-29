@@ -8,8 +8,8 @@
 (allow process-info*)
 (allow system-sched (target self))
 (allow mach-lookup (global-name "com.apple.sysmond"))
-(deny file-read* (literal (param "KEY")))
-(deny file-read-data (literal (param "KEY")))
+(deny file-read* (literal (param "KEY")) (literal (param "TEMP_KEY")))
+(deny file-read-data (literal (param "KEY")) (literal (param "TEMP_KEY")))
 (deny mach-lookup (xpc-service-name-prefix ""))
 
 (define (lord-writable-root root)

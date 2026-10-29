@@ -2,6 +2,7 @@
 """Lord's Unix HTTP broker and subscription CLI adapters (Python 3.11 or later)."""
 import argparse
 import asyncio
+import ctypes
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 import fcntl
@@ -14,6 +15,7 @@ import shlex
 import shutil
 import signal
 import stat
+import struct
 import sys
 import time
 
@@ -286,6 +288,7 @@ def grok_profile(cwd, readonly, env):
     params = {name: canon(path) for name, path in {
         'AGENT': cwd, 'TMP': env.get('TMPDIR') or '/tmp', 'PRIVATE_TMP': '/private/tmp',
         'GROK_HOME': grok_home(), 'SESSIONS': grok_home() / 'sessions', 'KEY': HOME / 'control.header', 'REAL_KEY': real_home / 'control.header',
+        'TEMP_KEY': HOME / '.control.header', 'REAL_TEMP_KEY': real_home / '.control.header',
         'LORD_HOME': HOME, 'REAL_LORD_HOME': real_home, 'SOCKET': Path(canon(SOCKET.parent)) / SOCKET.name}.items()}
     params['SOCKET_LOGICAL'] = str(SOCKET)
     if not readonly: profile += '\n(allow file-write* (subpath (param "AGENT")))'
@@ -365,7 +368,8 @@ def tests_profile(cwd, dirs, env):
     profile = '\n'.join((folder / name).read_text() for name in ('seatbelt_base_policy.sbpl', 'seatbelt_preferences_policy.sbpl', 'tests.sbpl'))
     roots, tmp, private_tmp = tests_paths(cwd, dirs, env)
     params = {'TMP': tmp, 'PRIVATE_TMP': private_tmp,
-              'KEY': canon(HOME / 'control.header'), 'LORD_HOME': canon(HOME), 'LORD_HOME_LOGICAL': normalize_system_aliases(HOME)}
+              'KEY': canon(HOME / 'control.header'), 'TEMP_KEY': canon(HOME / '.control.header'),
+              'LORD_HOME': canon(HOME), 'LORD_HOME_LOGICAL': normalize_system_aliases(HOME)}
     daemon = codex_daemon_directory()
     params['CODEX_DAEMON'] = str(daemon)
     roots = list(dict.fromkeys(roots))
@@ -587,12 +591,14 @@ def check_pins(a):
 
 def gpt_permissions(a):
     r = a.record
-    filesystem = {'/': 'read', '/**/control.header': 'deny'}
+    homes = {os.path.abspath(HOME), canon(HOME)}
+    filesystem = {'/': 'read', '/**/control.header': 'deny', '/**/.control.header': 'deny'}
     if not r.get('readonly'):
         for path in [a.cwd, *r.get('dirs', []), os.environ.get('TMPDIR') or '/tmp', '/private/tmp']:
-            filesystem[canon(path)] = 'write'
-    for path in {str(HOME / 'control.header'), canon(HOME / 'control.header')}:
-        filesystem[path] = 'deny'
+            if not inside(canon(path), homes): filesystem[canon(path)] = 'write'
+    for path in homes:
+        filesystem[path] = 'read'
+        for name in ('control.header', '.control.header'): filesystem[str(Path(path) / name)] = 'deny'
     name = 'lord-' + uuid.uuid4().hex
     return {'default_permissions': name, 'permissions': {name: {'filesystem': filesystem,
             'network': {'enabled': bool(r.get('net'))}}}}
@@ -687,16 +693,38 @@ class Redactor:
         self.secrets = {v for k, v in os.environ.items() if len(v) >= 8 and
                         any(s in k.upper() for s in SECRET_NAMES)}
 
-    def __call__(self, value):
+    def __call__(self, value, *, cut=None):
         value = str(value)
-        for secret in sorted(self.secrets, key=len, reverse=True): value = value.replace(secret, '[REDACTED]')
-        value = re.sub(r'(?i)\bBearer[ \t]+[^\s\"\x27]+|\bsk-[\w-]{16,}|\beyJ[\w-]{1,512}\.[\w-]{1,8192}\.[\w-]{1,2048}|\bgh[pousr]_\w{20,}|\bgithub_pat_\w{20,}'
-                       r'|\bAKIA[0-9A-Z]{16}\b|\bAIza[\w-]{30,}|\bxox[abprs]-[\w-]{10,}|\bxai-\w{20,}', '[REDACTED]', value)
+        positions = list(range(len(value))) if cut is not None else None
+        def substitute(pattern, replacement, prefix=False):
+            nonlocal value, cut, positions
+            if cut is None:
+                value = re.sub(pattern, replacement, value)
+                return
+            parts, offsets, end, shift, boundary = [], [], 0, 0, cut
+            for match in re.finditer(pattern, value):
+                new = match.expand(replacement)
+                parts.extend((value[end:match.start()], new))
+                offsets.extend(positions[end:match.start()])
+                kept = len(match[1]) if prefix else 0
+                offsets.extend(positions[match.start():match.start() + kept])
+                offsets.extend([positions[match.start() + kept]] * (len(new) - kept))
+                delta = len(new) - len(match[0])
+                if match.end() <= boundary: cut += delta
+                elif match.start() < boundary: cut = match.start() + shift
+                shift += delta
+                end = match.end()
+            value = ''.join([*parts, value[end:]])
+            positions = [*offsets, *positions[end:]]
+        for secret in sorted(self.secrets, key=len, reverse=True): substitute(re.escape(secret), '[REDACTED]')
+        substitute(r'(?i)\bBearer[ \t]+[^\s\"\x27]+|\bsk-[\w-]{16,}|\beyJ[\w-]{1,512}\.[\w-]{1,8192}\.[\w-]{1,2048}|\bgh[pousr]_\w{20,}|\bgithub_pat_\w{20,}'
+                   r'|\bAKIA[0-9A-Z]{16}\b|\bAIza[\w-]{30,}|\bxox[abprs]-[\w-]{10,}|\bxai-\w{20,}', '[REDACTED]')
         # key=value, key: value and "key": "value", for the usual secret names.
         # Names may carry a prefix (GITHUB_TOKEN, client_secret, "access_token"); a scheme word (Basic, Token) goes with
         # its value.
-        return re.sub(r'(?i)(["\x27]?(?<![\w-])[\w-]{0,64}(?:api[-_]?key|authorization|password|passwd|secret|token)[\w-]{0,64}["\x27]?\s*[:=]\s*["\x27]?)'
-                      r'(?!\[REDACTED\])(?:(?:basic|token|digest|bearer)\s+)?[^\s\"\x27,;}]+', r'\1[REDACTED]', value)
+        substitute(r'(?i)(["\x27]?(?<![\w-])[\w-]{0,64}(?:api[-_]?key|authorization|password|passwd|secret|token)[\w-]{0,64}["\x27]?\s*[:=]\s*["\x27]?)'
+                   r'(?!\[REDACTED\])(?:(?:basic|token|digest|bearer)\s+)?[^\s\"\x27,;}]+', r'\1[REDACTED]', prefix=True)
+        return value if cut is None else (value, cut, positions)
 
 async def process_table():
     ps = await asyncio.create_subprocess_exec('/bin/ps', '-A', '-o', 'pid=,ppid=,rss=', stdout=-1, stderr=-3)
@@ -799,12 +827,25 @@ def signal_all(pids, sig):
         try: os.kill(pid, sig)
         except (ProcessLookupError, PermissionError): pass
 
+def process_start(pid):
+    # PROC_PIDTBSDINFO supplies microsecond birth times, unlike ps's second-resolution lstart.
+    if sys.platform != 'darwin': return None
+    data = ctypes.create_string_buffer(136)
+    try: size = ctypes.CDLL('/usr/lib/libproc.dylib').proc_pidinfo(pid, 3, 0, data, len(data))
+    except (OSError, ValueError): return None
+    return struct.unpack_from('=QQ', data.raw, 120) if size == len(data) else None
+
+def peer_pid(writer):
+    try: pid = writer.get_extra_info('socket').getsockopt(0, 2)  # SOL_LOCAL, LOCAL_PEERPID
+    except (OSError, AttributeError): return None
+    return pid if isinstance(pid, int) and pid > 0 else None
+
 async def kill_tree(process, known=(), *, agent_id=None, others=(), on_jobs=None, startup=(), on_error=None):
     # Tool commands can leave the vendor's process group, so every descendant is signalled by pid as well.
     # macOS answers killpg with EPERM when the group holds only zombies; the pid signals below still run.
     roots = [p for p in (process, *others) if p is not None]
     if not roots and not agent_id: return
-    logged, remembered = set(), set(known)
+    logged, remembered, starts = set(), set(known), {}
     def failed(error):
         if on_error:
             try: on_error(f'process cleanup lookup failed: {error}')
@@ -821,6 +862,8 @@ async def kill_tree(process, known=(), *, agent_id=None, others=(), on_jobs=None
             failed(error)
         marked = marked_pids(markers, agent_id)
         pids = {pid for p in roots if p.returncode is None for pid in tree(children, p.pid)}
+        if sig == signal.SIGKILL:
+            pids.update(pid for pid, start in starts.items() if start is not None and process_start(pid) == start)
         if fallback: pids.update(remembered)
         if on_jobs:
             try:
@@ -831,6 +874,7 @@ async def kill_tree(process, known=(), *, agent_id=None, others=(), on_jobs=None
                 pids.update(remembered)
                 failed(error)
         remembered.update(pids | marked)
+        if sig == signal.SIGTERM: starts = {pid: process_start(pid) for pid in pids | marked}
         for p in roots:
             if p.returncode is not None: continue
             try: os.killpg(p.pid, sig)
@@ -848,16 +892,20 @@ def usage(value):
 
 REDACT = Redactor()
 
-def redact_tail(text, limit, redact):
-    # Keep a nearby line boundary so every credential prefix remains intact.
-    if len(text) > limit:
-        cut = len(text) - limit
-        newline = text.rfind('\n', max(0, cut - 256), cut)
-        if newline >= 0: text = text[newline + 1:]
-        else:
-            newline = text.find('\n', cut)
-            text = text[newline + 1:] if newline >= 0 else ''
-    return redact(text)
+def redact_tail(text, limit, redact, *, details=False):
+    # Map the cut through redactions so a credential crossing it stays whole and omission counts use source offsets.
+    if len(text) <= limit:
+        shown, omitted = redact(text), 0
+    else:
+        start = max(0, len(text) - limit - 64)
+        shown, cut, positions = redact(text[start:], cut=len(text) - limit - start)
+        cut = max(cut, len(shown) - limit)
+        value = r'[^\s\"\x27,\[\]{}:;]'
+        if cut and re.fullmatch(value, shown[cut - 1:cut]) and (partial := re.match(value + '+', shown[cut:])):
+            cut += partial.end()
+        omitted = start + positions[cut] if cut < len(positions) else len(text)
+        shown = shown[cut:]
+    return (shown, omitted) if details else shown
 
 # The names of an agent's files in logs/, after its id (Agent.files and the answers folder).
 AGENT_FILES = ('.log', '.log.1', '.answer.md', '.json', '.json.tmp', '.reads.txt', '.answers')
@@ -953,8 +1001,8 @@ class Agent:
         future = self.rows.get(rid)
         if future is None or future.done(): return
         self.jobs_checked, self.jobs_changed = 0, time.monotonic()
-        text = redact_tail(output, ROW_OUTPUT + 8192, REDACT)
-        if len(output) > ROW_OUTPUT + 8192 or len(text) > ROW_OUTPUT: text = f'[{len(output) - ROW_OUTPUT} earlier characters not shown]\n{text[-ROW_OUTPUT:]}'
+        text, omitted = redact_tail(output, ROW_OUTPUT, REDACT, details=True)
+        if omitted: text = f'[{omitted} earlier characters not shown]\n{text}'
         future.set_result({'output': text, 'stopped': stopped})
 
     def write_record(self, settings, turns=None, helpers=None):
@@ -1091,7 +1139,9 @@ class Vendor:
             # A missing program leaves no vendor setup behind.
             if not shutil.which(command[0], path=subscription_env().get('PATH')):
                 raise RuntimeError(f'{command[0]} was not found; {INSTALL[self.family]}')
-            if self.agent: check_pins(self.agent)
+            if self.agent:
+                check_pins(self.agent)
+                self.d.message_folders(self.agent)
             # @nice: the vendor starts at that niceness and every command it runs inherits it; a sandboxed command
             # cannot lower its own priority. nice -n adds to the daemon's own niceness, which no one may lower, so a
             # daemon already at or past the level starts the vendor at its own.
@@ -1258,7 +1308,7 @@ class Vendor:
         while line := await process.stderr.readline():
             text = line.decode('utf8', 'replace')
             self.d.log(text)
-            if process is self.exec_process: self.exec_error = (self.exec_error + redact_tail(text, 8192, self.d.redact))[-2000:]
+            if process is self.exec_process: self.exec_error = redact_tail(self.exec_error + text, 2000, self.d.redact)
             if self.family == 'gemini' and text.startswith('AGY_ERROR: '): self.agy_error(text[len('AGY_ERROR: '):])
 
     def agy_error(self, text):
@@ -1685,6 +1735,7 @@ class Daemon:
     async def attach(self, a):
         async with a.lock:
             vendor = self.backend(a)
+            tickets = self.message_tickets(a)
             try: await vendor.ensure()
             except Exception as error:
                 # A start that failed on a spent quota is not retried. An agent never saved yet has no log pruning would
@@ -1694,6 +1745,7 @@ class Daemon:
                 await asyncio.sleep(self.config.get('retry_delay_s', 3))
                 await vendor.ensure()
             if a.generation == vendor.generation: return
+            self.message_folders(a)
             if a.family == 'gpt':
                 await self.effort(a)
                 server = self.server(a)
@@ -1754,6 +1806,7 @@ class Daemon:
             self.save(a)
             if vendor.startup_children is None:
                 vendor.startup_children = set((await process_table())[0].get(vendor.process.pid, []))
+            return tickets
 
     async def effort(self, a, requested=None):
         # The requested level, or the nearest one the vendor lists for this model.
@@ -1832,7 +1885,10 @@ class Daemon:
                 cause = 'record is missing' if not a else 'vendor session is missing' if not a.vendorSession else None
                 if cause: raise ValueError(f'agent {aid} cannot be resumed ({cause}); launch a fresh agent')
             cwd_paths = dict(a.record.get('cwd_paths', {a.cwd: a.cwd}) if a else {})
-            checked = self.launch_folders(body['launch']) if not a and body.get('launch') else ()
+            launch = body.get('launch')
+            checked = self.launch_folders(launch, agent_id=aid) if launch else []
+            if a: checked += self.message_folders(a)
+            checked = set(checked)
             if a:
                 pinned_folder('@cwd', a.cwd, cwd_paths, checked)
             cwd = pinned_folder('@cwd', body['cwd'], cwd_paths, checked)
@@ -1869,7 +1925,10 @@ class Daemon:
                 self.quota_refusal(family, body.get('model') or (a.model if a else self.config[family]['model']), a, aid)
             new = a is None
             saved = None if new else (json.loads(dumps(a.record)), a.restart)
-            try: return await self.open_agent(aid, family, cwd, body, a, cwd_paths, dir_paths)
+            try:
+                opened = await self.open_agent(aid, family, cwd, body, a, cwd_paths, dir_paths)
+                if launch: self.consume_launch(launch, aid)
+                return opened
             except BaseException as error:
                 # A first /open that fails leaves no agent behind, so a corrected retry starts clean; a refused
                 # later /open puts the agent's options back and reattaches with them on the next turn.
@@ -1943,8 +2002,9 @@ class Daemon:
             a.generation = 0
         # A result held for this agent is handed over by /turn without the vendor, and a vendor that failed to start here
         # would strand it; the next turn's start attaches the vendor instead.
+        tickets = []
         if not a.undelivered():
-            try: await self.attach(a)
+            try: tickets = await self.attach(a) or []
             except Exception as error:
                 if resuming and a.vendorSession and re.search(r'\b(?:conversation|thread|session|rollout)(?:\s+[a-f0-9-]{8,})?\s+(?:(?:is|was)\s+)?(?:not found|does not exist|missing)\b|\bno (?:conversation|thread|session|rollout) found\b|\bmissing (?:conversation|thread|session|rollout)\s*$', str(error), re.I):
                     raise RuntimeError(f'agent {aid} cannot be resumed ({self.redact(error)}); launch a fresh agent') from None
@@ -1958,6 +2018,7 @@ class Daemon:
         a.session_ended = False
         a.default_model = False
         # An opened agent counts as used, so pruning cannot take it before its turn starts.
+        self.consume_messages(a, tickets)
         self.save(a)
         settings = self.settings(a)
         a.write_record(settings)
@@ -2012,12 +2073,13 @@ class Daemon:
             if a.family in ('grok', 'gemini') and previous != (a.model, a.effort):
                 if a.family == 'gemini': await self.backend(a).close()
                 a.generation = 0
-            await self.attach(a)
+            tickets = await self.attach(a) or []
         except BaseException:
             if (a.model, a.effort) != previous:
                 a.model, a.effort = previous
                 a.generation = 0
             raise
+        self.consume_messages(a, tickets)
         if a.turn_id: a.ended_turns.add(a.turn_id)
         a.state, a.answer, a.final_text, a.items = 'running', '', '', {}
         a.base, a.tokens, a.turn_id = dict(a.total), usage({}), None
@@ -2274,8 +2336,14 @@ class Daemon:
         # Keep an untouched message's envelope intact: the plugin must unwrap it exactly once.
         if changed: data[field] = '\n'.join([*lines, options['text']])
         if tool == 'Agent': return self.launch_folders(folders=folders)
+        if folders:
+            ticket = self.launch_folders(folders=folders, agent_id=target.agentId)
+            try: self.message_tickets(target, add=ticket)
+            except BaseException:
+                self.consume_launch(ticket, target.agentId)
+                raise
 
-    def launch_folders(self, launch=None, *, folders=None):
+    def launch_folders(self, launch=None, *, folders=None, agent_id=None):
         if launch is not None and (not isinstance(launch, str) or not re.fullmatch(r'[0-9a-f]{32}', launch)):
             raise ValueError('delegated launch is invalid; launch again')
         if folders is not None: launch = uuid.uuid4().hex
@@ -2283,16 +2351,59 @@ class Daemon:
         with self.journal_lock():
             if folders is not None:
                 path.parent.mkdir(mode=0o700, exist_ok=True)
-                path.write_text(dumps({'folders': list(dict.fromkeys(folders)), 'expires': now + 600}) + '\n')
+                path.write_text(dumps({'folders': list(dict.fromkeys(folders)), 'expires': now + 600, 'agentId': agent_id}) + '\n')
                 return launch
             try: entry = json.loads(path.read_text()) if path.stat().st_size <= LIMIT else None
             except (OSError, ValueError): entry = None
-            path.unlink(missing_ok=True)
-        if not isinstance(entry, dict) or not isinstance(entry.get('expires'), (int, float)) or entry['expires'] <= now:
-            raise ValueError('delegated launch expired or already opened; launch again')
-        if not isinstance(entry.get('folders'), list) or len(entry['folders']) > 65 or not all(isinstance(path, str) for path in entry['folders']):
-            raise ValueError('delegated launch is invalid; launch again')
-        return entry['folders']
+            if not isinstance(entry, dict) or not isinstance(entry.get('expires'), (int, float)) or entry['expires'] <= now:
+                raise ValueError('delegated folder check expired or already opened; launch again with a fresh agent')
+            if not isinstance(entry.get('folders'), list) or len(entry['folders']) > 65 or not all(isinstance(path, str) for path in entry['folders']):
+                raise ValueError('delegated launch is invalid; launch again')
+            if agent_id and entry.get('agentId') not in (None, agent_id): raise ValueError('delegated launch belongs to another agent; launch again')
+            if agent_id and not entry.get('agentId'):
+                entry['agentId'] = agent_id
+                path.write_text(dumps(entry) + '\n')
+            return entry['folders']
+
+    def consume_launch(self, launch, agent_id):
+        with self.journal_lock():
+            path = HOME / 'launches' / f'{launch}.json'
+            try: entry = json.loads(path.read_text()) if path.stat().st_size <= LIMIT else None
+            except (OSError, ValueError): return
+            if isinstance(entry, dict) and entry.get('agentId') == agent_id: path.unlink(missing_ok=True)
+
+    def message_folders(self, a):
+        tickets = self.message_tickets(a)
+        checked = {path for ticket in tickets for path in self.launch_folders(ticket, agent_id=a.agentId)}
+        for path in checked: pinned_folder('@dir', path, {}, checked)
+        return list(checked)
+
+    def consume_messages(self, a, tickets):
+        for ticket in tickets: self.consume_launch(ticket, a.agentId)
+        if tickets: self.message_tickets(a, consume=tickets)
+
+    def message_tickets(self, a, *, add=None, consume=()):
+        # A receiver in another daemon may hold an older agent record while its vendor stays warm.
+        path = HOME / 'messages' / f'{a.agentId}.json'
+        if not add and not consume:
+            try: path.stat()
+            except FileNotFoundError: return []
+        with self.journal_lock():
+            try: tickets = json.loads(path.read_text()) if path.stat().st_size <= 4096 else None
+            except FileNotFoundError: tickets = []
+            except ValueError: tickets = None
+            if not isinstance(tickets, list) or len(tickets) > 64 or any(not isinstance(t, str) or not re.fullmatch(r'[0-9a-f]{32}', t) for t in tickets):
+                raise ValueError('invalid message folder checks; launch a fresh agent')
+            if add:
+                if len(tickets) >= 64: raise ValueError('lord: too many pending message folder checks; wait for the receiver to start')
+                tickets.append(add)
+            if consume: tickets = [ticket for ticket in tickets if ticket not in consume]
+            if add or consume:
+                if tickets:
+                    path.parent.mkdir(mode=0o700, exist_ok=True)
+                    path.write_text(dumps(tickets) + '\n')
+                else: path.unlink(missing_ok=True)
+            return tickets
 
     def tool_refused(self, a, message):
         message = re.sub(r'\s+', ' ', message).strip()
@@ -2335,7 +2446,7 @@ class Daemon:
         try: return await future
         finally: a.calls.pop(call, None); a.call_data.pop(call, None)
 
-    async def route(self, method, path, body):
+    async def route(self, method, path, body, peer=None):
         if method == 'GET':
             if path == '/health': return {'ok': True, 'pid': os.getpid(), 'version': VERSION}
             if path == '/agents':
@@ -2373,7 +2484,14 @@ class Daemon:
                 # Time spent waiting for the tool is not vendor silence.
                 if a.agentId in self.vendors: self.vendors[a.agentId].last = time.monotonic()
                 future.set_result({'content': [{'type': 'text', 'text': body['text']}], 'isError': bool(body.get('isError'))})
-            elif path == '/mcp': return await self.mcp_call(a, body['name'], body.get('arguments', {}), body.get('token'))
+            elif path == '/mcp':
+                vendor = getattr(self, 'vendors', {}).get(a.agentId)
+                roots = [p for p in (vendor.process, vendor.exec_process) if p and p.returncode is None] if vendor else []
+                try: children = (await process_table())[0] if peer and roots else {}
+                except Exception: raise ValueError('lord tool call from an unknown process') from None
+                if not peer or not any(peer in tree(children, p.pid) for p in roots):
+                    raise ValueError('lord tool call from an unknown process')
+                return await self.mcp_call(a, body['name'], body.get('arguments', {}), body.get('token'))
             elif path == '/row':
                 # Answers once the vendor reports the step finished, or the turn ends.
                 future = a.rows.get(body.get('rowId'))
@@ -2506,7 +2624,7 @@ class Daemon:
                             if task: task.cancel()
                         await asyncio.gather(disconnected, *([pending] if pending else []), return_exceptions=True)
             else:
-                result = await self.route(method, path, body)
+                result = await self.route(method, path, body, peer_pid(writer) if path == '/mcp' else None)
                 await self.response(writer, 200, result)
         except (BrokenPipeError, ConnectionResetError): pass
         except Exception as error:
@@ -2632,6 +2750,7 @@ class Daemon:
                     raise
                 removed.append(aid)
                 for path in a.files(): path.unlink(missing_ok=True)
+                (HOME / 'messages' / f'{aid}.json').unlink(missing_ok=True)
                 shutil.rmtree(a.answers_path, ignore_errors=True)
                 del self.agents[aid]
                 self.open_locks.pop(aid, None)
