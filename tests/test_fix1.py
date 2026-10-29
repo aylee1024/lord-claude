@@ -304,7 +304,7 @@ def test_fix1_finish_ends_when_job_lookup_fails():
     async def scenario():
         d = object.__new__(m.Daemon); logged = []; d.log = logged.append
         a = agent(m); a.state = 'running'; a.finished.clear()
-        d.backend = lambda _: types.SimpleNamespace(update_jobs=AsyncMock(side_effect=OSError('ps unavailable')))
+        d.refresh_jobs = AsyncMock(side_effect=OSError('ps unavailable'))
         try: await d.finish(a, text='answer', usage={})
         except OSError: pass
         assert a.finished.is_set() and a.events.get_nowait()['text'] == 'answer'

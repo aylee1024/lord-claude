@@ -145,6 +145,11 @@ class Rig(Client):
         return [json.loads(line) for line in (self.home / 'sandbox.jsonl').read_text().splitlines()]
 
 
+def gpt_profile(rig):
+    config = [e['params']['config'] for e in rig.audit() if e.get('method') in ('thread/start', 'thread/resume')][-1]
+    return config['permissions'][config['default_permissions']]
+
+
 @pytest.fixture
 def rig():
     # Not under a temp folder: read-only grok is refused there.
@@ -696,8 +701,10 @@ def test_codex_permission_policy_applies_to_every_turn(rig, readonly, net):
     rig.open('gpt', readonly=readonly, net=net)
     rig.turn('PING')
     params = next(e['params'] for e in rig.audit() if e.get('method') == 'turn/start')
-    assert params['sandboxPolicy']['type'] == ('readOnly' if readonly else 'workspaceWrite')
-    assert params['sandboxPolicy']['networkAccess'] is net
+    assert 'sandboxPolicy' not in params
+    profile = gpt_profile(rig)
+    assert profile['filesystem'].get(str(rig.home.resolve())) == (None if readonly else 'write')
+    assert profile['network']['enabled'] is net
 
 
 def test_interrupt_before_grok_prompt_is_dispatched(rig, monkeypatch):
@@ -848,10 +855,10 @@ def test_dirs_become_codex_writable_roots_and_reattach(rig):
     rig.open('gpt')
     rig.open('gpt', dirs=[str(extra)])
     starts = [e['params'] for e in rig.audit() if e.get('method') in ('thread/start', 'thread/resume')]
-    assert starts[-1]['config']['sandbox_workspace_write']['writable_roots'] == [str(extra.resolve())]
+    assert gpt_profile(rig)['filesystem'][str(extra.resolve())] == 'write'
     rig.turn('PING')
     turn = [e['params'] for e in rig.audit() if e.get('method') == 'turn/start'][-1]
-    assert turn['sandboxPolicy']['writableRoots'] == [str(extra.resolve())]
+    assert 'sandboxPolicy' not in turn and gpt_profile(rig)['filesystem'][str(extra.resolve())] == 'write'
 
 
 def test_missing_dir_is_refused(rig):
@@ -999,7 +1006,7 @@ def test_a_later_readonly_reattaches_with_the_read_only_sandbox(rig):
     rig.turn('PING')
     rig.open('gpt', readonly=True)
     rig.turn('PING')
-    assert [e['params'] for e in rig.audit() if e.get('method') == 'turn/start'][-1]['sandboxPolicy']['type'] == 'readOnly'
+    assert gpt_profile(rig)['filesystem'].get(str(rig.home.resolve())) is None
 
 
 def test_nosandbox_runs_codex_unconfined_and_a_later_readonly_is_refused(rig):
@@ -1015,7 +1022,7 @@ def test_nosandbox_runs_codex_unconfined_and_a_later_readonly_is_refused(rig):
 def test_a_later_nosandbox_reattaches_unconfined(rig):
     rig.open('gpt')
     rig.turn('PING')
-    assert [e['params'] for e in rig.audit() if e.get('method') == 'turn/start'][-1]['sandboxPolicy']['type'] == 'workspaceWrite'
+    assert gpt_profile(rig)['filesystem']['/'] == 'read'
     rig.open('gpt', nosandbox=True)
     rig.turn('PING')
     assert [e['params'] for e in rig.audit() if e.get('method') == 'thread/resume'][-1]['sandbox'] == 'danger-full-access'
@@ -1273,6 +1280,7 @@ def test_grok_and_gemini_usage_is_saved_when_the_turn_ends(rig):
 def test_spawned_vendor_only_effort_goes_as_a_directive(monkeypatch):
     spec = importlib.util.spec_from_file_location('lordd_effort', DAEMON)
     m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+    m.HOME.mkdir(parents=True, exist_ok=True)
     async def main():
         a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6.1-sol', 'nosandbox': True}); a.state = 'running'
         d = object.__new__(m.Daemon); d.log = lambda text: None
@@ -1427,7 +1435,7 @@ def test_a_refused_open_changes_nothing(rig):
     assert status == 400
     rig.turn('PING')
     params = [e['params'] for e in rig.audit() if e.get('method') == 'turn/start'][-1]
-    assert params['sandboxPolicy']['networkAccess'] is False
+    assert 'sandboxPolicy' not in params and gpt_profile(rig)['network']['enabled'] is False
 
 
 def test_an_unknown_model_for_an_existing_agent_is_refused_at_open(rig):
@@ -1584,7 +1592,7 @@ def test_a_refused_model_change_puts_the_agents_options_back(rig):
     assert status == 400
     rig.turn('PING')
     params = [e['params'] for e in rig.audit() if e.get('method') == 'turn/start'][-1]
-    assert params['sandboxPolicy']['networkAccess'] is False
+    assert 'sandboxPolicy' not in params and gpt_profile(rig)['network']['enabled'] is False
 
 
 def test_an_opened_agent_is_not_pruned_before_its_turn(rig):
@@ -2639,7 +2647,7 @@ def test_a_retry_keeps_the_turns_wall_clock_and_its_wait_is_not_silence(monkeypa
         a.state, a.turn_body, a.started = 'running', {'text': 'work'}, 100.0
         async def rpc(method, params): return {'turn': {'id': 't2'}}
         v = types.SimpleNamespace(last=0, exec_process=None, rpc=rpc, agent=a, process=types.SimpleNamespace(pid=999999, returncode=None), reason=None, descendants=set())
-        d.backend, d.vendors = (lambda agent: v), {'a': v}
+        d.backend, d.vendors, d.agents = (lambda agent: v), {'a': v}, {'a': a}
         await d.retry(a, 0)
         kept = a.started
         # While Lord waits to retry, codex is idle by Lord's choice: the silence guard does not count it.
@@ -4157,7 +4165,7 @@ def test_tests_watch_exec_kills_detached_marked_child(tmp_path):
         a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': str(tmp_path), 'model': 'gpt-6.1-sol'}); a.state = 'running'
         d.log = lambda text: None
         v = m.Vendor(d, 'gpt', a)
-        d.vendors = {'a': v}
+        d.vendors, d.agents = {'a': v}, {'a': a}
         child = None
         try:
             v.process = await asyncio.create_subprocess_exec(PYTHON, '-c', 'import time; time.sleep(300)',

@@ -43,8 +43,10 @@ You can also put options on their own lines at the start of a task or message:
 | `@cwd <folder>` | The folder the agent works in |
 | `@dir <folder>` | An extra folder gpt may write to |
 | `@memory <GB>`, `@hang <s>`, `@wall <s>` | Stop the agent if it uses too much memory, goes silent, or runs too long. Defaults: 24 GB; silent for 2,400 s (grok and gemini; gpt has none); no wall-clock limit |
-| `@nice <0 to 19>` | Start the vendor at that niceness (or at Lord's own, if higher), which every command it runs inherits. Inside `@tests`, `nice` can lower its own priority; `renice` and `taskpolicy` against outside processes are denied. Raising priority is denied by the kernel. The default gpt sandbox denies priority changes |
+| `@nice <0 to 19>` | Start the vendor at that niceness (or at Lord's own, if higher), which every command it runs inherits. Inside `@tests`, `nice` can lower its own priority; `renice` and `taskpolicy` against outside processes are denied. Raising priority is denied by the kernel. Other gpt sandbox modes cannot change their own priority |
 | `@tools` | Load your own codex or grok skills, plugins and tool servers, which Lord leaves out by default |
+
+Sandboxed gpt uses Codex 0.164.0 permission profiles that deny reading files named `control.header`, including another Lord home's key, with `@net` included. `@tests` keeps its own key denial and blocks Unix control sockets. Grok's profile denies the key too. Sandboxed commands cannot read the key and use Lord's control API to bypass delegation checks. `@nosandbox` uses codex's `danger-full-access`, with no Seatbelt or key denial; its delegation is already unconfined. Folder pins are checked before every vendor start, for all three families.
 
 For gpt, Lord disables only the MCP servers named in your own codex config. MCP servers and hooks from a trusted project's `.codex/config.toml` run in codex's own process, outside the sandbox, even without `@tools`. This applies to `workspace-write`, `read-only` and `@tests`.
 
@@ -55,7 +57,7 @@ gpt permissions measured on macOS with codex 0.164.0 (default `workspace-write`,
 | Operation | `workspace-write` | `@tests` | `@nosandbox` |
 |---|---|---|---|
 | Bind and connect loopback TCP | Denied | Allowed | Allowed |
-| psutil process lookups and `pgrep -fl python` | Denied | Allowed | Allowed |
+| Process lookups with `pgrep -fl python` | Denied | Allowed | Allowed |
 | `sysctl kern.boottime` | Denied | Allowed | Allowed |
 | `/bin/ps` | Denied | Denied | Allowed |
 | Lower priority with `nice -n 10` | Denied | Allowed | Allowed |
@@ -77,9 +79,11 @@ Lord starts codex, grok and agy by name from the Claude Code session's `PATH`, a
 
 Launch Lord agents without a `name`: a named launch would start a separate Claude process instead of the vendor, so Lord refuses it. Message an agent by the id its launch returns; it keeps its working folder across messages.
 
+A delegated launch or message may have at most 64 leading option lines and 16 KB of option text; excess returns `too many option lines` before resolving folders.
+
 A sandboxed agent (gpt without `@nosandbox`, or grok) can launch only `lord:gpt` and `lord:grok` with no more access than its own. Grok requires network access. Lord refuses `@nosandbox`, network, tools or `@tests` the sender does not have, and working or extra folders outside the sender's real working and `@dir` folders, including through links. Relative paths use the sender's working folder; without `@cwd`, a child starts there. A gpt child inherits `@nosearch`. Messages, including self-messages, can reach only Lord agent ids known to this daemon whose recorded access fits within the sender's. Refused calls return a tool error naming the line or type and log that reason in both logs, without the message body. Read-only agents cannot launch or message; gpt with `@nosandbox` and gemini keep unrestricted delegation.
 
-An `@tests` sender launches only `@tests` gpt children and messages only `@tests` agents. A child's folders must already exist. Lord remembers each forwarded real folder and refuses an open if that spelling now resolves elsewhere, including after a daemon restart: `@dir <path> changed after it was checked; launch again`.
+An `@tests` sender launches only `@tests` gpt children and messages only `@tests` agents. A child's folders must already exist. Each launch gets a folder-check ticket that expires after ten minutes and applies only to that child's first open, including after a daemon restart. A changed spelling is refused: `@dir <path> changed after it was checked; launch again`.
 
 Claude Code's agent list shows each Lord agent's model and effort before its task, for example `lord:gpt  Astra, xhigh · Fix the test`, and its details name the vendor model. The label is set at launch; an `@model` or `@effort` sent later in a message applies but does not relabel the agent.
 
@@ -104,7 +108,7 @@ The plugin answers each Lord agent's turn by passing it to `lordd.py`, a small b
 
 Lord counts commands in both vendor process trees as jobs. Lord's own tool server, code hosts, direct vendor children present before the first turn on that process, and visible tool-server processes without both matching ownership markers are excluded with their subtrees. Processes carrying both the agent's `LORD_AGENT_ID` and this daemon's `LORD_DAEMON_SOCKET` are also found after detaching; another daemon's processes are not adopted when agent ids collide. Markers are read only from the environment appended after the plain command, never from arguments. Lord sets these two values in codex's command environment policy on start and resume, preserving them even when your policy filters inherited variables. macOS hides the markers for its own programs (shells, sleep, perl), so a detached shell script is seen only through its other children.
 
-Restored agents' marked jobs are refreshed at restore, listing, before pruning and before idle exit, even without a vendor process. At quit, Lord closes only agents this process launched or messaged; listing an agent or staging its model with `/lord model` does not make it part of that cleanup.
+Restored agents' marked jobs are refreshed at restore, listing, before pruning and before idle exit, even without a vendor process. Listing and turn completion reuse job lookups younger than five seconds; a new command invalidates the cache. Detached jobs are checked every five seconds, and listing stopped records creates no empty vendors. At quit, Lord closes only agents this process launched or messaged; listing an agent or staging its model with `/lord model` does not make it part of that cleanup.
 
 The default models are gpt-6.1-sol, grok-4.7 and gemini-4-argon. If your account does not offer one, or the vendor retires it, Lord uses the vendor tool's own default model instead; `/lord` shows the model each agent ran. A model you name with `@model` is used as named, or refused with the list your account offers. You can change default models and limits in `~/.claude/lord/config.json`, for example `{"grok": {"model": "grok-4.7"}}`.
 

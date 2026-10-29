@@ -8,7 +8,7 @@ import time
 
 import pytest
 
-from test_lordd import Rig, PYTHON, ROOT, grok_home, rig  # noqa: F401  (fixtures)
+from test_lordd import Rig, PYTHON, ROOT, grok_home, rig, gpt_profile  # noqa: F401  (fixtures)
 
 
 def refused(rig, body):
@@ -27,8 +27,8 @@ def test_refused_open_options_do_not_return_after_a_daemon_restart(rig):
     rig.stop(); rig.start()          # e.g. the 600 s idle exit before the agent's next turn
     rig.open('gpt')
     rig.turn('PING')
-    policy = [e['params'] for e in rig.audit() if e.get('method') == 'turn/start'][-1]['sandboxPolicy']
-    assert policy['networkAccess'] is False and policy['writableRoots'] == [], policy
+    policy = gpt_profile(rig)
+    assert policy['network']['enabled'] is False and str(extra.resolve()) not in policy['filesystem'], policy
 
 
 def _grok_lists_models(rig):
@@ -112,7 +112,7 @@ def test_a_relative_dir_is_not_resolved_against_the_daemons_folder(rig, monkeypa
     status, reply = refused(rig, {'agentId': 'a', 'family': 'gpt', 'cwd': str(project), 'dirs': ['shared']})
     if status == 200:
         rig.turn('PING')
-        roots = [e['params'] for e in rig.audit() if e.get('method') == 'turn/start'][-1]['sandboxPolicy']['writableRoots']
+        roots = [path for path, mode in gpt_profile(rig)['filesystem'].items() if mode == 'write']
         assert not any(r.startswith(str(elsewhere)) for r in roots), roots
 
 

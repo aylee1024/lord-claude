@@ -381,7 +381,12 @@ async def handle(value):
             if p.get('environments'):
                 assert p['environments'] == [{'environmentId': SESSIONS['environment'], 'cwd': p['cwd']}]
                 assert 'sandbox' not in p
-            else: assert p['sandbox'] in ('workspace-write', 'read-only', 'danger-full-access')
+            elif p.get('sandbox') == 'danger-full-access':
+                assert 'default_permissions' not in p['config'] and 'permissions' not in p['config']
+            else:
+                assert 'sandbox' not in p
+                profile = p['config']['permissions'][p['config']['default_permissions']]
+                assert profile['filesystem'][str((Path(os.environ['LORD_HOME']) / 'control.header').resolve())] == 'deny'
             server = p['config']['mcp_servers']['lord']
         else:
             server = p['mcpServers'][0]

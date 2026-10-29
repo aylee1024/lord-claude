@@ -29,13 +29,13 @@ def test_r4_delegated_folder_swap_is_refused_at_child_open(tests_backend, rig, o
             await d.open({'agentId': 'sender', 'family': 'gpt', 'cwd': str(work)})
             a = d.agents['sender']; a.state = 'running'
             data = {'subagent_type': 'lord:gpt', 'prompt': f'@{option} {slot}\nwork'}
-            d.confine_call(a, 'Agent', data, m['delegation_access'](a, current=True))
+            launch = d.confine_call(a, 'Agent', data, m['delegation_access'](a, current=True))
             assert f'@{option} {slot}' in data['prompt']
             if restart:
                 await d.close()
                 current = m['Daemon']()
             slot.rmdir(); slot.symlink_to(outside, target_is_directory=True)
-            body = {'agentId': 'child', 'family': 'gpt', 'cwd': str(slot if option == 'cwd' else work)}
+            body = {'agentId': 'child', 'family': 'gpt', 'cwd': str(slot if option == 'cwd' else work), 'launch': launch}
             if option == 'dir': body['dirs'] = [str(slot)]
             with pytest.raises(ValueError, match=f'@{option} .*changed after it was checked; launch again'):
                 await current.open(body)
@@ -54,10 +54,10 @@ def test_r4_already_running_daemon_reads_new_delegated_pins(tests_backend, rig):
             await d.open({'agentId': 'sender', 'family': 'gpt', 'cwd': str(rig.home / 'work')})
             peer = m['Daemon']()
             a = d.agents['sender']
-            d.confine_call(a, 'Agent', {'subagent_type': 'lord:gpt', 'prompt': f'@dir {slot}\nwork'}, m['delegation_access'](a))
+            launch = d.confine_call(a, 'Agent', {'subagent_type': 'lord:gpt', 'prompt': f'@dir {slot}\nwork'}, m['delegation_access'](a))
             slot.rmdir(); slot.symlink_to(outside, target_is_directory=True)
             with pytest.raises(ValueError, match='changed after it was checked'):
-                await peer.open({'agentId': 'child', 'family': 'gpt', 'cwd': str(rig.home / 'work'), 'dirs': [str(slot)]})
+                await peer.open({'agentId': 'child', 'family': 'gpt', 'cwd': str(rig.home / 'work'), 'dirs': [str(slot)], 'launch': launch})
         finally:
             if peer: await peer.close()
             await d.close()
