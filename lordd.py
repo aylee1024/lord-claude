@@ -67,14 +67,25 @@ def parse_options(text, option_lines=None):
         text = re.sub(r'(^|[\r\n\u2028\u2029])  ', r'\1', text)
     def notification(found):
         def field(name):
-            value = re.search(fr'<{name}>([\s\S]*?)</{name}>', found[0])
-            return value[1].strip(OPTION_SPACE) if value else ''
+            begin = found.find(f'<{name}>')
+            if begin < 0: return ''
+            begin += len(name) + 2
+            end = found.find(f'</{name}>', begin)
+            return found[begin:end].strip(OPTION_SPACE) if end >= 0 else ''
         def line(name): return re.sub('[' + re.escape(OPTION_SPACE) + ']+', ' ', field(name))
         return f"Agent {line('task-id')} finished ({line('status')}): {field('result') or line('summary')}"
-    text = re.sub(r'<task-notification>[\s\S]*?</task-notification>', notification, text)
+    parts, cursor = [], 0
+    while (begin := text.find('<task-notification>', cursor)) >= 0:
+        end = text.find('</task-notification>', begin + len('<task-notification>'))
+        if end < 0: break
+        end += len('</task-notification>')
+        parts.extend((text[cursor:begin], notification(text[begin:end])))
+        cursor = end
+    text = ''.join([*parts, text[cursor:]])
     lines, seen, result = re.split(r'\r?\n', text.strip(OPTION_SPACE)), set(), {'text': ''}
-    while lines:
-        line = lines[0].strip(OPTION_SPACE)
+    index = 0
+    while index < len(lines):
+        line = lines[index].strip(OPTION_SPACE)
         known = match(r'^@([a-z]+)(?:\s|$)', line)
         word = known if known and known[1] in KNOWN_OPTIONS else match(r'^@([a-z]+)(?:\s+\S+)?\s*$', line)
         word = word[1] if word else None
@@ -104,8 +115,8 @@ def parse_options(text, option_lines=None):
         else: break
         if word: seen.add(word)
         if option_lines is not None: option_lines.append(line)
-        lines.pop(0)
-    result['text'] = '\n'.join(lines)
+        index += 1
+    result['text'] = '\n'.join(lines[index:])
     return result
 
 def delegation_access(a, current=False):
@@ -547,8 +558,11 @@ def settings_line(s):
                        f"memory {s['memory_gb']} GB", f"hang {s['hang_s'] or 'none'}{' s' if s['hang_s'] else ''}",
                        f"wall {s['wall_s'] or 'none'}{' s' if s['wall_s'] else ''}"])
 
-def pinned_folder(label, path, pins):
+def pinned_folder(label, path, pins, checked=()):
     real = str(Path(path).expanduser().resolve())
+    logical = normalize_system_aliases(os.path.abspath(Path(path).expanduser()))
+    if logical in checked and real != logical:
+        raise ValueError(f'{label} {path} changed after it was checked; launch again')
     if path in pins and real != pins[path]:
         raise ValueError(f'{label} {path} now points to {real}, not {pins[path]} as when it was added; name the folder itself or launch a fresh agent')
     if not Path(real).exists(): raise ValueError(f'{label} {path} does not exist')
@@ -809,6 +823,13 @@ def usage(value):
 
 REDACT = Redactor()
 
+def redact_tail(text, limit, redact):
+    # The retained tail can start inside a credential whose prefix was discarded.
+    if len(text) > limit:
+        text = text[-limit:]
+        text = re.sub(r'^\S+', '', text)
+    return redact(text)
+
 # The names of an agent's files in logs/, after its id (Agent.files and the answers folder).
 AGENT_FILES = ('.log', '.log.1', '.answer.md', '.json', '.json.tmp', '.reads.txt', '.answers')
 
@@ -900,8 +921,8 @@ class Agent:
     def row_done(self, rid, output, stopped=False):
         future = self.rows.get(rid)
         if future is None or future.done(): return
-        text = REDACT(output[-(ROW_OUTPUT + 8192):])
-        if len(text) > ROW_OUTPUT: text = f'[{len(output) - ROW_OUTPUT} earlier characters not shown]\n{text[-ROW_OUTPUT:]}'
+        text = redact_tail(output, ROW_OUTPUT + 8192, REDACT)
+        if len(output) > ROW_OUTPUT + 8192 or len(text) > ROW_OUTPUT: text = f'[{len(output) - ROW_OUTPUT} earlier characters not shown]\n{text[-ROW_OUTPUT:]}'
         future.set_result({'output': text, 'stopped': stopped})
 
     def write_record(self, settings, turns=None, helpers=None):
@@ -911,7 +932,7 @@ class Agent:
             saved = saved if isinstance(saved, dict) else {}
             if turns is None: turns = saved.get('turns') if isinstance(saved.get('turns'), list) else []
             if helpers is None: helpers = saved.get('helpers') if isinstance(saved.get('helpers'), list) else []
-        document = {**{k: self.record[k] for k in ('readonly', 'net', 'nosandbox', 'tests', 'nosearch', 'tools', 'nice', 'memory_gb', 'hang_s', 'wall_s', 'created', 'dir_paths', 'cwd_paths') if k in self.record},
+        document = {**{k: self.record[k] for k in ('readonly', 'net', 'nosandbox', 'tests', 'nosearch', 'tools', 'nice', 'memory_gb', 'hang_s', 'wall_s', 'created', 'dir_paths', 'cwd_paths', 'delegated_folders') if k in self.record},
                     'agentId': self.agentId, 'family': self.family, 'lordVersion': VERSION, 'session': self.record.get('session'),
                     **{k: v for k, v in settings.items() if k != 'codex_folder'}, 'vendorSession': self.vendorSession,
                     'transcript': transcript_path(self.family, self.vendorSession, self.cwd, settings.get('codex_folder')),
@@ -1164,9 +1185,6 @@ class Vendor:
 
     async def update_jobs(self, children=None, markers=None):
         if not self.agent: return set()
-        if not any(p and p.returncode is None for p in (self.process, self.exec_process)) and not self.agent.jobs:
-            self.descendants.clear(); self.exec_descendants.clear()
-            return set()
         if children is None: children = (await process_table())[0]
         if markers is None: markers = await process_markers()
         pids = set()
@@ -1206,7 +1224,7 @@ class Vendor:
         while line := await process.stderr.readline():
             text = line.decode('utf8', 'replace')
             self.d.log(text)
-            if process is self.exec_process: self.exec_error = (self.exec_error + self.d.redact(text[-8192:]))[-2000:]
+            if process is self.exec_process: self.exec_error = (self.exec_error + redact_tail(text, 8192, self.d.redact))[-2000:]
             if self.family == 'gemini' and text.startswith('AGY_ERROR: '): self.agy_error(text[len('AGY_ERROR: '):])
 
     def agy_error(self, text):
@@ -1517,6 +1535,13 @@ class Daemon:
             self.log(f'{a.agentId}: job lookup failed: {error}')
         finally: a.emit('done', **value)
 
+    async def refresh_jobs(self, agents=None):
+        agents = list(self.agents.values() if agents is None else agents)
+        if not agents: return
+        children, _ = await process_table()
+        markers = await process_markers()
+        for a in agents: await self.backend(a).update_jobs(children, markers)
+
     def refused(self, body, message):
         aid = body.get('agentId')
         if not isinstance(aid, str) or not re.fullmatch(r'[A-Za-z0-9_-][A-Za-z0-9_.-]*', aid): return
@@ -1543,7 +1568,7 @@ class Daemon:
                 if not isinstance(saved, dict) or saved.get('family') not in ('gpt', 'grok', 'gemini'): raise ValueError('record is invalid')
                 if not all(isinstance(saved.get(k), str) and saved[k] for k in ('model', 'effort', 'cwd')): raise ValueError('record is incomplete')
                 if not isinstance(saved.get('vendorSession'), str) or not re.fullmatch(r'[A-Za-z0-9_.-]+', saved['vendorSession']): raise ValueError('vendor session is missing')
-                record = {k: saved[k] for k in ('family', 'model', 'effort', 'cwd', 'dirs', 'nice', 'memory_gb', 'hang_s', 'wall_s', 'tools', 'codexHome', 'vendorSession', 'session', 'dir_paths', 'cwd_paths') if k in saved}
+                record = {k: saved[k] for k in ('family', 'model', 'effort', 'cwd', 'dirs', 'nice', 'memory_gb', 'hang_s', 'wall_s', 'tools', 'codexHome', 'vendorSession', 'session', 'dir_paths', 'cwd_paths', 'delegated_folders') if k in saved}
                 if not record.get('codexHome') or canon(record['codexHome']) == canon(self.user_codex_home): record.pop('codexHome', None)
                 record.update(agentId=aid, created=saved.get('created') or datetime.now(timezone.utc).isoformat())
                 record.update(readonly=saved.get('sandbox') == 'read-only' or bool(saved.get('readonly')),
@@ -1763,12 +1788,15 @@ class Daemon:
                 cause = 'record is missing' if not a else 'vendor session is missing' if not a.vendorSession else None
                 if cause: raise ValueError(f'agent {aid} cannot be resumed ({cause}); launch a fresh agent')
             cwd_paths = dict(a.record.get('cwd_paths', {a.cwd: a.cwd}) if a else {})
-            if a: pinned_folder('@cwd', a.cwd, cwd_paths)
-            cwd = pinned_folder('@cwd', body['cwd'], cwd_paths)
+            records = [agent.record for agent in self.agents.values()] + list(self.records(self.journal).values())
+            checked = {path for record in records for path in record.get('delegated_folders', [])}
+            if a:
+                pinned_folder('@cwd', a.cwd, cwd_paths, checked)
+            cwd = pinned_folder('@cwd', body['cwd'], cwd_paths, checked)
             dir_paths = dict(a.record.get('dir_paths', {x: x for x in a.record.get('dirs', [])}) if a else {})
             for path in [*(a.record.get('dirs', []) if a else []), *(body.get('dirs') or [])]:
                 if not Path(path).expanduser().is_absolute(): raise ValueError(f'@dir {path} is not an absolute path')
-                pinned_folder('@dir', path, dir_paths)
+                pinned_folder('@dir', path, dir_paths, checked)
             if body.get('tests') or (a and a.record.get('tests')):
                 for clash in ('readonly', 'nosandbox', 'net', 'tools'):
                     if body.get(clash) or (a and a.record.get(clash)): raise ValueError(f'@tests cannot be used with @{clash}')
@@ -2148,6 +2176,7 @@ class Daemon:
             try: path = canon(os.path.join(access['cwd'], value))
             except (OSError, ValueError): raise ValueError(f'lord: {line} cannot be resolved as a folder') from None
             if not inside(path, roots): raise ValueError(f'lord: {line} is outside the sandboxed sender\'s folders')
+            if tool == 'Agent' and not Path(path).is_dir(): raise ValueError(f'lord: {line} does not exist as a folder')
             if parse_options('@cwd ' + path) != {'text': '', 'cwd': path}:
                 raise ValueError(f'lord: {line} cannot represent its real folder as an option line')
             return path
@@ -2165,6 +2194,7 @@ class Daemon:
             if (other['family'] not in ('gpt', 'grok') or target.record.get('nosandbox') or other['sandbox'] == 'none'
                     or any(other[key] and not access[key] for key in ('network', 'tools'))
                     or other['sandbox'] == 'tests' and access['sandbox'] != 'tests'
+                    or access['sandbox'] == 'tests' and other['sandbox'] != 'tests'
                     or access.get('web_search') == 'off' and other['family'] == 'gpt' and other.get('web_search') != 'off'
                     or any(not inside(canon(path), roots) for path in [other['cwd'], *other['dirs']])):
                 raise ValueError(f"lord: message target {data['to']} has more access than the sandboxed sender")
@@ -2172,26 +2202,37 @@ class Daemon:
         lines = []
         options = parse_options(data[field], lines)
         if options.get('error'): raise ValueError('lord: ' + options['error'])
+        if access['sandbox'] == 'tests':
+            for clash in ('readonly', 'nosandbox', 'net', 'tools'):
+                if options.get(clash) or options.get('limits', {}).get(clash):
+                    raise ValueError(f'lord: @{clash} cannot be used by an @tests caller')
         for flag in ('nosandbox', 'net', 'tools', 'tests'):
             requested = options.get('limits', {}).get('tools') if flag == 'tools' else options.get(flag)
             allowed = {'nosandbox': False, 'net': access['network'], 'tools': access['tools'], 'tests': access['sandbox'] == 'tests'}[flag]
             if requested and not allowed:
                 raise ValueError(f'lord: @{flag} would give more access than the sandboxed sender has')
-        changed = False
+        changed, folders = False, []
         for i, line in enumerate(lines):
             folder = re.match(r'^@(cwd|dir)[' + re.escape(OPTION_SPACE) + r']+(.+)$', line, re.S)
             if not folder: continue
             path = folder_path(line, folder[2])
             lines[i] = f'@{folder[1]} {path}'
+            folders.append(path)
             changed = True
         if tool == 'Agent':
             if not options.get('cwd'):
                 cwd = folder_path('@cwd', roots[0])
                 lines.append('@cwd ' + cwd)
+                folders.append(cwd)
             if access.get('web_search') == 'off' and data['subagent_type'] == 'lord:gpt' and not options.get('nosearch'): lines.append('@nosearch')
+            if access['sandbox'] == 'tests' and not options.get('tests'): lines.append('@tests')
             changed = True
         # Keep an untouched message's envelope intact: the plugin must unwrap it exactly once.
         if changed: data[field] = '\n'.join([*lines, options['text']])
+        if set(folders) - set(a.record.get('delegated_folders', [])):
+            a.record['delegated_folders'] = sorted(set(a.record.get('delegated_folders', [])) | set(folders))
+            self.save(a)
+            a.write_record({**{k: a.record[k] for k in ('codexHome',) if k in a.record}, **access, 'model': a.model, 'effort': a.effort})
 
     def tool_refused(self, a, message):
         message = re.sub(r'\s+', ' ', message).strip()
@@ -2209,8 +2250,7 @@ class Daemon:
         if a.state not in ('running', 'waiting_tool') or a.cancel_requested: raise ValueError('No running turn for lord tool')
         access = delegation_access(a, current=True)
         if a.record.get('readonly') or access['sandbox'] == 'read-only':
-            self.tool_refused(a, 'lord: a read-only agent cannot spawn agents or send messages')
-            raise ValueError('a read-only agent cannot spawn agents or send messages')
+            return self.tool_refused(a, 'lord: a read-only agent cannot spawn agents or send messages')
         if name == 'spawn_agent':
             data = {'subagent_type': args['type'], 'prompt': args['prompt'], 'description': args['description'],
                     'run_in_background': bool(args.get('background', False))}
@@ -2239,12 +2279,15 @@ class Daemon:
         if method == 'GET':
             if path == '/health': return {'ok': True, 'pid': os.getpid(), 'version': VERSION}
             if path == '/agents':
-                for v in self.vendors.values():
-                    if v.agent: await v.update_jobs()
+                self.refresh()
+                await self.refresh_jobs()
                 return self.listed()
             if path == '/allowance': return self.allowances()
         elif method == 'POST':
-            if path == '/restore': return self.restore(body['agentId'])
+            if path == '/restore':
+                result = self.restore(body['agentId'])
+                if result.get('agent'): await self.refresh_jobs([self.agents[body['agentId']]])
+                return result
             if path == '/session_end':
                 ids = body.get('agentIds') if isinstance(body.get('agentIds'), list) else []
                 for a in list(self.agents.values()):
@@ -2437,9 +2480,14 @@ class Daemon:
             if now - pruned >= 3600:
                 pruned = now
                 self.task(self.prune(self.config['prune_days']))
+            idle_s = min(self.config['idle_exit_s'], self.config.get('retire_idle_s', 30)) if self.retire else self.config['idle_exit_s']
+            if not self.requests and now - self.last_request >= idle_s:
+                try: await self.refresh_jobs()
+                except Exception as error:
+                    self.log(f'job lookup before idle exit failed: {error}')
+                    continue
             busy = any(a.state in ('running', 'waiting_tool') or (a.jobs and not a.session_ended) or (a.undelivered() and now - self.last_request < self.config.get('keep_undelivered_s', 86400))
                        for a in self.agents.values())
-            idle_s = min(self.config['idle_exit_s'], self.config.get('retire_idle_s', 30)) if self.retire else self.config['idle_exit_s']
             if not self.requests and now - self.last_request >= idle_s and not busy:
                 self.stop_event.set()
                 return
@@ -2483,6 +2531,7 @@ class Daemon:
 
     async def prune_locked(self, days):
         if not isinstance(days, (int, float)) or days < 0: raise ValueError('days must be nonnegative')
+        await self.refresh_jobs()
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         removed = []
         for aid, a in list(self.agents.items()):

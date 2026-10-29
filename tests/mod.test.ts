@@ -1457,8 +1457,9 @@ test('v225 completion forwards the engine stop reason', async ($, on) => {
 test('v225 quitting requests cleanup of its idle agents', async ($, on) => {
   const w = world(on)
   on('session.end', (_, e) => ({ sessionId: e.sessionId }))
+  await spawn($)
   await $.session.end({ sessionId: 'caller', reason: 'other' } as any)
-  expect(w.requests.find(x => x.path === '/session_end')?.body).toEqual({ session: 'caller', cause: 'session end: other' })
+  expect(w.requests.find(x => x.path === '/session_end')?.body).toEqual({ agentIds: ['a1'], cause: 'session end: other' })
 })
 
 

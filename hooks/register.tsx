@@ -46,16 +46,31 @@ function task(text: string): Task {
     const end = text.indexOf(marker)
     if (end >= 0) text = text.slice(end + marker.length).replace(/^\r?\n/, '').replace(/^\r?\n/, '').replace(/^  /gm, '')
   }
-  text = text.replace(/<task-notification>[\s\S]*?<\/task-notification>/g, block => {
-    const field = (name: string) => (block.match(new RegExp(`<${name}>([\\s\\S]*?)<\\/${name}>`))?.[1] ?? '').trim()
+  const parts = ['']
+  let cursor = 0
+  while (true) {
+    const begin = text.indexOf('<task-notification>', cursor)
+    if (begin < 0) break
+    const close = text.indexOf('</task-notification>', begin + '<task-notification>'.length)
+    if (close < 0) break
+    const end = close + '</task-notification>'.length, block = text.slice(begin, end)
+    const field = (name: string) => {
+      const start = block.indexOf(`<${name}>`)
+      if (start < 0) return ''
+      const begin = start + name.length + 2, end = block.indexOf(`</${name}>`, begin)
+      return end < 0 ? '' : block.slice(begin, end).trim()
+    }
     const line = (name: string) => field(name).replace(/\s+/g, ' ')
-    return `Agent ${line('task-id')} finished (${line('status')}): ${field('result') || line('summary')}`
-  })
+    parts.push(text.slice(cursor, begin), `Agent ${line('task-id')} finished (${line('status')}): ${field('result') || line('summary')}`)
+    cursor = end
+  }
+  text = parts.join('') + text.slice(cursor)
   const result: Task = { text: '' }
   const lines = text.trim().split(/\r?\n/)
   const seen = new Set<string>()
-  while (lines.length) {
-    const line = lines[0].trim()
+  let index = 0
+  while (index < lines.length) {
+    const line = lines[index].trim()
     // An option line is @word with at most one value, or a known option with any value; a longer line starting
     // with @ (a mention) is task text.
     const known = /^@([a-z]+)(?:\s|$)/.exec(line)?.[1]
@@ -75,16 +90,16 @@ function task(text: string): Task {
     else if (line === '@tools') result.limits = { ...result.limits, tools: true }
     else if (/^@nice\s+\d+\s*$/.test(line)) result.limits = { ...result.limits, nice: Number(line.split(/\s+/)[1]) }
     else if (/^@cwd\s+\S/.test(line)) result.cwd = line.replace(/^@cwd\s+/, '')
-    else if (/^@dir\s+\S/.test(line)) result.dirs = [...(result.dirs ?? []), line.replace(/^@dir\s+/, '')]
+    else if (/^@dir\s+\S/.test(line)) (result.dirs ??= []).push(line.replace(/^@dir\s+/, ''))
     // A known option written wrongly would end the options here and leave the rest (an @readonly, say) as task text.
     else if (/^@(model|effort|readonly|net|nosearch|nosandbox|tests|memory|hang|wall|tools|cwd|dir|nice)\b/.test(line)) { result.error = `option line not understood: ${line}`; break }
     // A misspelt option would otherwise run the task at a default (@efort max at high effort).
     else if (word) { result.error = `unknown option line: ${line} (options: ${OPTIONS})`; break }
     else break
     if (word) seen.add(word)
-    lines.shift()
+    index++
   }
-  result.text = lines.join('\n')
+  result.text = lines.slice(index).join('\n')
   return result
 }
 
@@ -406,6 +421,7 @@ async function connect($: EngineInterface, signal: AbortSignal): Promise<void> {
 
 async function steer($: EngineInterface, agentId: string, text: string): Promise<boolean> {
   const agent = await lordAgent($, agentId)
+  if (agent && !agent.owned) { agent.owned = true; await keep($, agentId) }
   if (!agent?.running) return false
   const parsed = task(text)
   // Directives alter the next turn's session options rather than an in-flight request. A message asking for
@@ -426,6 +442,7 @@ async function steer($: EngineInterface, agentId: string, text: string): Promise
 // this one ends, and the answer then carries both results. Undefined: not a running Lord agent (the engine delivers).
 async function message($: EngineInterface, to: string, text: string): Promise<string | undefined> {
   const agent = await lordAgent($, to)
+  if (agent && !agent.owned) { agent.owned = true; await keep($, to) }
   if (!agent?.running) return undefined
   if (await steer($, to, text)) return `Injected into ${to}'s running turn: ${agent.family} reads it at its next step.`
   const parsed = task(text)
@@ -503,7 +520,7 @@ async function lordAgent($: EngineInterface, agentId: string): Promise<Agent | u
     if (!known) { others.add(agentId); return undefined }
     family = known.family
   }
-  agents.set(agentId, { family: family!, cwd: known?.cwd ?? cwd, opened: !!known, effort: known?.effort, model: known?.model,
+  agents.set(agentId, { family: family!, owned: previous?.owned, cwd: known?.cwd ?? cwd, opened: !!known, effort: known?.effort, model: known?.model,
     ...(known?.sandbox ? { readonly: known.sandbox === 'read-only', nosandbox: known.sandbox === 'none' && family === 'gpt', tests: known.sandbox === 'tests', net: family === 'gpt' && !!known.network,
       nosearch: known.nosearch || known.web_search === 'off', dirs: known.dirs, limits: { memory_gb: known.memory_gb, hang_s: known.hang_s, wall_s: known.wall_s, nice: known.nice, tools: known.tools } } : {}) })
   return agents.get(agentId)
@@ -591,7 +608,7 @@ export const register: Register = on => {
       others.delete(r.agentId)
       const previous = agents.get(r.agentId) ?? (e.resume ? await lordAgent($, r.agentId) : undefined)
       // A resumed run arrives with the session's folder; an agent that already opened keeps its own.
-      agents.set(r.agentId, { ...previous, family: e.subagentType.slice(5), cwd: previous?.opened ? previous.cwd : directories.get(r.agentId) ?? e.cwd ?? previous?.cwd,
+      agents.set(r.agentId, { ...previous, owned: true, family: e.subagentType.slice(5), cwd: previous?.opened ? previous.cwd : directories.get(r.agentId) ?? e.cwd ?? previous?.cwd,
         worktree: previous?.worktree || isolated.has(e.tool_use_id), ...(!previous && e.resume ? { resumeError: `agent ${r.agentId} cannot be resumed (record is missing); launch a fresh agent` } : {}) })
       isolated.delete(e.tool_use_id)
       await keep($, r.agentId)
@@ -630,6 +647,7 @@ export const register: Register = on => {
       if (agent.resumeError) throw new Error(agent.resumeError)
       if (agent.error) { const error = agent.error; delete agent.error; throw new Error(error.replace(/^lord: error: /, '')) }
       let outcome: Outcome | undefined
+      agent.owned = true
       agent.running = true
       await keep($, agentId)
       if (e.index === 0) {
@@ -954,10 +972,11 @@ export const register: Register = on => {
   on('session.end', async ($, e, next) => {
     if (['clear', 'resume'].includes(e.reason)) return next(e)
     ending = true
-    const at = new Set([await socket($), ...[...agents.values()].map(agent => agent.daemon).filter((path): path is string => !!path)])
+    const owned = [...agents.entries()].filter(([, agent]) => agent.owned)
+    const at = new Set(await Promise.all(owned.map(([, agent]) => daemonOf($, agent))))
     await Promise.all([...at].map(async path => {
-      const ids = (await Promise.all([...agents.entries()].map(async ([id, agent]) => await daemonOf($, agent) === path ? id : undefined))).filter(Boolean)
-      return request($, '/session_end', { session: e.sessionId, ...(ids.length ? { agentIds: ids } : {}), cause: `session end: ${e.reason}` }, path).catch(() => {})
+      const ids = (await Promise.all(owned.map(async ([id, agent]) => await daemonOf($, agent) === path ? id : undefined))).filter(Boolean)
+      return request($, '/session_end', { agentIds: ids, cause: `session end: ${e.reason}` }, path).catch(() => {})
     }))
     return next(e)
   })
@@ -972,7 +991,7 @@ export const register: Register = on => {
       if (args[0] === 'model' && args.length === 3) {
         const known = list.find((agent: any) => agent.agentId === args[1])
         if (!known) return { text: `lord: unknown agent ${args[1]}` }
-        const agent = agents.get(args[1]) ?? { family: known.family, cwd: known.cwd }
+        const agent = agents.get(args[1]) ?? { ...(await $.state.get({ ...agentState, id: args[1] })).value, family: known.family, cwd: known.cwd }
         // Staged like an @model line: it applies only once /open accepts it.
         agent.pending = merge({ text: '', ...agent.pending }, { model: args[2] })
         agents.set(args[1], agent)

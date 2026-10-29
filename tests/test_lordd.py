@@ -2165,6 +2165,7 @@ def test_a_held_answer_is_delivered_even_when_its_vendor_will_not_start(tmp_path
         a = m.Agent({'agentId': 'a', 'family': 'gemini', 'cwd': str(tmp_path.resolve()), 'model': 'gemini-3.8-flash', 'effort': 'high'})
         a.events.put_nowait({'type': 'done', 'text': 'HELD'})
         d.agents, d.open_locks, d.retire, d.quota = {'a': a}, {}, False, {}
+        d.journal = tmp_path / 'journal.jsonl'
         d.config = {'gemini': {'model': 'gemini-3.8-flash', 'effort': 'high'}}
         d.refresh = lambda aid: None
         d.save = lambda a: None

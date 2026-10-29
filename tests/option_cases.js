@@ -344,5 +344,21 @@ export default [
     "name": "workflow carriage return indentation",
     "input": "[Workflow harness \u2014 computed task]\nThe computed task text follows:\n  @cwd /tmp/x/one\r  two\n  work",
     "expected": {"text": "work", "cwd": "/tmp/x/one\rtwo"}
+  },{
+    "name": "unmatched notification opener",
+    "input": "before <task-notification>tail",
+    "expected": {"text": "before <task-notification>tail"}
+  },{
+    "name": "repeated unmatched notification openers",
+    "input": "<task-notification><task-notification><task-notification>",
+    "expected": {"text": "<task-notification><task-notification><task-notification>"}
+  },{
+    "name": "nested notification openers",
+    "input": "<task-notification>outer<task-notification><task-id>probe</task-id><status>done</status><result>inner</result></task-notification>tail</task-notification>",
+    "expected": {"text": "Agent probe finished (done): innertail</task-notification>"}
+  },{
+    "name": "unmatched notification field openers",
+    "input": "<task-notification><result><result><status>done</status></task-notification>",
+    "expected": {"text": "Agent  finished (done):"}
   }
 ]

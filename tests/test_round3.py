@@ -24,6 +24,7 @@ def scope(tmp_path):
     a = m.Agent({'agentId': 'caller', 'family': 'gpt', 'model': 'fake', 'cwd': str(work), 'dirs': [str(extra)]})
     a.state = 'running'
     d = object.__new__(m.Daemon); d.agents = {'caller': a}; d.redact = m.Redactor()
+    d.journal, d.touched = m.HOME / 'journal.jsonl', set()
     return d, a, m, work, extra, outside
 
 
@@ -98,6 +99,9 @@ def test_r3_allowed_folders_are_normalized_inside_sender_roots(scope, tool, opti
     d, a, m, work, extra, _ = scope
     (work / 'link-in').symlink_to(extra, target_is_directory=True)
     requested = str(extra) if path == 'extra' else path
+    if tool == 'spawn_agent' and path == 'missing':
+        assert 'does not exist' in denied(scope, tool=tool, text=f'@{option} {requested}\nwork')
+        return
     result, event = invoke(d, a, tool=tool, text=f'@{option} {requested}\nwork')
     assert event and result['isError'] is False
     forwarded = event['input']['prompt' if tool == 'spawn_agent' else 'message']
@@ -159,7 +163,7 @@ def test_r3_unconfined_callers_are_unchanged(scope, family, tool):
 @pytest.mark.parametrize('tool', ['spawn_agent', 'send_message'])
 def test_r3_readonly_callers_remain_blocked(scope, tool):
     d, a, *_ = scope; a.record['readonly'] = True
-    with pytest.raises(ValueError, match='read-only'): invoke(d, a, tool=tool)
+    assert 'read-only' in denied(scope, tool=tool)
     assert a.events.empty()
 
 
@@ -209,6 +213,7 @@ def test_r3_body_mentions_and_blank_lines_do_not_become_options(scope, tool, tex
 
 def test_r3_relative_dirs_use_sender_cwd_even_with_explicit_child_cwd(scope):
     d, a, m, work, *_ = scope
+    (work / 'new').mkdir()
     _, event = invoke(d, a, text='@cwd child\n@dir new\nwork')
     options = m.parse_options(event['input']['prompt'])
     assert options['cwd'] == str(work / 'child') and options['dirs'] == [str(work / 'new')]
@@ -217,7 +222,7 @@ def test_r3_relative_dirs_use_sender_cwd_even_with_explicit_child_cwd(scope):
 def test_r3_current_readonly_turn_cannot_use_future_write_settings(scope):
     d, a, _, work, *_ = scope
     a.settings = {'cwd': str(work), 'dirs': [], 'sandbox': 'read-only', 'network': False, 'tools': False}
-    with pytest.raises(ValueError, match='read-only'): invoke(d, a)
+    assert 'read-only' in denied(scope)
     assert a.events.empty() and 'read-only' in a.log_path.read_text()
 
 

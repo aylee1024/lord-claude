@@ -202,7 +202,7 @@ def test_r2_redact_then_trim_sites_bound_input(tmp_path, monkeypatch):
         a.state = 'running'; a.note('x' * 131072)
         a.read_paths([('read', '/' + 'x' * 131072)])
         a.row('r', 'command', 'x' * 131072)
-        a.row_done('r', 'x' * 131072 + 'TAIL')
+        a.row_done('r', 'x' * 131072 + '\nTAIL')
         assert (await a.rows['r'])['output'].endswith('TAIL')
         d = object.__new__(m.Daemon); d.redact = redact; d.log('x' * 131072)
     asyncio.run(scenario())

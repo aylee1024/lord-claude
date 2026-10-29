@@ -117,17 +117,17 @@ def test_fix1_marker_parser_retains_only_pid_and_marker(monkeypatch):
     asyncio.run(scenario())
 
 
-def test_fix1_idle_lookup_is_skipped_except_when_closing(monkeypatch):
-    m = load('fix1_no_marker_listing')
+def test_fix1_idle_lookup_and_close_refresh_markers(monkeypatch):
+    m = load('fix1_idle_marker_listing')
     async def scenario():
         lookup = AsyncMock(return_value=m.ProcessMarkers())
         monkeypatch.setattr(m, 'process_markers', lookup)
         a = agent(m); v = m.Vendor(types.SimpleNamespace(log=lambda text: None), 'gpt', a)
         v.descendants = {10002}
         assert await v.update_jobs() == set()
-        lookup.assert_not_called()
+        lookup.assert_awaited_once()
         await v.close()
-        assert lookup.await_count == 2 and not v.descendants
+        assert lookup.await_count == 3 and not v.descendants
     asyncio.run(scenario())
 
 
