@@ -183,14 +183,20 @@ def test_open_stream_done_permissions_and_usage(rig, family):
 @pytest.mark.parametrize('family', ['gpt', 'grok'])
 @pytest.mark.parametrize('prompt,name', [('TOOL', 'Agent'), ('MESSAGE', 'SendMessage'), ('ERROR_TOOL', 'Agent'), ('CLAUDE_TOOL', 'Agent')])
 def test_mcp_tool_result_continue(rig, family, prompt, name):
-    rig.open(family)
+    rig.open(family, **({'nosandbox': True} if family == 'gpt' and prompt == 'CLAUDE_TOOL' else {}))
+    if prompt == 'MESSAGE': rig.open('gpt', agent='friend')
     events = rig.turn(prompt)
     event = events[-1]
+    if family == 'grok' and prompt == 'CLAUDE_TOOL':
+        assert event['type'] == 'done' and not any(e['type'] == 'tool' for e in events)
+        result = json.loads(event['text'])
+        assert result['isError'] is True and 'general-purpose' in result['content'][0]['text']
+        return
     assert event['type'] == 'tool' and event['name'] == name
     assert not any(e['type'] == 'done' for e in events)
     assert rig.request('/agents')[0]['state'] == 'waiting_tool'
     if name == 'Agent':
-        assert event['input']['prompt'] == ('child' if prompt == 'CLAUDE_TOOL' else '@model gpt-6-luna\nchild')
+        assert event['input']['prompt'] == ('child' if prompt == 'CLAUDE_TOOL' else f'@model gpt-6-luna\n@cwd {rig.home.resolve()}\nchild')
         assert event['input']['subagent_type'] == ('general-purpose' if prompt == 'CLAUDE_TOOL' else 'lord:gpt')
         assert event['input']['run_in_background'] is False
         if prompt == 'CLAUDE_TOOL':
@@ -1268,7 +1274,7 @@ def test_spawned_vendor_only_effort_goes_as_a_directive(monkeypatch):
     spec = importlib.util.spec_from_file_location('lordd_effort', DAEMON)
     m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
     async def main():
-        a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6.1-sol'}); a.state = 'running'
+        a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6.1-sol', 'nosandbox': True}); a.state = 'running'
         d = object.__new__(m.Daemon); d.log = lambda text: None
         task = asyncio.create_task(d.mcp_call(a, 'spawn_agent', {'type': 'lord:gpt', 'prompt': 'work', 'description': 'd', 'effort': 'ultra'}, a.token))
         event = await asyncio.wait_for(a.events.get(), 2); task.cancel()

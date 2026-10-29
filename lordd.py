@@ -48,6 +48,74 @@ MEMORY_CEILING_KB = 24 * 1024 * 1024
 ROW_OUTPUT = 2000
 EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max']
 RANKS = ['minimal', *EFFORTS, 'ultra']
+OPTIONS = '@model, @effort, @cwd, @dir, @readonly, @net, @nosearch, @nosandbox, @tests, @tools, @memory, @hang, @wall, @nice'
+KNOWN_OPTIONS = {option[1:] for option in OPTIONS.split(', ')}
+# ECMAScript trim, \s, \d and word boundaries differ from Python's Unicode defaults.
+OPTION_SPACE = '\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff'
+
+def parse_options(text, option_lines=None):
+    def match(pattern, value):
+        pattern = pattern.replace(r'[\s\S]', r'(?s:.)')
+        pattern = pattern.replace(r'\s', '[' + re.escape(OPTION_SPACE) + ']').replace(r'\S', '[^' + re.escape(OPTION_SPACE) + ']')
+        return re.search(pattern, value, re.ASCII)
+    coordinator = re.fullmatch(r'The coordinator sent a message while you were working:\r?\n([\s\S]*)\r?\n\r?\nAddress this before completing your current task\.', text)
+    if coordinator: text = coordinator[1]
+    if text.startswith('[Workflow harness — computed task]') and (end := text.find('The computed task text follows:')) >= 0:
+        text = text[end + len('The computed task text follows:'):]
+        text = re.sub(r'^\r?\n', '', text, count=1)
+        text = re.sub(r'^\r?\n', '', text, count=1)
+        text = re.sub(r'(^|[\r\n\u2028\u2029])  ', r'\1', text)
+    def notification(found):
+        def field(name):
+            value = re.search(fr'<{name}>([\s\S]*?)</{name}>', found[0])
+            return value[1].strip(OPTION_SPACE) if value else ''
+        def line(name): return re.sub('[' + re.escape(OPTION_SPACE) + ']+', ' ', field(name))
+        return f"Agent {line('task-id')} finished ({line('status')}): {field('result') or line('summary')}"
+    text = re.sub(r'<task-notification>[\s\S]*?</task-notification>', notification, text)
+    lines, seen, result = re.split(r'\r?\n', text.strip(OPTION_SPACE)), set(), {'text': ''}
+    while lines:
+        line = lines[0].strip(OPTION_SPACE)
+        known = match(r'^@([a-z]+)(?:\s|$)', line)
+        word = known if known and known[1] in KNOWN_OPTIONS else match(r'^@([a-z]+)(?:\s+\S+)?\s*$', line)
+        word = word[1] if word else None
+        if word and word != 'dir' and word in seen:
+            result['error'] = f'option line repeated: {line} (only @dir may be given more than once)'
+            break
+        model = match(r'^@model\s+(\S+)\s*$', line)
+        effort = match(r'^@effort\s+(minimal|low|medium|high|xhigh|max|ultra)\s*$', line)
+        number = match(r'^@(memory|hang|wall|nice)\s+([0-9]+(?:\.[0-9]+)?)\s*$', line)
+        folder = match(r'^@(cwd|dir)\s+(\S[\s\S]*)', line)
+        if model: result['model'] = model[1]
+        elif effort: result['effort'] = effort[1]
+        elif line in ('@readonly', '@net', '@nosearch', '@nosandbox', '@tests'): result[line[1:]] = True
+        elif number and (number[1] == 'memory' or '.' not in number[2]):
+            key = {'memory': 'memory_gb', 'hang': 'hang_s', 'wall': 'wall_s', 'nice': 'nice'}[number[1]]
+            result.setdefault('limits', {})[key] = float(number[2])
+        elif line == '@tools': result.setdefault('limits', {})['tools'] = True
+        elif folder:
+            if folder[1] == 'cwd': result['cwd'] = folder[2]
+            else: result.setdefault('dirs', []).append(folder[2])
+        elif match(r'^@(model|effort|readonly|net|nosearch|nosandbox|tests|memory|hang|wall|tools|cwd|dir|nice)\b', line):
+            result['error'] = f'option line not understood: {line}'
+            break
+        elif word:
+            result['error'] = f'unknown option line: {line} (options: {OPTIONS})'
+            break
+        else: break
+        if word: seen.add(word)
+        if option_lines is not None: option_lines.append(line)
+        lines.pop(0)
+    result['text'] = '\n'.join(lines)
+    return result
+
+def delegation_access(a, current=False):
+    r = a.record
+    s = getattr(a, 'settings', None) if current else None
+    if s is None:
+        s = {'cwd': a.cwd, 'dirs': r.get('dirs', []), 'sandbox': 'read-only' if r.get('readonly') else 'none' if r.get('nosandbox') or a.family == 'gemini' else 'tests' if r.get('tests') else 'workspace-write',
+             'network': a.family != 'gpt' or bool(r.get('net') or r.get('nosandbox')), 'tools': bool(r.get('tools')), 'web_search': 'off' if r.get('nosearch') else 'live'}
+    return {**s, 'family': a.family}
+
 INSTALL = {'gpt': "install OpenAI's codex CLI (brew install --cask codex, or npm install -g @openai/codex) and sign in with `codex login`",
            'grok': "install xAI's grok CLI (curl -fsSL https://x.ai/cli/install.sh | bash) and sign in by running `grok` once",
            'gemini': "install Google Antigravity's agy CLI (curl -fsSL https://antigravity.google/cli/install.sh | bash) and sign in by running `agy` once"}
@@ -2073,6 +2141,64 @@ class Daemon:
         return {'gpt': allowance_buckets(), 'refused': [{'family': f, 'model': m, 'until': datetime.fromtimestamp(q[0], timezone.utc).isoformat(timespec='seconds'), 'reason': q[1]}
                                         for (f, m), q in self.quota.items() if q[0] > time.time()]}
 
+    def confine_call(self, a, tool, data, access):
+        if access['sandbox'] == 'none': return
+        roots = [canon(path) for path in [access['cwd'], *access['dirs']]]
+        def folder_path(line, value):
+            try: path = canon(os.path.join(access['cwd'], value))
+            except (OSError, ValueError): raise ValueError(f'lord: {line} cannot be resolved as a folder') from None
+            if not inside(path, roots): raise ValueError(f'lord: {line} is outside the sandboxed sender\'s folders')
+            if parse_options('@cwd ' + path) != {'text': '', 'cwd': path}:
+                raise ValueError(f'lord: {line} cannot represent its real folder as an option line')
+            return path
+        if tool == 'Agent':
+            family = data['subagent_type']
+            if family not in ('lord:gpt', 'lord:grok'):
+                raise ValueError(f'lord: a sandboxed agent cannot launch {family} agents; only lord:gpt and lord:grok with no more access than its own')
+            if family == 'lord:grok' and not access['network']:
+                raise ValueError('lord: launching lord:grok requires network access')
+            field = 'prompt'
+        else:
+            target = self.agents.get(data['to'])
+            if target is None: raise ValueError(f"lord: unknown message target {data['to']}; a sandboxed agent can message only known Lord agents with no more access than its own")
+            other = delegation_access(target)
+            if (other['family'] not in ('gpt', 'grok') or target.record.get('nosandbox') or other['sandbox'] == 'none'
+                    or any(other[key] and not access[key] for key in ('network', 'tools'))
+                    or other['sandbox'] == 'tests' and access['sandbox'] != 'tests'
+                    or access.get('web_search') == 'off' and other['family'] == 'gpt' and other.get('web_search') != 'off'
+                    or any(not inside(canon(path), roots) for path in [other['cwd'], *other['dirs']])):
+                raise ValueError(f"lord: message target {data['to']} has more access than the sandboxed sender")
+            field = 'message'
+        lines = []
+        options = parse_options(data[field], lines)
+        if options.get('error'): raise ValueError('lord: ' + options['error'])
+        for flag in ('nosandbox', 'net', 'tools', 'tests'):
+            requested = options.get('limits', {}).get('tools') if flag == 'tools' else options.get(flag)
+            allowed = {'nosandbox': False, 'net': access['network'], 'tools': access['tools'], 'tests': access['sandbox'] == 'tests'}[flag]
+            if requested and not allowed:
+                raise ValueError(f'lord: @{flag} would give more access than the sandboxed sender has')
+        changed = False
+        for i, line in enumerate(lines):
+            folder = re.match(r'^@(cwd|dir)[' + re.escape(OPTION_SPACE) + r']+(.+)$', line, re.S)
+            if not folder: continue
+            path = folder_path(line, folder[2])
+            lines[i] = f'@{folder[1]} {path}'
+            changed = True
+        if tool == 'Agent':
+            if not options.get('cwd'):
+                cwd = folder_path('@cwd', roots[0])
+                lines.append('@cwd ' + cwd)
+            if access.get('web_search') == 'off' and data['subagent_type'] == 'lord:gpt' and not options.get('nosearch'): lines.append('@nosearch')
+            changed = True
+        # Keep an untouched message's envelope intact: the plugin must unwrap it exactly once.
+        if changed: data[field] = '\n'.join([*lines, options['text']])
+
+    def tool_refused(self, a, message):
+        message = re.sub(r'\s+', ' ', message).strip()
+        a.note(message)
+        self.log(f'{a.agentId}: {message}')
+        return {'content': [{'type': 'text', 'text': message}], 'isError': True}
+
     async def mcp_call(self, a, name, args, token):
         if token != a.token: raise ValueError('lord tool call from an unknown process')
         if name == 'list_agents':
@@ -2081,7 +2207,10 @@ class Daemon:
             agents = [{k: getattr(b, k) for k in ('agentId', 'family', 'model', 'state')} for b in self.agents.values()]
             return {'content': [{'type': 'text', 'text': dumps({'you': a.agentId, 'agents': agents})}], 'isError': False}
         if a.state not in ('running', 'waiting_tool') or a.cancel_requested: raise ValueError('No running turn for lord tool')
-        if a.record.get('readonly'): raise ValueError('a read-only agent cannot spawn agents or send messages')
+        access = delegation_access(a, current=True)
+        if a.record.get('readonly') or access['sandbox'] == 'read-only':
+            self.tool_refused(a, 'lord: a read-only agent cannot spawn agents or send messages')
+            raise ValueError('a read-only agent cannot spawn agents or send messages')
         if name == 'spawn_agent':
             data = {'subagent_type': args['type'], 'prompt': args['prompt'], 'description': args['description'],
                     'run_in_background': bool(args.get('background', False))}
@@ -2096,6 +2225,8 @@ class Daemon:
             data = {'to': args['to'], 'message': args['text'], 'summary': args['text'][:100]}
             tool = 'SendMessage'
         else: raise ValueError('Unknown lord tool')
+        try: self.confine_call(a, tool, data, access)
+        except ValueError as error: return self.tool_refused(a, str(error))
         call = uuid.uuid4().hex
         future = asyncio.get_running_loop().create_future()
         a.calls[call], a.call_data[call] = future, (tool, data)

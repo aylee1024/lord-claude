@@ -262,6 +262,27 @@ goes as an `@model` first line); `send_message(to, text)` becomes SendMessage; `
 `{you, agents}` from the daemon (each agent's id, family, model and state only). A vendor-only effort (`minimal`, `ultra`) goes as an `@effort` first line. Without an agent id the server lists no tools; a read-only agent's server lists only
 `list_agents`, and the daemon refuses spawn and send for it.
 
+The daemon checks each launch and message before emitting an engine tool call. A sandboxed caller (gpt without
+`@nosandbox`, or grok) delegates with no more access than its own running turn's settings; options recorded for a
+future turn do not authorize the current caller. Only `lord:gpt` and `lord:grok` launches pass, and grok requires
+network. The Python option parser mirrors the mod's leading-line grammar, envelopes, whitespace, mentions,
+repeated options and malformed known options, tested against the same fixtures. It checks the assembled prompt,
+including model and effort directives. `@nosandbox` is always refused; `@net`, `@tools` and `@tests` require the
+same access on the caller. Narrowing and neutral options pass. A gpt child inherits `@nosearch`.
+
+`@cwd` and `@dir` resolve relative to the sender's cwd, then to real paths (including the nearest existing parent
+for missing paths), and must be within its cwd or recorded extra roots. Forwarded folder lines use those absolute
+paths. A launch without `@cwd` gets the sender's real cwd, never the controller session's folder. Messages can reach
+only exact ids in this daemon's agent table, including the sender, with recorded gpt or grok settings, no
+`nosandbox`, no additional network, tools, tests or search access, and contained cwd and dirs. Unknown names and
+broader targets are refused even when their message has no options. GPT with `@nosandbox` and gemini callers
+retain their existing delegation behavior. Read-only callers remain blocked, including a running read-only turn
+whose next turn has different settings.
+
+A scope refusal returns MCP `isError: true` with one plain `lord: ...` sentence naming the refused option line,
+launch type or target. Both the agent log and `lordd.log` record that reason; no message body is logged for the
+refusal. No call id, pending future or engine tool event is created.
+
 ## Mod behaviour
 - A new Lord agent's `agent.spawn` description becomes `<model>, <effort> · <description>` and its `model` the vendor model:
   `@model`, else `~/.claude/lord/config.json`, else the bundled `config.json`. Short names: the model's word capitalized, with

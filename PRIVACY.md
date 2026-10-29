@@ -16,6 +16,8 @@ A grok working folder may not be inside `~/.grok` or contain it (`$GROK_HOME` if
 
 For job ownership Lord reads a process-environment listing only while a vendor or listed jobs remain. It verifies the plain command prefix by length and hash and reads markers only from the appended environment suffix, never arguments. It retains only pid, `LORD_AGENT_ID`, `LORD_DAEMON_SOCKET` and whether the environment was visible, never other environment text. A marked job must match both the agent id and this daemon's socket path. On codex start and resume Lord sets those two values in the command environment policy so inherited-variable filters cannot remove them. Commands shown in logs, records and footers come from a separate process listing without environments.
 
+A sandboxed Lord agent launches only gpt or grok agents with no more access than its own; grok needs network access. It can message only Lord ids known to its daemon whose recorded folders and capabilities fit within its own, including itself. The daemon refuses widening option lines before forwarding a launch or message, resolves folder links, supplies the sender's cwd for children without one, and carries `@nosearch` to gpt children. Read-only agents cannot launch or message. Unconfined gpt and gemini keep their existing delegation behavior. A refusal is a tool error; the agent log and `lordd.log` store its reason naming the line, type or target, without the message body.
+
 **What stays on your computer**, under `~/.claude/lord/`:
 
 - `journal.jsonl` (`sessions.jsonl` before 2.0.18): one line per agent (agent id, vendor session id, model, effort, working folder, options, last token counts). Task text is never stored here. Lines unused for 14 days are removed.
