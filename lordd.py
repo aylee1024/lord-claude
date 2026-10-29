@@ -595,6 +595,10 @@ def check_pins(a):
     pinned_folder('@cwd', a.cwd, a.record.get('cwd_paths', {a.cwd: a.cwd}))
     for path in a.record.get('dirs', []): pinned_folder('@dir', path, a.record.get('dir_paths', {path: path}))
 
+def held_folders(a):
+    cwd, dirs = a.record.get('cwd_paths', {}), a.record.get('dir_paths', {})
+    return {a.cwd, *cwd, *cwd.values(), *dirs, *dirs.values(), *a.record.get('dirs', [])}
+
 def gpt_permissions(a):
     r = a.record
     homes = {os.path.abspath(HOME), canon(HOME)}
@@ -851,6 +855,13 @@ def peer_pid(writer):
 def remember_processes(births, pids):
     for pid in pids:
         if (birth := process_start(pid)) is not None: births[pid] = birth
+
+def remembered_processes(births, children):
+    pids = set()
+    for pid, birth in list(births.items()):
+        if birth is not None and process_start(pid) == birth: pids.update(tree(children, pid))
+        else: births.pop(pid)
+    return pids
 
 async def kill_tree(process, known=(), *, agent_id=None, others=(), on_jobs=None, startup=(), on_error=None, births=None):
     # Tool commands can leave the vendor's process group, so every descendant is signalled by pid as well.
@@ -1289,6 +1300,7 @@ class Vendor:
             pids |= live
         roots = {p.pid for p in (self.process, self.exec_process) if p}
         marked = marked_pids(markers, self.agent.agentId)
+        pids |= remembered_processes(self.agent.process_births, children)
         remember_processes(self.agent.process_births, pids | marked)
         self.agent.jobs = await job_details(job_pids(children, pids, roots, markers, self.agent.agentId, getattr(self, 'startup_children', None) or ()))
         self.agent.jobs_checked = checked if self.agent.jobs_changed <= checked else 0
@@ -1633,7 +1645,9 @@ class Daemon:
         except Exception as error:
             a.note(f'job lookup failed: {error}')
             self.log(f'{a.agentId}: job lookup failed: {error}')
-        if a.turn_epoch is owner and not a.cancel_requested: a.emit('done', **value)
+        if a.turn_epoch is owner:
+            if a.cancel_requested: a.emit('error', message='interrupted', retryable=False)
+            else: a.emit('done', **value)
 
     async def refresh_jobs(self, agents=None, *, max_age=0):
         agents = list(self.agents.values() if agents is None else agents)
@@ -1647,7 +1661,7 @@ class Daemon:
             for a in agents:
                 if vendor := self.vendors.get(a.agentId): await vendor.update_jobs(children, markers)
                 else:
-                    pids = job_pids(children, set(), set(), markers, a.agentId)
+                    pids = job_pids(children, remembered_processes(a.process_births, children), set(), markers, a.agentId)
                     remember_processes(a.process_births, pids)
                     a.jobs = await job_details(pids)
                 a.jobs_checked = checked if a.jobs_changed <= checked else 0
@@ -1921,7 +1935,7 @@ class Daemon:
             checked = self.launch_folders(launch, agent_id=aid) if launch else []
             messages = {}
             if a:
-                held = {*cwd_paths, *cwd_paths.values(), *a.record.get('dir_paths', {}), *a.record.get('dir_paths', {}).values(), *a.record.get('dirs', [])}
+                held = held_folders(a)
                 applying = [path for path in [body['cwd'], *(body.get('dirs') or [])] if normalize_system_aliases(path) not in held]
                 checked += self.message_folders(a, applying=applying, checks=messages)
             checked = set(checked)
@@ -1964,7 +1978,7 @@ class Daemon:
             try:
                 opened = await self.open_agent(aid, family, cwd, body, a, cwd_paths, dir_paths)
                 if launch: self.consume_launch(launch, aid)
-                pinned = {cwd, *dir_paths.values()}
+                pinned = {cwd, *cwd_paths, *cwd_paths.values(), *dir_paths, *dir_paths.values()}
                 self.consume_messages(self.agents[aid], [ticket for ticket, folders in messages.items() if set(folders) <= pinned])
                 self.agents[aid].opened = True
                 return opened
@@ -2139,7 +2153,7 @@ class Daemon:
         folder = (Path(r['codexHome']) if r.get('codexHome') else self.user_codex_home) if family == 'gpt' else \
             grok_home() if family == 'grok' else self.vendor_home / '.gemini'
         protected = {os.path.abspath(HOME), canon(HOME), os.path.abspath(HERE.parent), canon(HERE.parent)}
-        read_only = [path for path in [a.cwd, *r.get('dirs', [])] if family == 'gpt' and not r.get('nosandbox') and inside(path, protected)]
+        read_only = [path for path in [a.cwd, *r.get('dirs', [])] if family in ('gpt', 'grok') and not r.get('nosandbox') and inside(path, protected)]
         return {'model': a.model, 'effort': a.effort, 'cwd': a.cwd, 'dirs': r.get('dirs', []),
                 **({'read_only_folders': read_only} if read_only else {}),
                 'sandbox': 'tests' if r.get('tests') else 'read-only' if r.get('readonly') else 'none' if r.get('nosandbox') or family == 'gemini' else 'workspace-write',
@@ -2249,7 +2263,6 @@ class Daemon:
         return Path(os.environ['CODEX_HOME']) if os.environ.get('CODEX_HOME') else self.vendor_home / '.codex'
 
     async def interrupt(self, a, cause=None):
-        a.turn_epoch = object()
         if isinstance(cause, str) and cause:
             a.stop_cause = self.redact(cause[:8192])[:1000]
             a.note('stop requested: ' + a.stop_cause)
@@ -2272,7 +2285,9 @@ class Daemon:
                 a.emit('error', message='interrupted', retryable=False)
             if a.family == 'gpt':
                 # Before dispatch run_turn sees cancel_requested and ends the turn itself.
-                if a.turn_id: await v.rpc('turn/interrupt', {'threadId': a.vendorSession, 'turnId': a.turn_id})
+                if a.turn_id:
+                    try: await v.rpc('turn/interrupt', {'threadId': a.vendorSession, 'turnId': a.turn_id})
+                    except Exception as error: self.log(f'{a.agentId}: turn interrupt failed: {error}')
             elif a.family == 'grok':
                 if a.dispatched: await v.send({'method': 'session/cancel', 'params': {'sessionId': a.vendorSession}})
             else:
@@ -2377,7 +2392,7 @@ class Daemon:
         # Keep an untouched message's envelope intact: the plugin must unwrap it exactly once.
         if changed: data[field] = '\n'.join([*lines, options['text']])
         if tool == 'Agent': return self.launch_folders(folders=folders)
-        if folders:
+        if folders and not set(folders) <= held_folders(target):
             ticket = self.launch_folders(folders=folders, agent_id=target.agentId, message=True)
             try: self.message_tickets(target, add=ticket)
             except BaseException:
@@ -2416,11 +2431,18 @@ class Daemon:
     def message_folders(self, a, *, applying=(), checks=None):
         checked = set()
         applying = {normalize_system_aliases(path) for path in applying}
-        if not applying: return []
-        for ticket in self.message_tickets(a):
-            folders = self.launch_folders(ticket, agent_id=a.agentId, message=True)
+        held = held_folders(a)
+        try: tickets = self.message_tickets(a)
+        except (OSError, ValueError):
+            if applying: raise
+            return []
+        for ticket in tickets:
+            try: folders = self.launch_folders(ticket, agent_id=a.agentId, message=True)
+            except (OSError, ValueError):
+                if applying: raise
+                continue
             relevant = set(folders) & applying
-            if not relevant: continue
+            if not relevant and not set(folders) <= held: continue
             if checks is not None: checks[ticket] = folders
             checked.update(relevant)
         for path in checked: pinned_folder('@dir', path, {}, checked)
@@ -2769,11 +2791,12 @@ class Daemon:
                 try: tickets = json.loads(manifest.read_text()) if manifest.stat().st_size <= 4096 else None
                 except (OSError, ValueError): tickets = None
                 if not isinstance(tickets, list) or len(tickets) > 64 or any(not isinstance(t, str) or not re.fullmatch(r'[0-9a-f]{32}', t) for t in tickets):
-                    referenced = None
-                    break
+                    self.log(f'{manifest}: invalid message folder checks; removing manifest')
+                    manifest.unlink(missing_ok=True)
+                    continue
                 referenced.update(tickets)
             for path in (HOME / 'launches').glob('*.json'):
-                if referenced is not None and path.stem not in referenced and re.fullmatch(r'[0-9a-f]{32}\.json', path.name):
+                if path.stem not in referenced and re.fullmatch(r'[0-9a-f]{32}\.json', path.name):
                     try:
                         if path.stat().st_mtime <= time.time() - 600: path.unlink(missing_ok=True)
                     except FileNotFoundError: pass
@@ -2805,7 +2828,8 @@ class Daemon:
                     a.state = previous
                     raise
                 removed.append(aid)
-                self.consume_messages(a, self.message_tickets(a))
+                try: self.consume_messages(a, self.message_tickets(a))
+                except (OSError, ValueError) as error: self.log(f'{aid}: message folder checks not read during prune: {error}')
                 for path in a.files(): path.unlink(missing_ok=True)
                 (HOME / 'messages' / f'{aid}.json').unlink(missing_ok=True)
                 shutil.rmtree(a.answers_path, ignore_errors=True)

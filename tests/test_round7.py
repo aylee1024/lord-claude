@@ -42,11 +42,11 @@ def test_r7_existing_message_folders_are_not_newly_applied(tests_backend, rig, h
             if held: a.carry.append({'type': 'done', 'text': 'held'})
             path = work if folder == 'cwd' else slot
             d.confine_call(a, 'SendMessage', {'to': a.agentId, 'message': f'@{folder} {path}\nwork'}, m['delegation_access'](a))
-            assert d.message_tickets(a)
+            assert d.message_tickets(a) == []
             await d.open({'agentId': a.agentId, 'family': 'gpt', 'cwd': str(work), 'dirs': [str(slot)], 'pin_cwd': True})
             assert vendor.generation == generation
-            assert len(d.message_tickets(a)) == 1
-            assert len(list((m['HOME'] / 'launches').glob('*.json'))) == 1
+            assert d.message_tickets(a) == []
+            assert not list((m['HOME'] / 'launches').glob('*.json'))
         finally: await d.close()
     asyncio.run(run())
 
@@ -70,7 +70,7 @@ def test_r7_message_check_waits_for_new_folder_application(tests_backend, rig, a
             applied = {'dirs': [str(slot)]} if option == 'dir' else {'pin_cwd': True}
             body = {'agentId': a.agentId, 'family': 'gpt', 'cwd': str(work), **(applied if apply_folder else {})}
             await d.open(body)
-            consumed = apply_folder and option == 'dir'
+            consumed = option == 'cwd' or apply_folder
             assert bool(d.message_tickets(a)) is not consumed
             assert path.exists() is not consumed
             for _ in range(2): await d.open(body)

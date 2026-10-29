@@ -177,12 +177,13 @@ def test_r8_removed_unapplied_folder_does_not_block_receiver(tests_backend, rig)
 
 def test_r8_pruning_receiver_removes_its_pending_tickets(tests_backend, rig):
     d, m, _ = tests_backend; work = rig.home / 'work'
+    slot = work / 'slot'; slot.mkdir()
     async def noop(*args, **kwargs): pass
     async def run():
         try:
             await d.open({'agentId': 'receiver', 'family': 'gpt', 'cwd': str(work)})
             a = d.agents['receiver']
-            d.confine_call(a, 'SendMessage', {'to': a.agentId, 'message': f'@dir {work}\nwork'}, m['delegation_access'](a))
+            d.confine_call(a, 'SendMessage', {'to': a.agentId, 'message': f'@dir {slot}\nwork'}, m['delegation_access'](a))
             [ticket] = d.message_tickets(a); path = m['HOME'] / 'launches' / f'{ticket}.json'
             a.record['used'] = '2000-01-01T00:00:00+00:00'
             d.service = lambda *args: SimpleNamespace(ensure=noop, rpc=noop)
@@ -194,10 +195,11 @@ def test_r8_pruning_receiver_removes_its_pending_tickets(tests_backend, rig):
 
 def test_r8_message_ticket_limit_stays_bounded(scope):
     d, a, m, work, *_ = scope
+    slot = work / 'slot'; slot.mkdir()
     for _ in range(64):
-        d.confine_call(a, 'SendMessage', {'to': a.agentId, 'message': f'@dir {work}\nwork'}, m.delegation_access(a))
+        d.confine_call(a, 'SendMessage', {'to': a.agentId, 'message': f'@dir {slot}\nwork'}, m.delegation_access(a))
     with pytest.raises(ValueError, match='too many pending'):
-        d.confine_call(a, 'SendMessage', {'to': a.agentId, 'message': f'@dir {work}\nwork'}, m.delegation_access(a))
+        d.confine_call(a, 'SendMessage', {'to': a.agentId, 'message': f'@dir {slot}\nwork'}, m.delegation_access(a))
     assert len(d.message_tickets(a)) == 64
 
 
