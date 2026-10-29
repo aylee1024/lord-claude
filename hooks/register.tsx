@@ -6,7 +6,7 @@ import type { LordAgent as Agent, LordTask as Task } from '../types'
 // record: the daemon's account of the finished turn, for the answer's footer.
 type Stream = { next: number; live: number; answer: string; shown: string; failed?: boolean; model?: string; record?: TurnRecord }
 type Job = { pid: number; command: string; age_s: number }
-type TurnRecord = { ended_how: string; model: string; effort: string; started: string; ended: string; commands: number; retries: number; helpers: string[]; session?: string; jobs?: Job[]; policy_continues?: number }
+type TurnRecord = { ended_how: string; model: string; effort: string; started: string; ended: string; commands: number; retries: number; helpers: string[]; session?: string; jobs?: Job[]; killed_jobs?: Job[]; memory_warning?: string; policy_continues?: number }
 type Outcome = { tool?: { callId: string; name: string; input: Record<string, unknown> }; row?: { rowId: string; shell: boolean; title: string } }
 // A vendor's tool steps are drawn as rows: a shell command as a Bash row, any other step under the plugin's own tool for
 // that vendor, which Claude Code labels "lord - <family>". Neither runs anything; the plugin answers each with the
@@ -20,7 +20,7 @@ const pending = new Map<string, string>()
 const others = new Set<string>()
 const isolated = new Set<string>()
 const callEfforts = new Map<string, string>()
-// Quitting aborts the session's agent turns; the daemon keeps those turns running for the next session.
+// A quit closes idle vendors; running turns finish and remain deliverable at the next message.
 let ending = false
 let mainTurns = 0
 // A reload of this code (an update) starts the module variables over, even mid-turn; the session's state keeps
@@ -113,7 +113,7 @@ function signed(text: string, record: TurnRecord | undefined): string {
   try { JSON.parse(text.trim()); return text } catch {}
   const time = (iso: unknown) => typeof iso === 'string' ? iso.slice(11, 19) + 'Z' : '?'
   const helpers = record.helpers?.length ? ` · ${record.helpers.length} helper${record.helpers.length > 1 ? 's' : ''} (${[...new Set(record.helpers)].join(', ')})` : ''
-  return `${text}\n\n[lord: ${record.ended_how} · ${record.model} ${record.effort} · ${time(record.started)} to ${time(record.ended)} · ${record.commands} command${record.commands === 1 ? '' : 's'}${helpers}${record.retries ? ` · ${record.retries} retr${record.retries > 1 ? 'ies' : 'y'} at capacity` : ''}${record.policy_continues ? ` · ${record.policy_continues} policy continue` : ''}${record.jobs?.length ? ` · jobs: ${jobLine(record.jobs)}` : ''}${record.session ? ` · session ${record.session}` : ''}]`
+  return `${text}\n\n[lord: ${record.ended_how} · ${record.model} ${record.effort} · ${time(record.started)} to ${time(record.ended)} · ${record.commands} command${record.commands === 1 ? '' : 's'}${helpers}${record.retries ? ` · ${record.retries} retr${record.retries > 1 ? 'ies' : 'y'} at capacity` : ''}${record.policy_continues ? ` · ${record.policy_continues} policy continue` : ''}${record.jobs?.length ? ` · jobs: ${jobLine(record.jobs)}` : ''}${record.killed_jobs?.length ? ` · killed jobs: ${jobLine(record.killed_jobs)}` : ''}${record.memory_warning ? ` · ${record.memory_warning}` : ''}${record.session ? ` · session ${record.session}` : ''}]`
 }
 
 function jobLine(jobs: Job[]): string { return jobs.map(job => `${job.pid} ${job.command} (${job.age_s} s)`).join('; ') }
@@ -458,7 +458,8 @@ async function lordAgent($: EngineInterface, agentId: string): Promise<Agent | u
     agents.set(agentId, { ...kept.value })
     versions.set(agentId, kept.version)
   }
-  if (agents.has(agentId)) return agents.get(agentId)
+  if (agents.has(agentId) && !agents.get(agentId)?.resumePending) return agents.get(agentId)
+  const previous = agents.get(agentId)
   const directory = (await $.state.get({ ...dirState, id: agentId })).value
   if (directory && !directories.has(agentId)) directories.set(agentId, directory)
   const listed = await $.agent.list().then(list => list.find(agent => agent.id === agentId), () => undefined)
@@ -466,11 +467,12 @@ async function lordAgent($: EngineInterface, agentId: string): Promise<Agent | u
     const record = /^[A-Za-z0-9_-][A-Za-z0-9_.-]*$/.test(agentId) && await $.fs.read(`${await $.env.get('HOME')}/.claude/lord/logs/${agentId}.json`).then(() => true, () => false)
     if (!record) { others.add(agentId); return undefined }
   }
-  let family = listed?.type.startsWith('lord:') ? listed.type.slice(5) : undefined, cwd = directories.get(agentId)
+  let family = listed?.type.startsWith('lord:') ? listed.type.slice(5) : previous?.family, cwd = directories.get(agentId)
   // The daemon keeps an opened agent's settings, such as an @effort level beyond the Agent call's.
   let known = await request($, '/agents').then(text => JSON.parse(text).find((a: any) => a.agentId === agentId), () => undefined)
   if (!known && /^[A-Za-z0-9_-][A-Za-z0-9_.-]*$/.test(agentId)) {
     const record = await $.fs.read(`${await $.env.get('HOME')}/.claude/lord/logs/${agentId}.json`).then(String, () => undefined)
+    let definite = false
     try {
       if (record !== undefined || family) {
         agents.set(agentId, { family: family ?? 'gpt' })
@@ -480,15 +482,14 @@ async function lordAgent($: EngineInterface, agentId: string): Promise<Agent | u
       if (!known) {
         const restored = JSON.parse(await request($, '/restore', { agentId }))
         if (restored.found) {
-          if (restored.error) throw new Error(restored.error)
+          if (restored.error) { definite = true; throw new Error(restored.error) }
           known = restored.agent
-        } else if (record !== undefined || family) throw new Error(`agent ${agentId} cannot be resumed (record is missing); launch a fresh agent`)
+        } else if (record !== undefined || family) { definite = true; throw new Error(`agent ${agentId} cannot be resumed (record is missing); launch a fresh agent`) }
       }
     } catch (error) {
       if (record !== undefined || family) {
         const message = String(error instanceof Error ? error.message : error)
-        const resumeError = message.includes(`agent ${agentId} cannot be resumed`) ? message : `agent ${agentId} cannot be resumed (${message}); launch a fresh agent`
-        agents.set(agentId, { family: family ?? 'gpt', resumeError })
+        agents.set(agentId, { ...previous, family: family ?? 'gpt', ...(definite ? { resumeError: message } : { error: message, resumePending: true }) })
         return agents.get(agentId)
       }
     }
@@ -884,6 +885,19 @@ export const register: Register = on => {
     return next(e)
   })
 
+  on('tool.call', { tool: 'TaskStop' }, async ($, e, next) => {
+    if (!e.task_id) return next(e)
+    const cached = agents.get(e.task_id) ?? (await $.state.get({ ...agentState, id: e.task_id })).value
+    const at = cached?.daemon ?? await socket($)
+    try {
+      const known = JSON.parse(await request($, '/agents', undefined, at)).find((a: any) => a.agentId === e.task_id)
+      if (!known || !['idle', 'closed'].includes(known.state)) return next(e)
+      const result = JSON.parse(await request($, '/close', { agentId: e.task_id, cause: 'TaskStop', idle_only: true }, at))
+      if (!result.closed) return next(e)
+      return { result: { message: `Stopped ${result.stopped_jobs} jobs for Lord agent ${e.task_id}.`, task_id: e.task_id, task_type: `lord:${known.family}` } }
+    } catch { return next(e) }
+  })
+
   on('session.compact', async ($, e, next) => {
     // A Lord agent's transcript is never sent to a model: its vendor keeps its own context, and Lord answers every
     // step, so summarizing it would spend Claude tokens on nothing. It is shortened in place instead (compacted).
@@ -934,7 +948,8 @@ export const register: Register = on => {
   })
 
   on('session.end', async ($, e, next) => {
-    ending = !['clear', 'resume'].includes(e.reason)
+    if (['clear', 'resume'].includes(e.reason)) return next(e)
+    ending = true
     const at = new Set([await socket($), ...[...agents.values()].map(agent => agent.daemon).filter((path): path is string => !!path)])
     await Promise.all([...at].map(path => request($, '/session_end', { session: e.sessionId, cause: `session end: ${e.reason}` }, path).catch(() => {})))
     return next(e)

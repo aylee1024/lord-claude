@@ -32,6 +32,7 @@ def grok_home(tmp_path, monkeypatch):
     # the user's ~/.grok or ~/.claude/lord.
     monkeypatch.setenv('GROK_HOME', str(tmp_path / 'grok-home'))
     monkeypatch.setenv('LORD_HOME', str(tmp_path / 'lord-home'))
+    monkeypatch.delenv('LORD_DAEMON_SOCKET', raising=False)
     # The user's codex folder in tests is the vendor data folder's .codex.
     monkeypatch.delenv('CODEX_HOME', raising=False); monkeypatch.delenv('CODEX_SQLITE_HOME', raising=False)
     for vendor in ('CLAUDE', 'CURSOR'):
@@ -1680,11 +1681,11 @@ def test_a_crashed_vendors_descendants_in_another_group_are_stopped():
         code = ('import os, subprocess, sys, time\n'
                 'c = subprocess.Popen([sys.executable, "-c", "import os, time; os.setsid(); time.sleep(60)"])\n'
                 'print(c.pid, flush=True)\n')
-        parent = await asyncio.create_subprocess_exec(sys.executable, '-c', code, stdout=-1, start_new_session=True)
+        parent = await asyncio.create_subprocess_exec(sys.executable, '-c', code, stdout=-1, start_new_session=True, env={**os.environ, 'LORD_AGENT_ID': 'synthetic-orphan', 'LORD_DAEMON_SOCKET': str(m.SOCKET)})
         child = int((await parent.stdout.readline()).decode())
         await parent.wait()
         await asyncio.sleep(.3)
-        await m.kill_tree(parent, {child})
+        await m.kill_tree(parent, agent_id='synthetic-orphan')
         await asyncio.sleep(.3)
         try: os.kill(child, 0)
         except ProcessLookupError: return True
@@ -2853,7 +2854,7 @@ def test_tests_wiring_settings_environment_and_resume(tests_backend, rig):
             step = 12 - os.getpriority(os.PRIO_PROCESS, 0)
             assert argv[:4] == ('/usr/bin/nice', '-n', str(step), '/usr/bin/sandbox-exec') if step > 0 else argv[0] == '/usr/bin/sandbox-exec'
             assert ex['cwd'] == str((rig.home / 'work').resolve()) and ex['nice'] == max(12, os.getpriority(os.PRIO_PROCESS, 0))
-            assert ex['mcp_env'] == {} and ex['env'] == {}
+            assert ex['mcp_env'] == {'LORD_DAEMON_SOCKET': str(m['SOCKET'])} and ex['env'] == {}
             assert ex['codex_home'] == next(e['codex_home'] for e in audit if e.get('launch') and e['pid'] == v.process.pid)
             args = ex['argv']
             assert args[args.index('--listen') + 1] == 'ws://127.0.0.1:0'
@@ -4141,7 +4142,7 @@ print(json.dumps(result))
     assert key.read_text() == 'decoy'
 
 
-def test_tests_watch_exec_kills_detached_child_recorded_by_guard(tmp_path):
+def test_tests_watch_exec_kills_detached_marked_child(tmp_path):
     m = load('lordd_watch_exec_child')
     async def scenario():
         d = object.__new__(m.Daemon)
@@ -4153,11 +4154,11 @@ def test_tests_watch_exec_kills_detached_child_recorded_by_guard(tmp_path):
         child = None
         try:
             v.process = await asyncio.create_subprocess_exec(PYTHON, '-c', 'import time; time.sleep(300)',
-                cwd=tmp_path, start_new_session=True)
+                cwd=tmp_path, start_new_session=True, env={**os.environ, 'LORD_AGENT_ID': 'a', 'LORD_DAEMON_SOCKET': str(m.SOCKET)})
             code = ('import subprocess, sys, time\n'
                     'p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n'
                     'print(p.pid, flush=True)\ntime.sleep(300)\n')
-            v.exec_process = await asyncio.create_subprocess_exec(PYTHON, '-c', code, cwd=tmp_path, start_new_session=True, stdout=-1)
+            v.exec_process = await asyncio.create_subprocess_exec(PYTHON, '-c', code, cwd=tmp_path, start_new_session=True, stdout=-1, env={**os.environ, 'LORD_AGENT_ID': 'a', 'LORD_DAEMON_SOCKET': str(m.SOCKET)})
             child = int(await asyncio.wait_for(v.exec_process.stdout.readline(), 3))
             assert not v.descendants and not v.exec_descendants
             assert os.getsid(child) == child
@@ -4202,7 +4203,8 @@ def test_v225_jobs_survive_idle_close_and_exit_then_stop(rig, family):
             except ProcessLookupError: break
             assert time.monotonic() < deadline
             time.sleep(.02)
-        assert f'killing job {pid}: sleep' in (rig.home / 'logs/a.log').read_text()
+        command = next(j['command'] for j in done['record']['jobs'] if j['pid'] == pid)
+        assert f'killing job {pid}: {command}' in (rig.home / 'logs/a.log').read_text()
     finally:
         try: os.kill(pid, signal.SIGKILL)
         except ProcessLookupError: pass
@@ -4470,7 +4472,7 @@ def test_v225_helper_processes_are_excluded_but_jobs_remain(tmp_path, monkeypatc
     from unittest.mock import AsyncMock
     output = b'101 S 01:02 /usr/bin/python3 /tmp/plugin/lordd.py --mcp a\n102 S 1-02:03:04 /tmp/codex-code-mode-host\n103 S 00:08 sleep 300\n104 Z 00:01 sleep 300\n'
     monkeypatch.setattr(m.asyncio, 'create_subprocess_exec', AsyncMock(return_value=types.SimpleNamespace(communicate=AsyncMock(return_value=(output, b'')))))
-    assert asyncio.run(m.job_details({101, 102, 103, 104})) == [{'pid': 103, 'command': 'sleep 300', 'age_s': 8}]
+    assert asyncio.run(m.job_details({102, 103, 104})) == [{'pid': 103, 'command': 'sleep 300', 'age_s': 8}]
 
 
 def test_v225_version_is_225():
@@ -4492,5 +4494,9 @@ def test_v225_known_resume_never_starts_a_new_conversation(rig, missing):
     rig.start()
     conn, file, status, _ = rig.connect('/open', {'agentId': 'a', 'family': 'gpt', 'cwd': str(rig.home), 'resume': True})
     body = json.loads(file.read()); file.close(); conn.close()
+    if missing == 'record':
+        assert status == 200 and body['vendorSession'] == sid
+        assert rig.turn('PING')[-1]['text'] == 'PONG'
+        return
     assert status != 200 and 'agent a cannot be resumed' in body['error'] and 'launch a fresh agent' in body['error']
     assert json.loads((rig.home / 'logs/a.json').read_text())['turns'][-1]['ended_how'] == 'refused'

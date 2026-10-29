@@ -11,7 +11,7 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
   let streamFinished = false
   // Each /turn or /continue stream takes the next queued event list, else `events`; /row answers `replies.row`.
   const sequence: unknown[][] = []
-  const replies: { row: unknown; allowance?: unknown; steered?: boolean; agents?: any[]; roster?: any[]; restore?: any } = { row: { output: 'row output', stopped: false } }
+  const replies: { row: unknown; allowance?: unknown; steered?: boolean; agents?: any[]; roster?: any[]; restore?: any; unavailable?: boolean; closed?: any } = { row: { output: 'row output', stopped: false } }
   mock.env(on, { HOME: '/test', ...(socket ? { LORD_DAEMON_SOCKET: socket } : {}), ...env })
   let spawned = 'lord:gpt'
   const clock = mock.clock(on)
@@ -55,7 +55,7 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
   on('http.fetch', (_, e) => {
     const path = e.url.replace('http://lord', '')
     requests.push({ path, body: e.init?.body ? JSON.parse(e.init.body) : undefined, socket: e.init?.socketPath })
-    if (socket === '/down.sock') return { deny: 'socket unavailable' }
+    if (socket === '/down.sock' || replies.unavailable) return { deny: 'socket unavailable' }
     // The daemon compares a pinned @cwd with the folder the agent first opened in.
     if (path === '/open') {
       const body = JSON.parse(e.init!.body!)
@@ -68,6 +68,7 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
     if (path === '/agents' && failures > 0) return { deny: 'socket unavailable' }
     const result = path === '/restore' ? replies.restore ?? { found: false } : path === '/agents' ? replies.agents ?? (!fresh ? [{ agentId: 'a1', family: 'gpt', state: 'running', effort: 'ultra', model: 'fake-gpt', cwd: '/pinned' }]
         : requests.some(x => x.path === '/open') ? [{ agentId: 'a1', family: 'gpt', state: 'running' }] : [])
+      : path === '/close' ? replies.closed ?? { ok: true, closed: true, stopped_jobs: 0 }
       : path === '/health' ? { ok: true }
       : path === '/open' ? { vendorSession: 'v1', model: 'fake-gpt', effort: 'high' }
       // codex takes a message into its running turn; grok takes none, and the daemon queues it.
@@ -1453,11 +1454,11 @@ test('v225 completion forwards the engine stop reason', async ($, on) => {
   expect(w.requests.find(x => x.path === '/interrupt')?.body).toEqual({ agentId: 'a1', cause: 'aborted' })
 })
 
-test('v225 session end requests cleanup of its agents', async ($, on) => {
+test('v225 quitting requests cleanup of its idle agents', async ($, on) => {
   const w = world(on)
   on('session.end', (_, e) => ({ sessionId: e.sessionId }))
-  await $.session.end({ sessionId: 'caller', reason: 'clear', resume: {} } as any)
-  expect(w.requests.find(x => x.path === '/session_end')?.body).toEqual({ session: 'caller', cause: 'session end: clear' })
+  await $.session.end({ sessionId: 'caller', reason: 'other' } as any)
+  expect(w.requests.find(x => x.path === '/session_end')?.body).toEqual({ session: 'caller', cause: 'session end: other' })
 })
 
 
@@ -1495,4 +1496,53 @@ test('v225 a Lord record takes precedence over an unrecognized roster type', asy
   await spawn($, 'general-purpose')
   expect((await step($, 'continue')).result.answer).toBe('fake answer')
   expect(w.modelCalls()).toBe(0)
+})
+
+for (const reason of ['clear', 'resume']) test(`fix1 session ${reason} preserves agents`, async ($, on) => {
+  const w = world(on)
+  on('session.end', (_, e) => ({ sessionId: e.sessionId }))
+  await $.session.end({ sessionId: 'caller', reason, resume: {} } as any)
+  expect(w.requests.filter(x => x.path === '/session_end')).toEqual([])
+})
+
+test('fix1 TaskStop closes idle Lord jobs and answers the call', async ($, on) => {
+  const w = world(on)
+  w.replies.agents = [{ agentId: 'a1', family: 'gpt', state: 'idle', jobs: [{ pid: 10001, command: 'sleep', age_s: 1 }, { pid: 10002, command: 'sleep', age_s: 1 }] }]
+  w.replies.closed = { ok: true, closed: true, stopped_jobs: 2 }
+  const response: any = await $.tool.call({ tool: 'TaskStop', tool_use_id: 'stop1', task_id: 'a1' })
+  expect(response.result.message).toContain('2 jobs')
+  expect(response.result.task_id).toBe('a1')
+  expect(w.requests.find(x => x.path === '/close')?.body.agentId).toBe('a1')
+  expect(w.toolCalls).toEqual([])
+})
+
+for (const state of ['running', 'waiting_tool', 'unknown']) test(`fix1 TaskStop passes ${state} tasks unchanged`, async ($, on) => {
+  const w = world(on)
+  w.replies.agents = state === 'unknown' ? [] : [{ agentId: 'a1', family: 'gpt', state }]
+  const input = { tool: 'TaskStop', tool_use_id: 'stop1', task_id: 'a1' } as const
+  await $.tool.call(input)
+  expect(w.toolCalls).toEqual([input])
+  expect(w.requests.filter(x => x.path === '/close')).toEqual([])
+})
+
+test('fix1 a passing connection failure retries on the next message', async ($, on) => {
+  const w = world(on), state = sessionState(on)
+  w.replies.agents = []
+  w.replies.roster = []
+  w.replies.restore = { found: true, agent: { family: 'gpt', cwd: '/restored', model: 'fake-gpt', effort: 'high' } }
+  w.replies.unavailable = true
+  on('fs.read', (_, e) => e.path === '/test/.claude/lord/logs/a1.json' ? { value: '{}' } : { deny: 'absent' })
+  expect((await step($, 'continue')).result.answer).toContain('lord: error:')
+  expect(state.get('agent', 'a1').resumeError).toBeUndefined()
+  w.replies.unavailable = false
+  expect((await step($, 'try again')).result.answer).toBe('fake answer')
+  expect(w.modelCalls()).toBe(0)
+})
+
+test('fix1 memory warnings and restart kills appear in the footer', async ($, on) => {
+  world(on, [{ type: 'done', text: 'answer', record: { ...RECORD, memory_warning: 'Memory: 0.9 GB of the 1.0 GB ceiling', killed_jobs: [{ pid: 10001, command: 'sleep 30', age_s: 2 }] } }])
+  await spawn($)
+  const answer = (await step($, 'work')).result.answer
+  expect(answer).toContain('Memory: 0.9 GB')
+  expect(answer).toContain('killed jobs: 10001 sleep 30')
 })

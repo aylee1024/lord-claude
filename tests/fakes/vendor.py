@@ -168,9 +168,21 @@ async def turn(sid, text, request_id=None):
         save(sid)
         os._exit(9)
     if text == 'BACKGROUND':
-        child = subprocess.Popen(['sleep', '300'], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         audit(command_pid=child.pid)
         answer = 'JOB STARTED'
+    elif text == 'SHELL_BACKGROUND':
+        child = subprocess.Popen(['/bin/zsh', '-c', 'while :; do /bin/sleep 1; done'], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        audit(shell_pid=child.pid)
+        answer = 'SHELL STARTED'
+    elif text == 'TOOL_BACKGROUND':
+        env = {k: v for k, v in os.environ.items() if k != 'LORD_AGENT_ID'}
+        env['JOB_VISIBILITY_PROBE'] = 'synthetic'
+        code = 'import subprocess,time; p=subprocess.Popen(["/bin/sleep","300"],start_new_session=True); print(p.pid,flush=True); time.sleep(300)'
+        server = await asyncio.create_subprocess_exec(sys.executable, '-c', code, env=env, stdout=-1, stderr=-3)
+        child = int(await server.stdout.readline())
+        audit(tool_pid=server.pid, tool_child=child)
+        answer = 'TOOL STARTED'
     elif text == 'STEPS':
         # One command (long output ending in a token, exit code 2) and one file edit, shaped as each vendor reports them.
         output = 'x' * 3000 + ' sk-abcdefghijklmnopqrstuv'
@@ -213,7 +225,7 @@ async def turn(sid, text, request_id=None):
         answer = 'HEREDOC'
     elif text == 'COMMAND':
         # codex ends an interrupted turn but leaves the command it was running alive, in a session of its own.
-        child = subprocess.Popen(['sleep', '300'], start_new_session=True)
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'], start_new_session=True)
         audit(command_pid=child.pid)
         await live['wake'].wait()
         answer = ''
@@ -366,6 +378,9 @@ async def handle(value):
             return
         if p.get('environments'): assert p['environments'] == [{'environmentId': SESSIONS['environment'], 'cwd': p['cwd']}]
         sid = p.get('threadId') or p['sessionId']
+        if not (DATA / (sid + '.json')).is_file():
+            send({'id': rid, 'error': {'message': 'conversation not found'}})
+            return
         load(sid)
         result = {'thread': {'id': sid}} if FAMILY == 'gpt' else {'sessionId': sid}
         if FAMILY == 'gpt' and '--large-resume' in sys.argv: result['history'] = 'x' * (40 * 1024 * 1024)

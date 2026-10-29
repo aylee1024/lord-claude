@@ -42,7 +42,7 @@ HOME = Path(os.environ.get('LORD_HOME', Path.home() / '.claude/lord')).expanduse
 LEGACY_SOCKET = HOME / 'lordd.sock'
 SOCKET = Path(os.environ['LORD_DAEMON_SOCKET']) if os.environ.get('LORD_DAEMON_SOCKET') else HOME / f'lordd-{VERSION}.sock'
 LIMIT = 8 * 1024 * 1024
-VENDOR_LIMIT = 1024 * 1024 * 1024
+VENDOR_LIMIT = 256 * 1024 * 1024
 MEMORY_CEILING_KB = 24 * 1024 * 1024
 # A row's output as Claude Code keeps it: the end of what the step printed, where errors land.
 ROW_OUTPUT = 2000
@@ -389,11 +389,23 @@ def codex_reads(item):
     known = {path for _, path in found}
     return found + [('shell', path) for path in shell_reads(str(item.get('command') or ''), item.get('cwd')) if path not in known]
 
-def shell_reads(command, cwd=None):
-    try: words = shlex.split(command)
-    except ValueError: return []
-    if len(words) >= 3 and Path(words[0]).name in ('sh', 'bash', 'zsh') and words[1] in ('-c', '-lc', '-ic'):
-        return shell_reads(words[2], cwd)
+def shell_reads(command, cwd=None, depth=0):
+    if len(command) > 65536 or depth > 8: return []
+    if re.match(r'^\s*(?:/[^\s]+/)?(?:sh|bash|zsh)\s+-(?:c|lc|ic)\s', command):
+        try: words = shlex.split(command)
+        except ValueError: return []
+        if len(words) >= 3: return shell_reads(words[2], cwd, depth + 1)
+    # Heredoc contents are input data, not commands. Keep their introducing command only.
+    lines, pending = [], []
+    for line in command.splitlines(keepends=True):
+        if pending:
+            delimiter, tabs = pending[0]
+            if (line.lstrip('\t') if tabs else line).rstrip('\r\n') == delimiter: pending.pop(0)
+            continue
+        lines.append(line)
+        for match in re.finditer(r'<<(-?)\s*(?:\x27([^\x27]+)\x27|"([^"]+)"|([^\s;&|<>]+))', line):
+            pending.append((next(x for x in match.groups()[1:] if x is not None), bool(match[1])))
+    command = ''.join(lines)
     try:
         lexer = shlex.shlex(command, posix=True, punctuation_chars=';&|\n')
         lexer.whitespace = ' \t\r'
@@ -406,18 +418,25 @@ def shell_reads(command, cwd=None):
             if part: commands.append(part)
             part = []
         else: part.append(token)
-    found = []
+    found, seen = [], set()
     readers = ('cat', 'head', 'tail', 'sed', 'nl', 'wc', 'rg', 'grep', 'less')
     for words in commands:
+        if words and words[0] == 'cd':
+            target = words[1] if len(words) == 2 else None
+            if not target or any(c in target for c in '*?[$`~') or target == '-': cwd = None
+            elif target.startswith('/'): cwd = os.path.normpath(target)
+            elif cwd: cwd = os.path.normpath(os.path.join(str(cwd), target))
+            continue
         if not words or (name := Path(words[0]).name) not in readers: continue
-        if name == 'sed' and '-n' not in words[1:]: continue
-        pattern, skip, options = name in ('rg', 'grep', 'sed'), False, True
+        if name == 'sed' and not any(w.startswith('-') and not w.startswith('--') and 'n' in w for w in words[1:]): continue
+        pattern, skip, options = name in ('rg', 'grep', 'sed') and not (name == 'rg' and '--files' in words), False, True
         for word in words[1:]:
             if skip: skip = False; continue
             if options and word == '--': options = False; continue
             if options and word.startswith('-') and word != '-':
                 if name in ('rg', 'grep', 'sed') and word in ('-e', '--regexp', '-f', '--file'):
                     pattern, skip = False, True
+                elif name == 'sed' and re.fullmatch(r'-[nEru]*[ef]', word): pattern, skip = False, True
                 elif name in ('rg', 'grep', 'sed') and word.startswith(('-e', '-f', '--regexp=', '--file=')): pattern = False
                 elif name in ('head', 'tail') and word in ('-n', '-c', '--lines', '--bytes'): skip = True
                 elif name == 'nl' and word in ('-b', '-d', '-f', '-h', '-i', '-l', '-n', '-s', '-v', '-w'): skip = True
@@ -425,9 +444,10 @@ def shell_reads(command, cwd=None):
                 continue
             if word in ('>', '>>', '<', '2>', '2>>'): skip = True; continue
             if pattern: pattern = False; continue
-            if word == '-' or word.startswith(('>', '<')) or '$' in word or '`' in word: continue
+            if word == '-' or word.startswith(('>', '<')) or any(c in word for c in '*?[$`'): continue
+            if not cwd and not word.startswith('/'): continue
             path = os.path.normpath(os.path.join(str(cwd), word)) if cwd and not word.startswith('/') else word
-            if path not in found: found.append(path)
+            if path not in seen: found.append(path); seen.add(path)
     return found
 
 def error_kind(error):
@@ -458,6 +478,16 @@ def settings_line(s):
                        f"network {'on' if s['network'] else 'off'}", *([f"web search {s['web_search']}"] if 'web_search' in s else []), f"tools {'on' if s['tools'] else 'off'}", f"nice {s['nice']}",
                        f"memory {s['memory_gb']} GB", f"hang {s['hang_s'] or 'none'}{' s' if s['hang_s'] else ''}",
                        f"wall {s['wall_s'] or 'none'}{' s' if s['wall_s'] else ''}"])
+
+def pinned_folder(label, path, pins):
+    real = str(Path(path).expanduser().resolve())
+    if path in pins and real != pins[path]:
+        raise ValueError(f'{label} {path} now points to {real}, not {pins[path]} as when it was added; name the folder itself or launch a fresh agent')
+    if not Path(real).exists(): raise ValueError(f'{label} {path} does not exist')
+    if not Path(real).is_dir(): raise ValueError(f'{label} {path} is not a folder')
+    pins[path] = real
+    pins.setdefault(real, real)
+    return real
 
 def helper_seen(a, item):
     # A codex helper agent starting, from its parent's (or a helper's) item: subAgentActivity in codex's current helper
@@ -557,7 +587,7 @@ class Redactor:
         # key=value, key: value and "key": "value", for the usual secret names.
         # Names may carry a prefix (GITHUB_TOKEN, client_secret, "access_token"); a scheme word (Basic, Token) goes with
         # its value.
-        return re.sub(r'(?i)(["\x27]?(?<![A-Za-z0-9])[\w-]*(?:api[-_]?key|authorization|password|passwd|secret|token)[\w-]*["\x27]?\s*[:=]\s*["\x27]?)'
+        return re.sub(r'(?i)(["\x27]?(?<![A-Za-z0-9])[\w-]{0,64}(?:api[-_]?key|authorization|password|passwd|secret|token)[\w-]{0,64}["\x27]?\s*[:=]\s*["\x27]?)'
                       r'(?!\[REDACTED\])(?:(?:basic|token|digest|bearer)\s+)?[^\s\"\x27,;}]+', r'\1[REDACTED]', value)
 
 async def process_table():
@@ -570,6 +600,38 @@ async def process_table():
             rss[pid] = kb
     return children, rss
 
+class ProcessMarkers(dict):
+    def __init__(self):
+        super().__init__()
+        self.visible, self.hosts, self.sockets = set(), set(), {}
+
+async def process_markers():
+    # macOS hides some environments. Compare with plain command hashes, retaining no environment text.
+    found, plain = ProcessMarkers(), {}
+    for environment in (False, True):
+        ps = await asyncio.create_subprocess_exec('/bin/ps', '-Eww' if environment else '-ww', '-A', '-o', 'pid=,command=', stdout=-1, stderr=-3, limit=LIMIT)
+        try:
+            while row := await ps.stdout.readline():
+                fields = row.split(None, 1)
+                if len(fields) != 2 or not fields[0].isdigit(): continue
+                pid, command = int(fields[0]), fields[1]
+                if not environment:
+                    plain[pid] = hashlib.sha256(command).digest()
+                    if Path(os.fsdecode(command.split(None, 1)[0])).name == 'codex-code-mode-host': found.hosts.add(pid)
+                    continue
+                if pid in plain and hashlib.sha256(command).digest() != plain[pid]: found.visible.add(pid)
+                for pattern, values in ((rb'(?:^|\s)LORD_AGENT_ID=([^\s]+)(?=\s|$)', found),
+                                        (rb'(?:^|\s)LORD_DAEMON_SOCKET=(.*?)(?= [^\s=]+=|$)', found.sockets)):
+                    markers = re.findall(pattern, command)
+                    if markers: values[pid] = markers[-1].decode('utf8', 'replace')
+        except BaseException:
+            if ps.returncode is None: ps.kill()
+            await ps.wait()
+            raise
+        await ps.wait()
+        if ps.returncode: raise RuntimeError('process marker lookup failed')
+    return found
+
 async def job_details(pids):
     if not pids: return []
     ps = await asyncio.create_subprocess_exec('/bin/ps', '-A', '-o', 'pid=,stat=,etime=,command=', stdout=-1, stderr=-3)
@@ -578,10 +640,10 @@ async def job_details(pids):
         fields = row.split(None, 3)
         if len(fields) != 4 or not fields[0].isdigit() or int(fields[0]) not in pids or 'Z' in fields[1]: continue
         pid, _, elapsed, command = fields
+        command = command[:300]
         try: words = shlex.split(command)
         except ValueError: words = []
-        if words and (Path(words[0]).name == 'codex-code-mode-host' or
-                      len(words) > 1 and Path(words[1]).name == 'lordd.py' and '--mcp' in words[2:]): continue
+        if Path((words or command.split() or [''])[0]).name == 'codex-code-mode-host': continue
         days, clock = elapsed.split('-', 1) if '-' in elapsed else ('0', elapsed)
         seconds = 0
         try:
@@ -598,30 +660,45 @@ def tree(children, root):
         stack += children.get(pid, [])
     return found
 
+def marked_pids(markers, agent_id):
+    sockets = getattr(markers, 'sockets', {})
+    return {pid for pid, marker in markers.items() if marker == agent_id and sockets.get(pid) == str(SOCKET)}
+
+def job_pids(children, pids, roots, markers, agent_id):
+    excluded = set()
+    hosts, visible = getattr(markers, 'hosts', set()), getattr(markers, 'visible', set())
+    marked = marked_pids(markers, agent_id)
+    for pid in pids - roots:
+        if pid in hosts or (pid in visible and pid not in marked): excluded.update(tree(children, pid))
+    return ((pids - excluded) | marked) - roots - hosts
+
 def signal_all(pids, sig):
     for pid in pids:
         try: os.kill(pid, sig)
         except (ProcessLookupError, PermissionError): pass
 
-async def kill_tree(process, known=()):
+async def kill_tree(process, known=(), *, agent_id=None, others=(), on_jobs=None):
     # Tool commands can leave the vendor's process group, so every descendant is signalled by pid as well.
     # macOS answers killpg with EPERM when the group holds only zombies; the pid signals below still run.
-    # A vendor that already exited leaves its descendants with launchd as parent: those recorded by the guard
-    # (`known`) are signalled when they are still orphans, and never a pid that has since gone to another parent.
-    if process is None: return
-    children = (await process_table())[0]
-    parent = {child: ppid for ppid, kids in children.items() for child in kids}
-    pids = tree(children, process.pid)
-    orphans = {pid for pid in known if parent.get(pid) == 1 or parent.get(pid) in known}
-    pids = [*pids, *(orphans - set(pids))]
-    try: os.killpg(process.pid, signal.SIGTERM)
-    except (ProcessLookupError, PermissionError): pass
-    signal_all(pids, signal.SIGTERM)
-    await asyncio.sleep(.2)
-    try: os.killpg(process.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError): pass
-    signal_all(pids, signal.SIGKILL)
-    await process.wait()
+    roots = [p for p in (process, *others) if p is not None]
+    if not roots and not agent_id: return
+    logged = set()
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        children = (await process_table())[0]
+        markers = await process_markers() if agent_id else {}
+        marked = marked_pids(markers, agent_id)
+        pids = {pid for p in roots if p.returncode is None for pid in tree(children, p.pid)}
+        if on_jobs:
+            jobs = await job_details(job_pids(children, pids, {p.pid for p in roots}, markers, agent_id) - logged)
+            on_jobs(jobs)
+            logged.update(j['pid'] for j in jobs)
+        for p in roots:
+            if p.returncode is not None: continue
+            try: os.killpg(p.pid, sig)
+            except (ProcessLookupError, PermissionError): pass
+        signal_all(pids | marked, sig)
+        if sig == signal.SIGTERM: await asyncio.sleep(.2)
+    await asyncio.gather(*(p.wait() for p in roots))
 
 def usage(value):
     return {key: int(next((value[k] for k in aliases if isinstance(value.get(k), (int, float))), 0))
@@ -658,6 +735,7 @@ class Agent:
         self.commands, self.retries, self.edited, self.last_command, self.turn_error, self.retry_task = 0, 0, False, None, None, None
         self.retry_waiting = False
         self.policy_continues, self.memory_warned, self.jobs, self.stop_cause = 0, False, [], None
+        self.memory_warning, self.killed_jobs, self.session_ended = None, [], False
         self.final_text, self.restart, self.token = '', False, uuid.uuid4().hex
         self.default_model, self.agy_step = False, None
         # Each vendor tool step's result, by step id, for the plugin's row of it (/row).
@@ -756,6 +834,8 @@ class Agent:
         turn = {'turn': number, 'started': started, 'ended': ended, 'ended_how': how,
                 'commands': getattr(self, 'commands', 0), 'retries': getattr(self, 'retries', 0),
                 'policy_continues': self.policy_continues, 'jobs': self.jobs,
+                'killed_jobs': list(self.killed_jobs),
+                **({'memory_warning': self.memory_warning} if self.memory_warning else {}),
                 **({'stop_cause': self.stop_cause} if self.stop_cause else {}),
                 'helpers': [h['thread'] for h in mine],
                 **({'usage': value.get('usage')} if kind == 'done' else {'error': str(value.get('message'))}),
@@ -763,7 +843,7 @@ class Agent:
         kept = [*turns, turn][-100:]
         # Only the helpers the kept turns name, in the order they started, so the record stays as bounded as its turns.
         named = dict.fromkeys(t for k in kept for t in (k.get('helpers') if isinstance(k.get('helpers'), list) else []) if isinstance(t, str))
-        document = {**{k: self.record[k] for k in ('readonly', 'net', 'nosandbox', 'tests', 'nosearch', 'tools', 'nice', 'memory_gb', 'hang_s', 'wall_s', 'created') if k in self.record},
+        document = {**{k: self.record[k] for k in ('readonly', 'net', 'nosandbox', 'tests', 'nosearch', 'tools', 'nice', 'memory_gb', 'hang_s', 'wall_s', 'created', 'dir_paths', 'cwd_paths') if k in self.record},
                     'agentId': self.agentId, 'family': self.family, 'lordVersion': VERSION, 'session': self.record.get('session'),
                     **{k: v for k, v in settings.items() if k != 'codex_folder'}, 'vendorSession': self.vendorSession,
                     'transcript': transcript, 'helpers': [self.helpers[t] for t in named if t in self.helpers], 'turns': kept}
@@ -779,7 +859,9 @@ class Agent:
         except OSError: pass
         helpers = [h.get('model') or '?' for h in mine]
         return {'ended_how': how, 'model': self.model, 'effort': self.effort, 'started': turn['started'], 'ended': ended,
-                'commands': turn['commands'], 'retries': turn['retries'], 'policy_continues': self.policy_continues, 'jobs': self.jobs, 'helpers': helpers, 'session': self.vendorSession}
+                'commands': turn['commands'], 'retries': turn['retries'], 'policy_continues': self.policy_continues, 'jobs': self.jobs,
+                'killed_jobs': turn['killed_jobs'], **({'memory_warning': self.memory_warning} if self.memory_warning else {}),
+                'helpers': helpers, 'session': self.vendorSession}
 
     def undelivered(self):
         return bool(self.carry) or not self.events.empty()
@@ -799,6 +881,7 @@ class Agent:
             if self.retry_waiting and self.retry_task and not self.retry_task.done(): self.retry_task.cancel()
             self.retry_waiting = False
             value['record'] = self.turn_record(kind, value)
+            self.killed_jobs = []
             self.state, self.activity = 'idle', ''
             self.finished.set()
             for future in self.calls.values():
@@ -823,7 +906,7 @@ class Vendor:
         self.exec_error = ''
         self.last, self.reason, self.efforts, self.descendants = time.monotonic(), None, [], set()
         self.pending, self.models = {}, []
-        self.lock, self.write_lock = asyncio.Lock(), asyncio.Lock()
+        self.lock, self.write_lock, self.kill_lock = asyncio.Lock(), asyncio.Lock(), asyncio.Lock()
         self.stopping, self.ready = False, False
         # The vendor's own account of a failure, from its stderr (agy's AGY_ERROR line), and the task reading stderr.
         self.error, self.stderr_task = None, None
@@ -923,7 +1006,7 @@ class Vendor:
         self.exec_token, self.environment_id = uuid.uuid4().hex, 'lord-' + uuid.uuid4().hex
         self.exec_descendants = set()
         self.d.redact.secrets.add(self.exec_token)
-        env = {k: v for k, v in env.items() if k not in ('LORD_MCP_TOKEN', 'LORD_DAEMON_SOCKET')}
+        env = {k: v for k, v in env.items() if k != 'LORD_MCP_TOKEN'}
         profile, params = tests_profile(self.agent.cwd, self.agent.record.get('dirs', []), env)
         try:
             self.exec_process = await asyncio.create_subprocess_exec(*nice, '/usr/bin/sandbox-exec', '-p', profile, *params,
@@ -956,35 +1039,35 @@ class Vendor:
         await self.kill()
 
     async def kill(self):
-        await self.update_jobs()
-        self.log_jobs()
-        await asyncio.gather(kill_tree(self.process, self.descendants), kill_tree(self.exec_process, self.exec_descendants))
-        if self.agent: self.agent.jobs = []
+        async with self.kill_lock:
+            active = self.agent and (self.process or self.exec_process or self.agent.jobs)
+            await kill_tree(self.process, others=(self.exec_process,), agent_id=self.agent.agentId if active else None, on_jobs=self.log_jobs if active else None)
+            if self.agent: self.agent.jobs = []
 
-    async def update_jobs(self, children=None):
+    async def update_jobs(self, children=None, markers=None):
         if not self.agent: return set()
-        if not self.process and not self.exec_process and not self.descendants and not self.exec_descendants:
+        if not any(p and p.returncode is None for p in (self.process, self.exec_process)) and not self.agent.jobs:
             self.agent.jobs = []
             return set()
         if children is None: children = (await process_table())[0]
-        parents = {pid: ppid for ppid, kids in children.items() for pid in kids}
+        if markers is None: markers = await process_markers()
         pids = set()
         for process, attr in ((self.process, 'descendants'), (self.exec_process, 'exec_descendants')):
-            known = getattr(self, attr, set())
-            live = set(tree(children, process.pid)) if process else set()
-            live |= {pid for pid in known if parents.get(pid) == 1 or parents.get(pid) in known}
+            live = set(tree(children, process.pid)) if process and process.returncode is None else set()
             setattr(self, attr, live - ({process.pid} if process else set()))
             pids |= live
         roots = {p.pid for p in (self.process, self.exec_process) if p}
-        self.agent.jobs = await job_details(pids - roots)
-        return pids
+        marked = marked_pids(markers, self.agent.agentId)
+        self.agent.jobs = await job_details(job_pids(children, pids, roots, markers, self.agent.agentId))
+        return pids | marked
 
-    def log_jobs(self):
+    def log_jobs(self, jobs=None):
         if not self.agent: return
-        for job in self.agent.jobs:
+        for job in self.agent.jobs if jobs is None else jobs:
             line = f"killing job {job['pid']}: {job['command']}"
             self.agent.note(line)
             self.d.log(f'{self.agent.agentId}: {line}')
+            self.agent.killed_jobs.append(job)
 
     async def send(self, value):
         async with self.write_lock:
@@ -1042,16 +1125,14 @@ class Vendor:
             self.reaped.clear()
             # agy writes its reason to stderr just before it exits, at start-up too; let that reader finish first.
             if self.stderr_task and not self.stderr_task.done(): await asyncio.wait([self.stderr_task], timeout=1)
-            for future in list(self.pending.values()):
-                if not future.done(): future.set_exception(RuntimeError(self.error or str(error)))
-            if self.family == 'gemini' and not self.initialized.done(): self.initialized.set_exception(RuntimeError(self.error or str(error)))
             reason, self.reason = self.reason, None
-            for a in self.d.agents.values():
-                if self.d.backend(a) is self:
-                    a.generation = 0
-                    a.emit('error', message=self.d.redact(reason or self.error or error), retryable=not (reason or self.error))
             self.d.log(error)
-            try: await self.close()
+            try:
+                await self.close(reason or self.error or str(error))
+                for a in self.d.agents.values():
+                    if self.d.backend(a) is self:
+                        a.generation = 0
+                        a.emit('error', message=self.d.redact(reason or self.error or error), retryable=not (reason or self.error))
             finally: self.reaped.set()
 
     async def request(self, value):
@@ -1223,12 +1304,12 @@ class Vendor:
         if item.get('type') == 'commandExecution': helper['commands'] = helper.get('commands', 0) + 1
         if item.get('type') == 'fileChange': a.edited = True
 
-    async def close(self):
+    async def close(self, error='Vendor closed'):
         self.stopping, self.ready = True, False
-        for future in [*self.pending.values(), getattr(self, 'initialized', None)]:
-            if future and not future.done(): future.set_exception(RuntimeError('Vendor closed'))
         process, ex = self.process, self.exec_process
         await self.kill()
+        for future in [*self.pending.values(), getattr(self, 'initialized', None)]:
+            if future and not future.done(): future.set_exception(RuntimeError(error))
         if self.process is process: self.process = None
         if self.exec_process is ex: self.exec_process = None
 
@@ -1309,8 +1390,11 @@ class Daemon:
         return self.vendors[a.agentId]
 
     async def finish(self, a, **value):
-        await self.backend(a).update_jobs()
-        a.emit('done', **value)
+        try: await self.backend(a).update_jobs()
+        except Exception as error:
+            a.note(f'job lookup failed: {error}')
+            self.log(f'{a.agentId}: job lookup failed: {error}')
+        finally: a.emit('done', **value)
 
     def refused(self, body, message):
         aid = body.get('agentId')
@@ -1338,7 +1422,7 @@ class Daemon:
                 if not isinstance(saved, dict) or saved.get('family') not in ('gpt', 'grok', 'gemini'): raise ValueError('record is invalid')
                 if not all(isinstance(saved.get(k), str) and saved[k] for k in ('model', 'effort', 'cwd')): raise ValueError('record is incomplete')
                 if not isinstance(saved.get('vendorSession'), str) or not re.fullmatch(r'[A-Za-z0-9_.-]+', saved['vendorSession']): raise ValueError('vendor session is missing')
-                record = {k: saved[k] for k in ('family', 'model', 'effort', 'cwd', 'dirs', 'nice', 'memory_gb', 'hang_s', 'wall_s', 'tools', 'codexHome', 'vendorSession', 'session') if k in saved}
+                record = {k: saved[k] for k in ('family', 'model', 'effort', 'cwd', 'dirs', 'nice', 'memory_gb', 'hang_s', 'wall_s', 'tools', 'codexHome', 'vendorSession', 'session', 'dir_paths', 'cwd_paths') if k in saved}
                 if not record.get('codexHome') or canon(record['codexHome']) == canon(self.user_codex_home): record.pop('codexHome', None)
                 record.update(agentId=aid, created=saved.get('created') or datetime.now(timezone.utc).isoformat())
                 record.update(readonly=saved.get('sandbox') == 'read-only' or bool(saved.get('readonly')),
@@ -1452,7 +1536,7 @@ class Daemon:
                 if a.vendorSession: params['threadId'] = a.vendorSession
                 try: result = await vendor.rpc('thread/resume' if a.vendorSession else 'thread/start', params)
                 except Exception as error:
-                    if a.vendorSession and re.search(r'limit|too large|Separator is not found', str(error), re.I):
+                    if a.vendorSession and re.search(r'line.*(?:limit|too large)|too large.*line|Separator is not found', str(error), re.I):
                         path = transcript_path(a.family, a.vendorSession, a.cwd, a.record.get('codexHome') or self.user_codex_home)
                         try: size = f'{Path(path).stat().st_size / 1048576:.0f}' if path else 'unknown'
                         except OSError: size = 'unknown'
@@ -1548,15 +1632,25 @@ class Daemon:
             if not Path(body['cwd']).expanduser().is_absolute(): raise ValueError('the working folder must be an absolute path')
             a = self.agents.get(aid)
             if body.get('resume') and not (a and (a.state in ('running', 'waiting_tool') or a.undelivered())):
-                cause = 'record is missing' if not a or not a.record_path.is_file() else 'vendor session is missing' if not a.vendorSession else None
+                if not a:
+                    restored = self.restore(aid)
+                    if restored.get('error'): raise ValueError(restored['error'])
+                    a = self.agents.get(aid)
+                cause = 'record is missing' if not a else 'vendor session is missing' if not a.vendorSession else None
                 if cause: raise ValueError(f'agent {aid} cannot be resumed ({cause}); launch a fresh agent')
+            cwd_paths = dict(a.record.get('cwd_paths', {a.cwd: a.cwd}) if a else {})
+            if a: pinned_folder('@cwd', a.cwd, cwd_paths)
+            cwd = pinned_folder('@cwd', body['cwd'], cwd_paths)
+            dir_paths = dict(a.record.get('dir_paths', {x: x for x in a.record.get('dirs', [])}) if a else {})
+            for path in [*(a.record.get('dirs', []) if a else []), *(body.get('dirs') or [])]:
+                if not Path(path).expanduser().is_absolute(): raise ValueError(f'@dir {path} is not an absolute path')
+                pinned_folder('@dir', path, dir_paths)
             if body.get('tests') or (a and a.record.get('tests')):
                 for clash in ('readonly', 'nosandbox', 'net', 'tools'):
                     if body.get(clash) or (a and a.record.get(clash)): raise ValueError(f'@tests cannot be used with @{clash}')
                 if relative := [x for x in body.get('dirs') or [] if not Path(x).expanduser().is_absolute()]:
                     raise ValueError(f'@dir {relative[0]} is not an absolute path')
                 validate_tests_layout(a.cwd if a else body['cwd'], [*(a.record.get('dirs', []) if a else []), *(body.get('dirs') or [])], subscription_env())
-            cwd = str(Path(body['cwd']).expanduser().resolve(strict=True))
             # A folder that holds the home folder, by its usual path or through macOS's data volume (/System/Volumes).
             if inside(canon(str(Path.home())), (canon(cwd),)) or (sys.platform == 'darwin' and inside('/System/Volumes/Data', (cwd, canon(cwd)))):
                 raise ValueError('refusing / or a folder holding your home folder as a working folder: start Claude Code in a project folder, or put "@cwd <folder>" on the first line of the task')
@@ -1580,7 +1674,7 @@ class Daemon:
                 self.quota_refusal(family, body.get('model') or (a.model if a else self.config[family]['model']), a, aid)
             new = a is None
             saved = None if new else (json.loads(dumps(a.record)), a.restart)
-            try: return await self.open_agent(aid, family, cwd, body, a)
+            try: return await self.open_agent(aid, family, cwd, body, a, cwd_paths, dir_paths)
             except BaseException as error:
                 # A first /open that fails leaves no agent behind, so a corrected retry starts clean; a refused
                 # later /open puts the agent's options back and reattaches with them on the next turn.
@@ -1596,7 +1690,7 @@ class Daemon:
                     self.save(a)
                 raise
 
-    async def open_agent(self, aid, family, cwd, body, a):
+    async def open_agent(self, aid, family, cwd, body, a, cwd_paths, dir_paths):
         resuming = a is not None
         if a is None:
             if not Path(cwd).is_dir(): raise ValueError('cwd must be a directory')
@@ -1621,10 +1715,10 @@ class Daemon:
         if body.get('nice') is not None and (isinstance(body['nice'], bool) or not isinstance(body['nice'], int) or not 0 <= body['nice'] <= 19):
             raise ValueError('@nice must be a whole number from 0 to 19')
         if relative := [x for x in body.get('dirs') or [] if not Path(x).expanduser().is_absolute()]: raise ValueError(f'@dir {relative[0]} is not an absolute path')
-        dirs = [str(Path(x).expanduser().resolve()) for x in body.get('dirs') or []]
+        dirs = list(dict.fromkeys(dir_paths.values()))
         if any(inside(canon(str(Path.home())), (canon(x),)) or (sys.platform == 'darwin' and inside('/System/Volumes/Data', (x, canon(x)))) for x in dirs):
             raise ValueError('refusing / or a folder holding your home folder as an @dir')
-        if missing := [x for x in body.get('dirs') or [] if not Path(x).expanduser().is_dir()]: raise ValueError(f'@dir {missing[0]} does not exist')
+        a.record.update(cwd_paths=cwd_paths, dir_paths=dir_paths)
         for key in ('readonly', 'net', 'nosandbox', 'tests', 'nosearch'):
             if body.get(key) and not a.record.get(key):
                 # A sandbox change needs a new process (grok) or a reattached thread (codex).
@@ -1655,7 +1749,7 @@ class Daemon:
         if not a.undelivered():
             try: await self.attach(a)
             except Exception as error:
-                if resuming and a.vendorSession and not str(error).startswith('session too large to resume'):
+                if resuming and a.vendorSession and re.search(r'\b(?:conversation|thread|session|rollout)(?:\s+[a-f0-9-]{8,})?\s+(?:(?:is|was)\s+)?(?:not found|does not exist|missing)\b|\bno (?:conversation|thread|session|rollout) found\b|\bmissing (?:conversation|thread|session|rollout)\s*$', str(error), re.I):
                     raise RuntimeError(f'agent {aid} cannot be resumed ({self.redact(error)}); launch a fresh agent') from None
                 raise
         # A model change applies at the next turn; refusing it here keeps the mod from adopting it. With a result held,
@@ -1664,6 +1758,7 @@ class Daemon:
         if body.get('model') and not a.undelivered() and (models := self.known_models(a)) and body['model'] not in models:
             raise ValueError(f'unknown {a.family} model {body["model"]}; {a.family} lists {", ".join(models)}')
         if a.state == 'closed': a.state = 'idle'
+        a.session_ended = False
         a.default_model = False
         # An opened agent counts as used, so pruning cannot take it before its turn starts.
         self.save(a)
@@ -1731,6 +1826,7 @@ class Daemon:
         a.dispatched, a.agy_step, a.rows = False, None, {}
         a.commands, a.retries, a.edited, a.last_command, a.turn_error, a.turn_body, a.retry_waiting = 0, 0, False, None, None, body, False
         a.policy_continues, a.memory_warned, a.stop_cause = 0, False, None
+        a.memory_warning = None
         a.turn_started = datetime.now(timezone.utc).isoformat(timespec='seconds')
         a.settings = self.settings(a)
         a.note(f'turn: {a.family} {a.model} effort {a.effort} · {settings_line(a.settings)}')
@@ -1961,9 +2057,11 @@ class Daemon:
             if path == '/session_end':
                 for a in list(self.agents.values()):
                     if body.get('session') and a.record.get('session') == body['session']:
-                        await self.interrupt(a, body.get('cause'))
-                        await self.backend(a).close()
-                        a.state = 'closed'
+                        a.session_ended = True
+                        a.note(body.get('cause') or 'session ended')
+                        if a.state not in ('running', 'waiting_tool') and not getattr(a, 'starting', False):
+                            await self.backend(a).close()
+                            a.state = 'closed'
                 return {'ok': True}
             if path == '/open':
                 try: return await self.open(body)
@@ -2005,10 +2103,14 @@ class Daemon:
                 a.note('message queued for the next turn: ' + self.redact(body['text'])[:300])
                 return {'ok': True, 'queued': True}
             elif path in ('/interrupt', '/close'):
+                if path == '/close' and body.get('idle_only') and (a.state in ('running', 'waiting_tool') or getattr(a, 'starting', False)):
+                    return {'ok': True, 'closed': False}
+                before = len(a.killed_jobs)
                 await self.interrupt(a, body.get('cause'))
                 if path == '/close':
                     a.state = 'closed'
                     await self.backend(a).close()
+                    if body.get('idle_only'): return {'ok': True, 'closed': True, 'stopped_jobs': len(a.killed_jobs) - before}
             else: raise ValueError('Unknown endpoint')
             return {'ok': True}
         raise ValueError('Unknown endpoint')
@@ -2143,7 +2245,7 @@ class Daemon:
             if now - pruned >= 3600:
                 pruned = now
                 self.task(self.prune(self.config['prune_days']))
-            busy = any(a.state in ('running', 'waiting_tool') or a.jobs or (a.undelivered() and now - self.last_request < self.config.get('keep_undelivered_s', 86400))
+            busy = any(a.state in ('running', 'waiting_tool') or (a.jobs and not a.session_ended) or (a.undelivered() and now - self.last_request < self.config.get('keep_undelivered_s', 86400))
                        for a in self.agents.values())
             idle_s = min(self.config['idle_exit_s'], self.config.get('retire_idle_s', 30)) if self.retire else self.config['idle_exit_s']
             if not self.requests and now - self.last_request >= idle_s and not busy:
@@ -2154,13 +2256,14 @@ class Daemon:
         idle_s = self.config.get('process_idle_s', self.config['idle_exit_s'])
         for service in [v for v in self.vendors.values() if v.agent is None]:
             if service.process and not service.pending and now - service.last >= idle_s: await service.close()
-        live = [v for v in self.vendors.values() if v.agent and v.process and v.process.returncode is None]
+        live = [v for v in self.vendors.values() if v.agent and (any(p and p.returncode is None for p in (v.process, v.exec_process)) or v.agent.jobs)]
         if not live: return
         children, rss = await process_table()
+        markers = await process_markers()
         for v in live:
             a = v.agent
-            pids = await Vendor.update_jobs(v, children)
-            if a.state in ('idle', 'closed') and not a.jobs and not a.lock.locked() and not a.stream_lock.locked() and now - v.last >= idle_s:
+            pids = await Vendor.update_jobs(v, children, markers)
+            if a.state in ('idle', 'closed') and (not a.jobs or a.session_ended) and not a.lock.locked() and not a.stream_lock.locked() and now - v.last >= idle_s:
                 await v.close()
                 continue
             ceiling = a.record['memory_gb'] * 1048576 if a.record.get('memory_gb') else self.config.get('memory_ceiling_kb', MEMORY_CEILING_KB)
@@ -2168,10 +2271,11 @@ class Daemon:
             if .85 * ceiling <= used <= ceiling and a.state in ('running', 'waiting_tool') and not a.memory_warned and (a.family != 'gpt' or a.turn_id):
                 text = f'Memory: {used / 1048576:.1f} GB of the {ceiling / 1048576:.1f} GB ceiling; at the ceiling Lord stops the turn and its processes.'
                 a.memory_warned = True
+                a.memory_warning = text
                 a.note(text)
+                self.log(f'{a.agentId}: {text}')
                 if a.family == 'gpt' and a.turn_id:
                     self.task(v.rpc('turn/steer', {'threadId': a.vendorSession, 'expectedTurnId': a.turn_id, 'input': [{'type': 'text', 'text': text}]}))
-                else: self.task(self.route('POST', '/queue', {'agentId': a.agentId, 'text': text}))
                 await asyncio.sleep(0)
             silent = a.record['hang_s'] if a.record.get('hang_s') is not None else self.config[a.family].get('no_progress_s', 0)
             if used > ceiling: v.reason = f'stopped: the {a.family} process tree used {used / 1048576:.1f} GB, over the {ceiling / 1048576:.1f} GB memory ceiling'
@@ -2180,13 +2284,7 @@ class Daemon:
                 v.reason = f'stopped: the turn ran past its {wall} s wall-clock limit'
             else: continue
             self.log(f'{a.agentId}: {v.reason}')
-            Vendor.log_jobs(v)
-            # The vendor's process group and every descendant by pid, since tool commands may leave the group.
-            for process in (v.process, v.exec_process):
-                if process:
-                    try: os.killpg(process.pid, signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError): pass
-            signal_all(pids, signal.SIGKILL)
+            await v.kill()
 
     async def prune(self, days):
         async with self.prune_lock: return await self.prune_locked(days)

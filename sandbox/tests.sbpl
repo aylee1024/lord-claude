@@ -6,7 +6,7 @@
 (allow network-outbound (remote ip "localhost:*"))
 (allow sysctl-read)
 (allow process-info*)
-(allow system-sched)
+(allow system-sched (target self))
 (allow mach-lookup (global-name "com.apple.sysmond"))
 (deny file-read* (literal (param "KEY")))
 (deny file-read-data (literal (param "KEY")))
