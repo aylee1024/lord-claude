@@ -64,7 +64,7 @@ def test_r6_message_folder_is_checked_again_at_open(tests_backend, rig, target, 
     asyncio.run(run())
 
 
-def test_r6_message_ticket_rechecks_a_queued_vendor_start(tests_backend, rig):
+def test_r6_pending_message_ticket_is_checked_only_at_applying_open(tests_backend, rig):
     d, m, _ = tests_backend
     work = rig.home / 'work'
     slot, outside = work / 'slot', rig.home / 'outside'
@@ -75,11 +75,13 @@ def test_r6_message_ticket_rechecks_a_queued_vendor_start(tests_backend, rig):
             a = d.agents['sender']
             data = {'to': 'sender', 'message': f'@dir {slot}\nwork'}
             d.confine_call(a, 'SendMessage', data, m['delegation_access'](a))
-            # Pinning at open does not replace the next vendor-start check.
             await d.backend(a).close(); a.generation = 0
             slot.rmdir(); slot.symlink_to(outside, target_is_directory=True)
+            await d.begin(a, {'text': 'PING'})
+            await asyncio.wait_for(a.finished.wait(), 5)
+            assert a.answer == 'PONG' and d.message_tickets(a)
             with pytest.raises(ValueError, match='changed after it was checked'):
-                await d.begin(a, {'text': 'PING'})
+                await d.open({'agentId': a.agentId, 'family': 'gpt', 'cwd': str(work), 'dirs': [str(slot)]})
         finally: await d.close()
     asyncio.run(run())
 

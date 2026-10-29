@@ -32,7 +32,7 @@ def test_r7_multiline_environment_secret_stays_out_of_rows(scope, monkeypatch):
 
 @pytest.mark.parametrize('held', [False, True])
 @pytest.mark.parametrize('folder', ['cwd', 'dir'])
-def test_r7_open_consumes_message_folders_without_a_vendor_start(tests_backend, rig, held, folder):
+def test_r7_existing_message_folders_are_not_newly_applied(tests_backend, rig, held, folder):
     d, m, _ = tests_backend
     work = rig.home / 'work'; slot = work / 'slot'; slot.mkdir()
     async def run():
@@ -45,16 +45,16 @@ def test_r7_open_consumes_message_folders_without_a_vendor_start(tests_backend, 
             assert d.message_tickets(a)
             await d.open({'agentId': a.agentId, 'family': 'gpt', 'cwd': str(work), 'dirs': [str(slot)], 'pin_cwd': True})
             assert vendor.generation == generation
-            assert d.message_tickets(a) == []
-            assert not list((m['HOME'] / 'launches').glob('*.json'))
+            assert len(d.message_tickets(a)) == 1
+            assert len(list((m['HOME'] / 'launches').glob('*.json'))) == 1
         finally: await d.close()
     asyncio.run(run())
 
 
 @pytest.mark.parametrize('apply_folder', [False, True])
-@pytest.mark.parametrize('missing', [False, True])
+@pytest.mark.parametrize('old_expiry', [False, True])
 @pytest.mark.parametrize('option', ['cwd', 'dir'])
-def test_r7_expired_message_refuses_only_a_matching_open_once(tests_backend, rig, apply_folder, missing, option):
+def test_r7_message_check_waits_for_new_folder_application(tests_backend, rig, apply_folder, old_expiry, option):
     d, m, _ = tests_backend
     work = rig.home / 'work'; slot = work / 'slot'; slot.mkdir()
     async def run():
@@ -65,16 +65,14 @@ def test_r7_expired_message_refuses_only_a_matching_open_once(tests_backend, rig
             ticket = d.launch_folders(folders=[str(folder)], agent_id=a.agentId)
             d.message_tickets(a, add=ticket)
             path = m['HOME'] / 'launches' / f'{ticket}.json'
-            if missing: path.unlink()
-            else:
+            if old_expiry:
                 entry = json.loads(path.read_text()); entry['expires'] = 0; path.write_text(json.dumps(entry))
             applied = {'dirs': [str(slot)]} if option == 'dir' else {'pin_cwd': True}
             body = {'agentId': a.agentId, 'family': 'gpt', 'cwd': str(work), **(applied if apply_folder else {})}
-            if apply_folder and not missing:
-                with pytest.raises(ValueError, match='expired'):
-                    await d.open(body)
-            else: await d.open(body)
-            assert d.message_tickets(a) == [] and not path.exists()
+            await d.open(body)
+            consumed = apply_folder and option == 'dir'
+            assert bool(d.message_tickets(a)) is not consumed
+            assert path.exists() is not consumed
             for _ in range(2): await d.open(body)
             await d.backend(a).close(); a.generation = 0
             await d.begin(a, {'text': 'PING'})
@@ -137,12 +135,14 @@ def test_r7_startup_swap_never_grants_the_new_target(tests_backend, rig, monkeyp
 
 @pytest.mark.parametrize('mode', ['workspace', 'net', 'readonly', 'grok', 'tests'])
 def test_r7_native_profiles_protect_both_plugin_spellings(tmp_path, monkeypatch, mode):
+    codex = shutil.which('codex') if mode not in ('grok', 'tests') else None
+    if mode not in ('grok', 'tests') and not codex: pytest.skip('native codex is not installed')
     m = load('r7_plugin'); work = tmp_path / 'work'; work.mkdir()
     plugin = work / 'cache' / 'plugin'; plugin.mkdir(parents=True)
     shutil.copytree(ROOT / 'sandbox', plugin / 'sandbox')
     (plugin / 'lordd.py').write_text('# synthetic plugin\n')
     alias = work / 'alias'; alias.symlink_to(plugin, target_is_directory=True)
-    monkeypatch.setattr(m, 'HERE', alias / 'lordd.py')
+    monkeypatch.setattr(m, 'HERE', (alias / 'lordd.py').resolve())
     m.HOME = tmp_path / 'lord'; m.HOME.mkdir()
     cli, temp = tmp_path / 'cli', tmp_path / 'temp'; cli.mkdir(); temp.mkdir()
     env = {'HOME': str(cli), 'CODEX_HOME': str(cli), 'TMPDIR': str(temp), 'PATH': '/opt/homebrew/bin:/usr/bin:/bin'}
@@ -161,13 +161,13 @@ print(json.dumps(out))
         profile, params = m.grok_profile(str(work), False, env) if mode == 'grok' else m.tests_profile(str(work), [], env)
         command = ['/usr/bin/sandbox-exec', '-p', profile, *params]
     else:
-        a = m.Agent({'agentId': 'probe', 'family': 'gpt', 'model': 'fake', 'cwd': str(work), 'dirs': [str(alias / 'sandbox')], 'net': mode == 'net', 'readonly': mode == 'readonly'})
+        a = m.Agent({'agentId': 'probe', 'family': 'gpt', 'model': 'fake', 'cwd': str(work), 'dirs': [str((alias / 'sandbox').resolve())], 'net': mode == 'net', 'readonly': mode == 'readonly'})
         config = m.gpt_permissions(a); name = config['default_permissions']; profile = config['permissions'][name]
         lines = ['default_permissions=' + json.dumps(name), f'[permissions.{name}.filesystem]']
         lines += [json.dumps(k) + '=' + json.dumps(v) for k, v in profile['filesystem'].items()]
         lines += [f'[permissions.{name}.network]', 'enabled=' + str(profile['network']['enabled']).lower()]
         (cli / 'config.toml').write_text('\n'.join(lines) + '\n')
-        command = ['/opt/homebrew/bin/codex', 'sandbox', '-P', name, '--']
+        command = [codex, 'sandbox', '-P', name, '--']
     result = subprocess.run([*command, '/opt/homebrew/bin/python3.12', '-I', '-c', code, *map(str, targets)], env=env, cwd=work, capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr[-500:]
     measured = json.loads(result.stdout)
@@ -219,6 +219,7 @@ def test_r7_planted_session_vendor_is_refused_before_it_runs(tests_backend, rig,
     program.write_text(f'#!{PYTHON}\nimport os\nfrom pathlib import Path\nPath({str(escaped)!r}).write_text("escaped")\nos.execv({PYTHON!r}, {[PYTHON, str(ROOT / "tests/fakes/vendor.py"), "gpt", str(rig.data)]!r} + ["app-server"])\n')
     program.chmod(0o755)
     d.agents['sender'] = m['Agent']({'agentId': 'sender', 'family': 'gpt', 'model': 'fake', 'cwd': str(project)})
+    d.agents['sender'].opened = True
     d.config['gpt'].pop('program')
     monkeypatch.setitem(m, 'SESSION_PATH', str(bindir) + ':/usr/bin:/bin')
     async def run():

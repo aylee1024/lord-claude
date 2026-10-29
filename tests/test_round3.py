@@ -99,7 +99,7 @@ def test_r3_allowed_folders_are_normalized_inside_sender_roots(scope, tool, opti
     d, a, m, work, extra, _ = scope
     (work / 'link-in').symlink_to(extra, target_is_directory=True)
     requested = str(extra) if path == 'extra' else path
-    if tool == 'spawn_agent' and path == 'missing':
+    if path == 'missing':
         assert 'does not exist' in denied(scope, tool=tool, text=f'@{option} {requested}\nwork')
         return
     result, event = invoke(d, a, tool=tool, text=f'@{option} {requested}\nwork')
