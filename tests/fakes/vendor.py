@@ -88,14 +88,16 @@ async def turn(sid, text, request_id=None):
     if FAMILY == 'gpt':
         send({'method': 'turn/started', 'params': {'threadId': sid, 'turn': {'id': tid}}})
         send({'id': request_id, 'result': {'turn': {'id': tid}}})
-        send({'method': 'item/started', 'params': {'threadId': sid, 'item': {'type': 'commandExecution', 'command': 'fake work'}}})
+        if not text.startswith('FORWARD_ROW:'):
+            send({'method': 'item/started', 'params': {'threadId': sid, 'item': {'type': 'commandExecution', 'command': 'fake work'}}})
     elif FAMILY == 'grok':
         update(sid, 'tool_call', toolCallId='native', title='fake work', status='in_progress')
     else:
         # agy reports each tool step twice: when it starts and when it ends.
-        for state in ('ACTIVE', 'DONE'):
-            send({'event': 'step_update', 'step_update': {'step_index': 2, 'state': state, 'step_type': 'tool', 'tool_name': 'run_command',
-                  'tool_info': {'name': 'run_command', 'parameters': {'CommandLine': 'fake work'}}}})
+        if not text.startswith('FORWARD_ROW:'):
+            for state in ('ACTIVE', 'DONE'):
+                send({'event': 'step_update', 'step_update': {'step_index': 2, 'state': state, 'step_type': 'tool', 'tool_name': 'run_command',
+                      'tool_info': {'name': 'run_command', 'parameters': {'CommandLine': 'fake work'}}}})
     if '--signed-out' in sys.argv and FAMILY == 'gpt':
         send({'method': 'error', 'params': {'threadId': sid, 'turnId': tid, 'willRetry': False,
               'error': {'message': 'unexpected status 401 Unauthorized: Missing bearer or basic authentication in header'}}})
@@ -260,6 +262,32 @@ async def turn(sid, text, request_id=None):
                 send({'event': 'step_update', 'step_update': {'step_type': 'agent_response', 'text_delta': 'partial'}})
         await live['wake'].wait()
         answer = live['steer'] or ''
+    elif text.startswith('FORWARD_ROW:'):
+        options = json.loads(text.split(':', 1)[1])
+        name = options['tool']
+        args = {'type': 'general-purpose', 'prompt': 'ping', 'description': 'probe'} if name == 'spawn_agent' else {'to': 'peer', 'text': 'ping'}
+        def step(index, done=False, output=''):
+            ordinary = index == 6
+            if FAMILY == 'gpt':
+                item = {'id': str(index), 'type': 'commandExecution', 'command': 'synthetic work', 'aggregatedOutput': output, 'exitCode': 0} if ordinary else {
+                    'id': str(index), 'type': 'mcpToolCall', 'server': 'lord', 'tool': name, 'arguments': args,
+                    'result': {'content': [{'type': 'text', 'text': output}]}}
+                send({'method': 'item/completed' if done else 'item/started', 'params': {'threadId': sid, 'item': item}})
+            else:
+                tool = 'run_command' if ordinary else 'mcp__lord__' + name
+                parameters = {'CommandLine': 'synthetic work'} if ordinary else args
+                send({'event': 'step_update', 'step_update': {'step_index': index, 'state': 'DONE' if done else 'ACTIVE',
+                      'step_type': 'tool', 'tool_name': tool, 'tool_info': {'name': tool, 'parameters': parameters, 'output': output}}})
+        if options['other']: step(6)
+        step(7)
+        audit(forward_rows_ready=True)
+        while not (DATA / 'forward-release').exists(): await asyncio.sleep(.01)
+        result = await mcp(session['server'], name, args)
+        audit(forward_result=result)
+        while not (DATA / 'forward-finish').exists(): await asyncio.sleep(.01)
+        step(7, True, json.dumps(result))
+        if options['other']: step(6, True, 'ordinary output')
+        answer = json.dumps(result)
     elif text in ('TOOL', 'ERROR_TOOL', 'LIST', 'MESSAGE', 'CLAUDE_TOOL', 'PARALLEL'):
         if text == 'LIST':
             name, args = 'list_agents', {}

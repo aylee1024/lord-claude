@@ -862,6 +862,7 @@ class Agent:
         self.finished = asyncio.Event()
         self.finished.set()
         self.calls, self.items, self.total = {}, {}, record.get('total', {})
+        self.tool_ready = asyncio.Event()
         self.effort = record.get('effort', 'high')
         self.turn_id, self.answer, self.tokens = None, '', usage({})
         self.cancel_requested, self.turn_task = False, None
@@ -2268,6 +2269,7 @@ class Daemon:
         a.calls[call], a.call_data[call] = future, (tool, data)
         a.state = 'waiting_tool'
         a.emit('tool', callId=call, name=tool, input=data)
+        a.tool_ready.set()
         try: return await future
         finally: a.calls.pop(call, None); a.call_data.pop(call, None)
 
@@ -2318,10 +2320,21 @@ class Daemon:
                     raise ValueError('lord tool call from an unknown process')
                 return await self.mcp_call(a, body['name'], body.get('arguments', {}), body.get('token'))
             elif path == '/row':
-                # Answers once the vendor reports the step finished, or the turn ends.
                 future = a.rows.get(body.get('rowId'))
                 if future is None: raise ValueError('No such step')
-                return await asyncio.shield(future)
+                # A Lord call may be inside this step or beside it; its caller runs it before waiting again.
+                while not future.done():
+                    a.tool_ready.clear()
+                    for call, pending in a.calls.items():
+                        if not pending.done():
+                            tool, data = a.call_data[call]
+                            return {'tool': {'callId': call, 'name': tool, 'input': data}}
+                    ready = asyncio.create_task(a.tool_ready.wait())
+                    try: await asyncio.wait((future, ready), return_when=asyncio.FIRST_COMPLETED)
+                    finally:
+                        ready.cancel()
+                        await asyncio.gather(ready, return_exceptions=True)
+                return future.result()
             elif path == '/steer':
                 steered = a.family == 'gpt' and a.state in ('running', 'waiting_tool') and bool(a.turn_id)
                 # A message asking for @readonly goes into the running turn only if that turn already runs read-only;
@@ -2414,6 +2427,9 @@ class Daemon:
                                     if pending.done() and not pending.cancelled(): a.carry.insert(0, pending.result())
                                     break
                                 event, pending = pending.result(), None
+                            if event['type'] == 'tool':
+                                call = a.calls.get(event['callId'])
+                                if call is None or call.done(): continue
                             if event['type'] in ('done', 'error') and a.followup:
                                 body, a.followup = a.followup, None
                                 result = event['text'] if event['type'] == 'done' else 'It failed: ' + event['message']

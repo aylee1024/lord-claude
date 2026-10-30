@@ -895,9 +895,12 @@ export const register: Register = on => {
   on('tool.call', { tool: ['Bash', ...stepTools] }, async ($, e, next) => {
     const agent = e.agentId ? await lordAgent($, e.agentId) : undefined
     if (agent && agent.row === e.tool_use_id) {
-      // The vendor ran this step itself; its row waits for the vendor's report that the step finished.
+      // The display yields to a Lord call while the vendor step keeps running.
       let row: { output?: string; stopped?: boolean } | undefined
-      try { for await (const value of events($, '/row', { agentId: e.agentId, rowId: e.tool_use_id }, await daemonOf($, agent))) row = value }
+      try {
+        for await (const value of events($, '/row', { agentId: e.agentId, rowId: e.tool_use_id }, await daemonOf($, agent)))
+          row = value.tool ? { output: 'Continued in the background while a Lord call runs.', stopped: false } : value
+      }
       catch (error) { row = { output: errorLine(error), stopped: true } }
       delete agent.row
       await keep($, e.agentId!)
