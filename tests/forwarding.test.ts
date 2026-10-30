@@ -11,7 +11,7 @@ function harness(on: On, family: string, failed = false) {
     const version = (state.get(`${e.key}/${e.id}`)?.version ?? 0) + 1
     state.set(`${e.key}/${e.id}`, { value: e.value, version }); return { value: { isSet: true, version } } as any
   })
-  on('fs.read', () => ({ deny: 'absent' }))
+  on('fs.read', (_, e) => e.path.endsWith('/.claude-plugin/plugin.json') ? { value: JSON.stringify({ version: '2.2.6' }) } : { deny: 'absent' })
   on('agent.list', () => ({ value: [] }))
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('session.messages', () => ({ value: [] }))
@@ -20,7 +20,7 @@ function harness(on: On, family: string, failed = false) {
   on('http.fetch', (_, e) => {
     const path = e.url.replace('http://lord', '')
     if (path === '/tool_result') accepted.push(JSON.parse(e.init!.body!))
-    return { value: { ok: true, status: 200, headers: {}, text: JSON.stringify(path === '/agents' ? [] : { ok: true }) } }
+    return { value: { ok: true, status: 200, headers: {}, text: JSON.stringify(path === '/agents' ? [] : { ok: true, ...(path === '/health' ? { version: '2.2.6' } : {}) }) } }
   })
   on('turn.step', async function* () { throw new Error('Lord fell through to a model') })
   return { calls, accepted, requests }

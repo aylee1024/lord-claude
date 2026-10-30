@@ -847,6 +847,23 @@ export const register: Register = on => {
   })
 
   on('tool.call', { tool: ['Agent', 'SendMessage', 'StructuredOutput', HANDBACK] }, async ($, e, next) => {
+    const agent = e.agentId ? await lordAgent($, e.agentId) : undefined
+    if (agent && ['Agent', 'SendMessage'].includes(e.tool) && (pending.get(e.tool_use_id) === e.agentId || agent.call === e.tool_use_id)) {
+      let expected: string | undefined, refusal: string | undefined
+      try {
+        expected = await version($)
+        const running = JSON.parse(await request($, '/health', undefined, await daemonOf($, agent))).version
+        if (!expected || running !== expected) refusal = `lord: cannot forward ${e.tool} from daemon ${running ?? 'unknown'}: this plugin is ${expected ?? 'unknown'}; launch or message the agent from this session instead`
+      } catch (error) { refusal = `lord: cannot forward ${e.tool}: daemon version could not be verified for plugin ${expected ?? 'unknown'} (${errorLine(error)})` }
+      if (refusal) {
+        pending.delete(e.tool_use_id)
+        delete agent.call
+        try { await request($, '/tool_result', { agentId: e.agentId, callId: e.tool_use_id, text: refusal, isError: true }, await daemonOf($, agent)) }
+        catch (error) { agent.error = errorLine(error) }
+        await keep($, e.agentId!)
+        return { result: refusal, text: refusal, isError: true } as any
+      }
+    }
     // A named Agent call starts an agent-team teammate in its own Claude process, whose turns no Lord hook answers.
     if (e.tool === 'Agent' && String((e as any).subagent_type ?? '').startsWith('lord:') && (e as any).name)
       return { deny: `lord agents cannot be named: a named Agent call starts a separate Claude process instead of ${String((e as any).subagent_type).slice(5)}. Launch it without name and message it by the agent id the launch returns.` }
@@ -870,7 +887,6 @@ export const register: Register = on => {
     const sent = e.tool === 'SendMessage' && typeof input.to === 'string' && typeof input.message === 'string' ? await message($, input.to, input.message) : undefined
     // A message a Lord agent's own vendor sent still reports its result to that vendor below.
     const r: any = sent ? { result: { success: true, message: sent } } : await next(call)
-    const agent = e.agentId ? await lordAgent($, e.agentId) : undefined
     if (e.tool === HANDBACK) {
       if (agent?.handback === 'sent') {
         agent.handback = r.isError || r.deny ? { isError: true, text: String(r.text ?? r.deny ?? '') } : 'done'

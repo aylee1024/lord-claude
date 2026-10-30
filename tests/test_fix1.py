@@ -147,6 +147,7 @@ def test_fix1_fake_tool_commands_inherit_marker_and_close(rig, family):
 @pytest.mark.parametrize('family', ['grok', 'gemini'])
 def test_fix1_memory_warning_does_not_queue_or_replace_answer(tmp_path, monkeypatch, family):
     m = load('fix1_memory_warning')
+    m.HOME.mkdir(parents=True, exist_ok=True)
     async def scenario():
         d = object.__new__(m.Daemon); d.config = {'idle_exit_s': 600, family: {}}; d.tasks = set(); logged = []
         d.log = logged.append; d.redact = str

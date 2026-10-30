@@ -3,7 +3,7 @@
 import argparse
 import asyncio
 import ctypes
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import datetime, timezone, timedelta
 import fcntl
 import hashlib
@@ -48,6 +48,24 @@ VENDOR_LIMIT = 256 * 1024 * 1024
 MEMORY_CEILING_KB = 24 * 1024 * 1024
 # A row's output as Claude Code keeps it: the end of what the step printed, where errors land.
 ROW_OUTPUT = 2000
+
+def home_identity():
+    try: info = HOME.stat()
+    except OSError: return None
+    return (info.st_dev, info.st_ino) if stat.S_ISDIR(info.st_mode) else None
+
+def home_folder(path, identity):
+    # Only bootstrap creates HOME; later writes can create children of that same directory.
+    if identity is None or home_identity() != identity: return False
+    folder = HOME
+    try:
+        for part in path.relative_to(HOME).parts:
+            folder = folder / part
+            folder.mkdir(mode=0o700, exist_ok=True)
+    except OSError:
+        if home_identity() == identity: raise
+        return False
+    return home_identity() == identity
 EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max']
 RANKS = ['minimal', *EFFORTS, 'ultra']
 def agent_access(a, current=False):
@@ -95,8 +113,10 @@ def live_search(config):
 CODEX_SHARED = ('auth.json', 'config.toml', 'AGENTS.md', 'AGENTS.override.md', '.env', 'agents', 'skills', 'plugins', 'rules',
                 'mcp-oauth-locks')
 
-def codex_home_ready(home, source):
-    home.mkdir(mode=0o700, parents=True, exist_ok=True)
+def codex_home_ready(home, source, identity=None):
+    if home == HOME or HOME in home.parents:
+        if not home_folder(home, identity or home_identity()): raise FileNotFoundError('Lord home disappeared or was replaced')
+    else: home.mkdir(mode=0o700, parents=True, exist_ok=True)
     (source / 'mcp-oauth-locks').mkdir(exist_ok=True)
     for name in CODEX_SHARED:
         # codex makes skills/.system at start, so a start before the user had skills leaves a folder of codex's own.
@@ -852,9 +872,10 @@ READS_LIMIT = 4 * 1024 * 1024
 READS_FULL = '[the read list stopped at 4 MB; later reads are in the activity log]'
 
 class Agent:
-    def __init__(self, record):
+    def __init__(self, record, home_id=None):
         self.record = record
         self.__dict__.update(record)
+        self.home_id = home_id or home_identity()
         self.vendorSession = record.get('vendorSession')
         self.state, self.activity, self.generation = 'idle', '', 0
         self.turn_epoch, self.opened, self.process_births = object(), False, {}
@@ -892,7 +913,7 @@ class Agent:
 
     def read_paths(self, found, helper=None):
         # Each path once, in the order first seen, so a reviewer can show what the agent and its helpers read.
-        if not found: return
+        if not found or not home_folder(self.reads_path.parent, self.home_id): return
         if self.reads is None:
             try: self.reads = set(self.reads_path.read_text(encoding='utf-8').splitlines())
             except OSError: self.reads = set()
@@ -916,12 +937,11 @@ class Agent:
                 break
             written.append(line)
             size += len(line.encode())
-        self.reads_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         with self.reads_path.open('a', encoding='utf-8') as file: file.write(''.join(written))
 
     def note(self, text):
         # The agent's activity log: what the vendor ran and read, for review provenance.
-        self.log_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not home_folder(self.log_path.parent, self.home_id): return
         # At 4 MB the log moves to <agentId>.log.1 (one earlier generation), so its newest records are always written.
         if self.log_path.exists() and self.log_path.stat().st_size >= 4 * 1024 * 1024: self.log_path.replace(self.log_path.with_suffix('.log.1'))
         # One line per record, so every line starts with its time: a multi-line command reads as one line.
@@ -945,6 +965,7 @@ class Agent:
         future.set_result({'output': text, 'stopped': stopped})
 
     def write_record(self, settings, turns=None, helpers=None):
+        if not home_folder(self.record_path.parent, self.home_id): return
         if turns is None or helpers is None:
             try: saved = json.loads(self.record_path.read_text(encoding='utf-8'))
             except (OSError, ValueError): saved = {}
@@ -956,7 +977,6 @@ class Agent:
                     **{k: v for k, v in settings.items() if k != 'codex_folder'}, 'vendorSession': self.vendorSession,
                     'transcript': transcript_path(self.family, self.vendorSession, self.cwd, settings.get('codex_folder')),
                     'helpers': helpers, 'turns': turns}
-        self.record_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         scratch = self.record_path.with_name(self.record_path.name + '.tmp')
         scratch.write_text(dumps(document) + '\n', encoding='utf-8')
         scratch.replace(self.record_path)
@@ -1000,12 +1020,12 @@ class Agent:
         # Only the helpers the kept turns name, in the order they started, so the record stays as bounded as its turns.
         named = dict.fromkeys(t for k in kept for t in (k.get('helpers') if isinstance(k.get('helpers'), list) else []) if isinstance(t, str))
         try:
-            if text and text.strip():
-                self.answers_path.mkdir(parents=True, exist_ok=True, mode=0o700)
-                answer.write_text(REDACT(text), encoding='utf-8')
-            # Every turn advances the number, so removing the answer 100 turns back keeps only the recorded turns'.
-            (self.answers_path / f'{number - 100}.md').unlink(missing_ok=True)
-            self.write_record(settings, kept, [self.helpers[t] for t in named if t in self.helpers])
+            if home_folder(self.record_path.parent, self.home_id):
+                if text and text.strip() and home_folder(self.answers_path, self.home_id):
+                    answer.write_text(REDACT(text), encoding='utf-8')
+                # Every turn advances the number, so removing the answer 100 turns back keeps only the recorded turns'.
+                (self.answers_path / f'{number - 100}.md').unlink(missing_ok=True)
+                self.write_record(settings, kept, [self.helpers[t] for t in named if t in self.helpers])
         except OSError: pass
         helpers = [h.get('model') or '?' for h in mine]
         return {'ended_how': how, 'model': self.model, 'effort': self.effort, 'started': turn['started'], 'ended': ended,
@@ -1040,10 +1060,9 @@ class Agent:
             for future in self.rows.values():
                 if not future.done(): future.set_result({'output': '', 'stopped': kind == 'error'})
         self.events.put_nowait({'type': kind, **value})
-        if kind == 'done' and value['text'].strip():
+        if kind == 'done' and value['text'].strip() and home_folder(self.answer_path.parent, self.home_id):
             # The latest turn's final answer, kept beside the activity log, so a read-only agent's findings
             # still land in a file.
-            self.answer_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             self.answer_path.write_text(REDACT(value['text']), encoding='utf-8')
 
 class Vendor:
@@ -1104,7 +1123,7 @@ class Vendor:
                 if reason := codex_home_unshareable(self.d.user_codex_home):
                     fix = 'run `codex login`' if reason.endswith('cannot be shared)') else 'undo that'
                     raise RuntimeError(f"Lord's codex folder can no longer share your codex setup: {reason}. This agent's conversation is in {home}; {fix} and it resumes, or start a new agent to keep the change")
-                codex_home_ready(Path(home), self.d.user_codex_home)
+                codex_home_ready(Path(home), self.d.user_codex_home, getattr(self.d, 'home_id', None))
                 env['CODEX_HOME'] = home
                 # codex would keep its thread database in this folder instead, which may be the user's.
                 env.pop('CODEX_SQLITE_HOME', None)
@@ -1477,6 +1496,7 @@ class Daemon:
     def __init__(self):
         HOME.mkdir(parents=True, exist_ok=True, mode=0o700)
         HOME.chmod(0o700)
+        self.home_id = home_identity()
         self.config = load_config()
         self.agents, self.vendors, self.tasks, self.connections = {}, {}, set(), set()
         self.redact, self.stopping, self.last_request = Redactor(), False, time.monotonic()
@@ -1497,7 +1517,13 @@ class Daemon:
         found = self.records(self.journal if self.journal.exists() else self.legacy_journal)
         # A first journal starts with every earlier record, so the next rewrite keeps them.
         if not self.journal.exists(): self.touched = set(found)
-        for aid, record in found.items(): self.agents[aid] = Agent(record)
+        for aid, record in found.items(): self.agents[aid] = Agent(record, getattr(self, 'home_id', None))
+
+    def home_live(self):
+        current = home_identity()
+        valid = current is not None and current == getattr(self, 'home_id', current)
+        if not valid and (stop := getattr(self, 'stop_event', None)) is not None: stop.set()
+        return valid
 
     def records(self, *paths):
         # The newest record of each agent: later lines, and later files, replace earlier ones.
@@ -1519,22 +1545,27 @@ class Daemon:
         for key in [aid] if aid else list(found):
             record, a = found.get(key), self.agents.get(key)
             if record is None or key in self.pruned: continue
-            if a is None: self.agents[key] = Agent(record)
+            if a is None: self.agents[key] = Agent(record, getattr(self, 'home_id', None))
             elif aid and record.get('used', '') > a.record.get('used', '') and a.state in ('idle', 'closed') and not a.stream_lock.locked():
                 v = self.vendors.get(key)
-                if not (v and v.process and v.process.returncode is None): self.agents[key] = Agent(record)
+                if not (v and v.process and v.process.returncode is None): self.agents[key] = Agent(record, getattr(self, 'home_id', None))
 
     @contextmanager
     def journal_lock(self):
+        if not self.home_live(): raise FileNotFoundError('Lord home disappeared or was replaced')
         with (HOME / 'journal.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             yield
 
     def log(self, text):
+        if not self.home_live(): return
         path = HOME / 'lordd.log'
         line = f'{datetime.now(timezone.utc).isoformat()} {self.redact(str(text)[:16384]).strip()[:8192]}\n'
-        if path.exists() and path.stat().st_size + len(line.encode()) > 1024 * 1024: path.replace(HOME / 'lordd.log.1')
-        with path.open('a', encoding='utf-8') as file: file.write(line)
+        try:
+            if path.exists() and path.stat().st_size + len(line.encode()) > 1024 * 1024: path.replace(HOME / 'lordd.log.1')
+            with path.open('a', encoding='utf-8') as file: file.write(line)
+        except OSError:
+            if self.home_live(): raise
 
     def task(self, coroutine):
         task = asyncio.create_task(coroutine)
@@ -1585,7 +1616,7 @@ class Daemon:
         record = dict(known.record) if known else {'agentId': aid, 'family': body.get('family', 'gpt'),
             'cwd': body.get('cwd', ''), 'model': body.get('model') or self.config.get(body.get('family', 'gpt'), {}).get('model', 'unknown'),
             'effort': body.get('effort') or 'high'}
-        a = Agent(record)
+        a = Agent(record, getattr(self, 'home_id', None))
         a.turn_started = datetime.now(timezone.utc).isoformat(timespec='seconds')
         try: a.settings = self.settings(a)
         except (ValueError, TypeError, KeyError): pass
@@ -1611,7 +1642,7 @@ class Daemon:
                               nosandbox=saved['family'] == 'gpt' and (saved.get('sandbox') == 'none' or bool(saved.get('nosandbox'))),
                               tests=saved.get('sandbox') == 'tests' or bool(saved.get('tests')),
                               net=bool(saved.get('network') or saved.get('net')), nosearch=saved.get('web_search') == 'off' or bool(saved.get('nosearch')))
-                a = Agent(record)
+                a = Agent(record, getattr(self, 'home_id', None))
                 self.agents[aid] = a
                 self.save(a)
                 a.restored = True
@@ -1693,6 +1724,7 @@ class Daemon:
 
     def server(self, a):
         env = {'LORD_HOME': str(HOME), 'LORD_DAEMON_SOCKET': str(SOCKET), 'LORD_MCP_TOKEN': a.token, **({'LORD_READONLY': '1'} if a.record.get('readonly') else {})}
+        env['LORD_SANDBOXED'] = '1' if agent_access(a)['sandbox'] != 'none' else '0'
         return {'name': 'lord', 'command': sys.executable, 'args': [str(HERE), '--mcp', a.agentId], 'env': env}
 
     async def attach(self, a):
@@ -1910,7 +1942,7 @@ class Daemon:
             a = Agent({**{k: body[k] for k in ('readonly', 'net', 'nosandbox', 'tests', 'nosearch') if k in body}, 'agentId': aid,
                 **({'codexHome': str(HOME / 'codex')} if own else {}),
                 'family': family, 'cwd': cwd, 'model': body.get('model') or config['model'],
-                'effort': body.get('effort') or config['effort'], 'created': datetime.now(timezone.utc).isoformat()})
+                'effort': body.get('effort') or config['effort'], 'created': datetime.now(timezone.utc).isoformat()}, getattr(self, 'home_id', None))
             # Until this first /open succeeds, a model nobody named may give way to the vendor's own default.
             a.default_model = not body.get('model')
             await self.effort(a)
@@ -2270,6 +2302,7 @@ class Daemon:
         a.state = 'waiting_tool'
         a.emit('tool', callId=call, name=tool, input=data)
         a.tool_ready.set()
+        a.tool_ready = asyncio.Event()
         try: return await future
         finally: a.calls.pop(call, None); a.call_data.pop(call, None)
 
@@ -2324,12 +2357,12 @@ class Daemon:
                 if future is None: raise ValueError('No such step')
                 # A Lord call may be inside this step or beside it; its caller runs it before waiting again.
                 while not future.done():
-                    a.tool_ready.clear()
+                    notification = a.tool_ready
                     for call, pending in a.calls.items():
                         if not pending.done():
                             tool, data = a.call_data[call]
                             return {'tool': {'callId': call, 'name': tool, 'input': data}}
-                    ready = asyncio.create_task(a.tool_ready.wait())
+                    ready = asyncio.create_task(notification.wait())
                     try: await asyncio.wait((future, ready), return_when=asyncio.FIRST_COMPLETED)
                     finally:
                         ready.cancel()
@@ -2488,7 +2521,7 @@ class Daemon:
         pruned = time.monotonic()
         while not self.stopping:
             await asyncio.sleep(min(1, max(.05, self.config['idle_exit_s'] / 4)))
-            if not HOME.is_dir():
+            if not self.home_live():
                 self.stop_event.set()
                 return
             now = time.monotonic()
@@ -2559,11 +2592,15 @@ class Daemon:
     async def prune_locked(self, days):
         if not isinstance(days, (int, float)) or days < 0: raise ValueError('days must be nonnegative')
         await self.refresh_jobs()
-        with self.journal_lock():
-            for name in ('launches', 'messages'):
-                path = HOME / name
-                if path.is_symlink(): path.unlink()
-                elif path.exists(): shutil.rmtree(path)
+        if not await others_answering():
+            with self.journal_lock():
+                for name in ('launches', 'messages'):
+                    path = HOME / name
+                    try:
+                        if path.is_symlink(): path.unlink()
+                        elif path.exists(): shutil.rmtree(path)
+                    except OSError as error:
+                        with suppress(Exception): self.log(f'legacy {name} not removed: {error}')
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         removed = []
         for aid, a in list(self.agents.items()):
@@ -2633,10 +2670,14 @@ class Daemon:
 
     async def close(self):
         self.stopping = True
-        for a in self.agents.values(): a.emit('error', message='Daemon shutting down', retryable=True)
+        for a in self.agents.values():
+            try: a.emit('error', message='Daemon shutting down', retryable=True)
+            except Exception as error:
+                with suppress(Exception): self.log(f'{a.agentId}: shutdown notice not written: {error}')
         restored = [a for a in self.agents.values() if a.agentId not in self.vendors]
         try: await self.refresh_jobs(restored)
-        except Exception as error: self.log(f'job lookup before shutdown failed: {error}')
+        except Exception as error:
+            with suppress(Exception): self.log(f'job lookup before shutdown failed: {error}')
         for a in restored:
             if a.jobs: self.backend(a)
         await asyncio.gather(*(v.close() for v in self.vendors.values()), return_exceptions=True)
@@ -2656,6 +2697,7 @@ class Daemon:
         for writer in list(self.connections): writer.close()
 
     async def serve(self):
+        if not self.home_live(): return
         lock = SOCKET.with_suffix('.lock').open('a')
         # A daemon that is shutting down holds the lock for a moment after it stops answering; this one waits for it
         # and takes over, so a turn that starts during that moment still finds a daemon.
@@ -2699,7 +2741,7 @@ class Daemon:
             if server: server.close()
             await self.close()
             if server: await server.wait_closed()
-            if bound: SOCKET.unlink(missing_ok=True)
+            if bound and self.home_live(): SOCKET.unlink(missing_ok=True)
             lock.close()
 
 async def answering(path=None):
@@ -2745,7 +2787,8 @@ async def mcp(agent_id):
     # A vendor started by a daemon from before 2.0.18 carries no socket path; that daemon is on the old socket.
     if not os.environ.get('LORD_DAEMON_SOCKET'): SOCKET = LEGACY_SOCKET
     agent_id = agent_id or os.environ.get('LORD_AGENT_ID')
-    token, readonly = os.environ.get('LORD_MCP_TOKEN'), os.environ.get('LORD_READONLY') == '1'
+    token = os.environ.get('LORD_MCP_TOKEN')
+    confined = os.environ.get('LORD_READONLY') == '1' or os.environ.get('LORD_SANDBOXED') == '1'
     redact = Redactor()
     async def respond(value):
         if 'id' not in value: return
@@ -2756,7 +2799,7 @@ async def mcp(agent_id):
                           'capabilities': {'tools': {}}, 'serverInfo': {'name': 'lord', 'version': VERSION}}
             elif method == 'ping': result = {}
             elif method == 'tools/list':
-                result = {'tools': [] if not agent_id else [t for t in TOOLS if t['name'] == 'list_agents'] if readonly else TOOLS}
+                result = {'tools': [] if not agent_id else [t for t in TOOLS if t['name'] == 'list_agents'] if confined else TOOLS}
             elif method == 'tools/call':
                 result = await relay('/mcp', {'agentId': agent_id, 'name': params['name'], 'arguments': params.get('arguments', {}), 'token': token})
             else: raise ValueError('Unknown MCP method')
@@ -2782,11 +2825,12 @@ def main():
     args = parser.parse_args()
     os.umask(0o077)
     # A neutral working folder: never the agent's tree, which a worktree's removal must find unused.
-    HOME.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chdir(HOME)
     if args.mcp is not None:
+        os.chdir(HOME if HOME.is_dir() else Path.home())
         asyncio.run(mcp(args.mcp))
         return
+    HOME.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chdir(HOME)
     if args.daemon:
         # A broken settings file is reported to the starting process; after the fork nothing can see it.
         try: load_config()

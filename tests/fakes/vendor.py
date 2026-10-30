@@ -52,7 +52,7 @@ def update(sid, kind, **value):
           'update': {'sessionUpdate': kind, **value}}})
 
 
-async def mcp(server, name, arguments):
+async def mcp(server, name, arguments, listing=False):
     # codex starts a tool server with a fixed list of its own variables plus the server's env, nothing else.
     env = {k: v for k, v in os.environ.items() if k in ('HOME', 'LOGNAME', 'PATH', 'SHELL', 'USER', 'LANG', 'LC_ALL', 'TERM', 'TMPDIR', 'TZ')} if FAMILY == 'gpt' else os.environ.copy()
     extra = server.get('env', {})
@@ -71,7 +71,10 @@ async def mcp(server, name, arguments):
     try:
         await rpc(1, 'initialize', {'protocolVersion': '2024-11-05', 'capabilities': {}, 'clientInfo': {'name': 'fake', 'version': '1'}})
         tools = await rpc(2, 'tools/list', {})
-        assert {t['name'] for t in tools['tools']} == {'spawn_agent', 'send_message', 'list_agents'}
+        if listing: return tools
+        confined = env.get('LORD_READONLY') == '1' or env.get('LORD_SANDBOXED') == '1'
+        expected = {'list_agents'} if confined else {'spawn_agent', 'send_message', 'list_agents'}
+        assert {t['name'] for t in tools['tools']} == expected
         result = await rpc(3, 'tools/call', {'name': name, 'arguments': arguments})
         return result
     finally:
@@ -262,6 +265,18 @@ async def turn(sid, text, request_id=None):
                 send({'event': 'step_update', 'step_update': {'step_type': 'agent_response', 'text_delta': 'partial'}})
         await live['wake'].wait()
         answer = live['steer'] or ''
+    elif text == 'STEP_WAIT':
+        audit(stepping=True)
+        index = 0
+        while not live['cancel']:
+            item = {'type': 'commandExecution', 'id': f'step-{index}', 'command': 'synthetic step'}
+            send({'method': 'item/started', 'params': {'threadId': sid, 'item': item}})
+            send({'method': 'item/completed', 'params': {'threadId': sid, 'item': {**item, 'aggregatedOutput': 'step', 'exitCode': 0}}})
+            index += 1
+            await asyncio.sleep(.01)
+        answer = ''
+    elif text == 'CATALOG':
+        answer = json.dumps(await mcp(session['server'], '', {}, listing=True))
     elif text.startswith('FORWARD_ROW:'):
         options = json.loads(text.split(':', 1)[1])
         name = options['tool']
@@ -438,7 +453,9 @@ async def handle(value):
             send({'id': rid, 'error': {'message': 'conversation not found'}})
             return
         load(sid)
-        if FAMILY == 'gpt': SESSIONS[sid]['shell_set'] = p.get('config', {}).get('shell_environment_policy', {}).get('set', {})
+        if FAMILY == 'gpt':
+            SESSIONS[sid]['shell_set'] = p.get('config', {}).get('shell_environment_policy', {}).get('set', {})
+            SESSIONS[sid]['server'] = p['config']['mcp_servers']['lord']
         result = {'thread': {'id': sid}} if FAMILY == 'gpt' else {'sessionId': sid}
         if FAMILY == 'gpt' and '--large-resume' in sys.argv: result['history'] = 'x' * (40 * 1024 * 1024)
         if FAMILY == 'grok':

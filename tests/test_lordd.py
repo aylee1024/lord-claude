@@ -2434,6 +2434,7 @@ def test_messages_queued_one_after_another_keep_every_result(rig):
 
 def test_answer_files_stay_within_the_last_100_turns_whatever_turns_are_empty(tmp_path):
     m = load('lordd_answers')
+    m.HOME.mkdir(parents=True, exist_ok=True)
     a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6.1-sol'})
     a.state = 'running'
     for n in range(300):
@@ -2503,6 +2504,7 @@ def test_a_malformed_record_or_allowance_file_never_stops_a_turn(tmp_path):
 
 def test_the_read_list_stops_growing_at_its_limit(tmp_path):
     m = load('lordd_reads_limit')
+    m.HOME.mkdir(parents=True, exist_ok=True)
     m.READS_LIMIT = 60
     a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6.1-sol'})
     for n in range(10): a.read_paths([('read', f'/w/file{n}.py')])
@@ -2514,6 +2516,7 @@ def test_the_read_list_stops_growing_at_its_limit(tmp_path):
 
 def test_the_mcp_helper_runs_from_lords_folder(tmp_path):
     home = tmp_path / 'lord-home'
+    home.mkdir()
     proc = subprocess.Popen([PYTHON, str(DAEMON), '--mcp', 'a'], cwd=str(ROOT), stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                             env={**os.environ, 'LORD_HOME': str(home), 'LORD_DAEMON_SOCKET': str(home / 'x.sock')})
     try:
@@ -2604,6 +2607,7 @@ def test_a_usage_limit_is_refused_until_the_reset_of_the_models_own_bucket():
 
 def test_one_large_batch_of_reads_stops_at_the_limit():
     m = load('lordd_reads_batch')
+    m.HOME.mkdir(parents=True, exist_ok=True)
     m.READS_LIMIT = 100
     a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6.1-sol'})
     a.read_paths([('read', f'/w/{"x" * 20}{n}.py') for n in range(10)])
@@ -2714,6 +2718,7 @@ def test_a_pending_retry_ends_with_its_turn_and_never_reaches_a_later_one(monkey
 
 def test_a_restarted_daemon_keeps_the_helpers_its_record_names(tmp_path):
     m = load('lordd_helpers_kept')
+    m.HOME.mkdir(parents=True, exist_ok=True)
     a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6.1-sol'})
     a.state, a.turn_started = 'running', '2026-01-01T00:00:00+00:00'
     m.helper_seen(a, {'type': 'subAgentActivity', 'agentThreadId': 'child', 'agentPath': '/root/x', 'model': 'gpt-6-luna'})
@@ -2727,6 +2732,7 @@ def test_a_restarted_daemon_keeps_the_helpers_its_record_names(tmp_path):
 
 def test_the_record_keeps_only_the_helpers_its_kept_turns_name():
     m = load('lordd_helpers_bounded')
+    m.HOME.mkdir(parents=True, exist_ok=True)
     for n in range(102):
         a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '.', 'model': 'gpt-6.1-sol'})
         started = time.strftime('%Y-%m-%dT%H:%M:%S+00:00', time.gmtime(1767225600 + 60 * n))
@@ -3292,6 +3298,7 @@ def test_tests_refuses_unsafe_layout_at_open_and_start(tests_backend, rig, monke
             home.mkdir(parents=True)
             m['HOME'] = home
             d.journal, d.legacy_journal = home / 'journal.jsonl', home / 'sessions.jsonl'
+            d.home_id = m['home_identity']()
             body = {'agentId': 'a', 'family': 'gpt', 'cwd': str(work), 'dirs': [str(extra)]}
             addition = rig.home / 'addition'; addition.mkdir()
             v = None
@@ -3496,6 +3503,7 @@ def test_tests_top_level_aliases_and_default_layout_are_accepted(tests_backend, 
             work = user / 'project'; work.mkdir(parents=True)
             m['HOME'] = home
             d.journal, d.legacy_journal = home / 'journal.jsonl', home / 'sessions.jsonl'
+            d.home_id = m['home_identity']()
             real_temp = Path('/private/var/tmp' if alias == '/var' else '/private/tmp')
             logical = '/var/tmp' if alias == '/var' else '/tmp'
             monkeypatch.setenv('TMPDIR', logical)
@@ -4338,6 +4346,7 @@ def test_v225_tests_symlink_roots_resolve_at_launch(tests_backend, rig, root):
 
 def test_v225_shell_reads_parse_real_multiline_text_and_deduplicate():
     m = load('lordd_v225_shell')
+    m.HOME.mkdir(parents=True, exist_ok=True)
     a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '/tmp/x', 'model': 'gpt-6.1-sol'})
     item = {'type': 'commandExecution', 'cwd': '/tmp/x', 'command': '/bin/zsh -lc \'cat a\ncat "b c"; head -n 2 d && tail -5 e || sed -n "1,5p" f | nl g; wc -l h; rg -n "pat" i; grep -e "pat" j; less k; cat a\'', 'commandActions': [{'type': 'read', 'path': 'a'}]}
     a.read_paths(m.codex_reads(item))
@@ -4471,6 +4480,7 @@ def test_v225_restore_missing_vendor_session_refuses_visibly(rig):
 
 def test_v225_shell_reads_deduplicate_across_commands():
     m = load('lordd_v225_reads_again')
+    m.HOME.mkdir(parents=True, exist_ok=True)
     a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '/tmp/x', 'model': 'gpt-6.1-sol'})
     a.read_paths([('read', '/tmp/x/a')])
     a.read_paths([('shell', '/tmp/x/a'), ('shell', '/tmp/x/b'), ('shell', '/tmp/x/b')])
