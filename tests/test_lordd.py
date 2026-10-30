@@ -185,18 +185,13 @@ def test_open_stream_done_permissions_and_usage(rig, family):
     assert 'fake-bearer-value' not in (rig.home / 'lordd.log').read_text()
 
 
-@pytest.mark.parametrize('family', ['gpt', 'grok'])
+@pytest.mark.parametrize('family', ['gpt', 'gemini'])
 @pytest.mark.parametrize('prompt,name', [('TOOL', 'Agent'), ('MESSAGE', 'SendMessage'), ('ERROR_TOOL', 'Agent'), ('CLAUDE_TOOL', 'Agent')])
 def test_mcp_tool_result_continue(rig, family, prompt, name):
-    rig.open(family, **({'nosandbox': True} if family == 'gpt' and prompt == 'CLAUDE_TOOL' else {}))
+    rig.open(family, **({'nosandbox': True} if family == 'gpt' else {}))
     if prompt == 'MESSAGE': rig.open('gpt', agent='friend')
     events = rig.turn(prompt)
     event = events[-1]
-    if family == 'grok' and prompt == 'CLAUDE_TOOL':
-        assert event['type'] == 'done' and not any(e['type'] == 'tool' for e in events)
-        result = json.loads(event['text'])
-        assert result['isError'] is True and 'general-purpose' in result['content'][0]['text']
-        return
     assert event['type'] == 'tool' and event['name'] == name
     assert not any(e['type'] == 'done' for e in events)
     assert rig.request('/agents')[0]['state'] == 'waiting_tool'
@@ -505,9 +500,9 @@ def test_redactor_and_environment_scrub_without_credentials(rig, monkeypatch):
     assert not {'HARNESS_API_KEY', 'ANTHROPIC_BASE_URL', 'SNEAKY', 'GROK_API_KEY', 'LORD_SECRET'} & set(env)
 
 
-@pytest.mark.parametrize('family', ['gpt', 'grok'])
+@pytest.mark.parametrize('family', ['gpt', 'gemini'])
 def test_parallel_mcp_calls_are_delivered_in_order(rig, family):
-    rig.open(family)
+    rig.open(family, **({'nosandbox': True} if family == 'gpt' else {}))
     first = rig.turn('PARALLEL')[-1]
     assert first['type'] == 'tool'
     rig.request('/tool_result', {'agentId': 'a', 'callId': first['callId'], 'text': 'first', 'isError': False})
@@ -519,9 +514,9 @@ def test_parallel_mcp_calls_are_delivered_in_order(rig, family):
     assert completed['type'] == 'done' and 'first' in completed['text'] and 'second' in completed['text']
 
 
-@pytest.mark.parametrize('family', ['gpt', 'grok'])
+@pytest.mark.parametrize('family', ['gpt', 'gemini'])
 def test_interrupt_pending_mcp_keeps_other_turn_alive(rig, family):
-    rig.open(family, agent='a'); rig.open(family, agent='b')
+    rig.open(family, agent='a', **({'nosandbox': True} if family == 'gpt' else {})); rig.open(family, agent='b')
     other = rig.stream('/turn', {'agentId': 'b', 'text': 'SLOW'})
     assert next(other)['type'] == 'activity'
     assert rig.turn('TOOL')[-1]['type'] == 'tool'
@@ -726,7 +721,7 @@ def test_interrupt_before_grok_prompt_is_dispatched(rig, monkeypatch):
 
 
 def test_steer_reaches_codex_while_waiting_for_lord_tool(rig):
-    rig.open('gpt')
+    rig.open('gpt', nosandbox=True)
     tool = rig.turn('TOOL')[-1]
     assert rig.request('/steer', {'agentId': 'a', 'text': 'additional context'}) == {'ok': True, 'steered': True}
     rig.request('/tool_result', {'agentId': 'a', 'callId': tool['callId'], 'text': 'result', 'isError': False})
@@ -735,7 +730,7 @@ def test_steer_reaches_codex_while_waiting_for_lord_tool(rig):
 
 @pytest.mark.parametrize('waiting', ['tool', 'turn'])
 def test_shutdown_releases_active_http_and_vendor_waiters(rig, waiting):
-    rig.open('gpt')
+    rig.open('gpt', nosandbox=True)
     stream = None
     if waiting == 'tool':
         assert rig.turn('TOOL')[-1]['type'] == 'tool'
@@ -898,7 +893,7 @@ def test_tools_keeps_the_users_vendor_setup(rig):
 
 
 def test_a_pending_tool_call_is_offered_again_to_the_next_client(rig):
-    rig.open('gpt')
+    rig.open('gpt', nosandbox=True)
     events = rig.turn('TOOL')
     assert events[-1]['type'] == 'tool'
     call = events[-1]['callId']
@@ -4306,13 +4301,13 @@ def test_v225_nosearch_overrides_config_on_start_and_resume(rig, chosen):
     assert len(configs) == 2 and all(c['web_search'] == 'disabled' for c in configs)
 
 
-def test_v225_default_memory_and_version():
+def test_default_memory_and_release_version():
     m = load('lordd_v225_defaults')
     d = object.__new__(m.Daemon); d.config = {'gpt': {}}
     a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '/tmp/x', 'model': 'gpt-6.1-sol'})
     assert d.settings(a)['memory_gb'] == 24
     assert json.loads((ROOT / 'config.json').read_text())['memory_ceiling_kb'] == 24 * 1048576
-    assert json.loads((ROOT / '.claude-plugin/plugin.json').read_text())['version'] == '2.2.5'
+    assert json.loads((ROOT / '.claude-plugin/plugin.json').read_text())['version'] == '2.2.6'
 
 
 @pytest.mark.parametrize('phase', ['launch', 'resume'])
@@ -4420,10 +4415,10 @@ def test_v225_tests_priority_and_pgrep(tmp_path):
     finally: decoy.terminate(); decoy.wait(timeout=5)
 
 
-def test_v225_public_directives_and_version():
+def test_public_directives_and_release_version():
     for name in ('README.md', 'CONTRACT.md', 'PRIVACY.md', 'agents/gpt.md'):
         assert '@nosearch' in (ROOT / name).read_text(), name
-    assert json.loads((ROOT / '.claude-plugin/plugin.json').read_text())['version'] == '2.2.5'
+    assert json.loads((ROOT / '.claude-plugin/plugin.json').read_text())['version'] == '2.2.6'
 
 
 @pytest.mark.parametrize('options', [{}, {'readonly': True}, {'net': True}, {'nosandbox': True}, {'tests': True}])
@@ -4491,8 +4486,8 @@ def test_v225_helper_processes_are_excluded_but_jobs_remain(tmp_path, monkeypatc
     assert asyncio.run(m.job_details({102, 103, 104})) == [{'pid': 103, 'command': 'sleep 300', 'age_s': 8}]
 
 
-def test_v225_version_is_225():
-    assert json.loads((ROOT / '.claude-plugin/plugin.json').read_text())['version'] == '2.2.5'
+def test_release_version_is_226():
+    assert json.loads((ROOT / '.claude-plugin/plugin.json').read_text())['version'] == '2.2.6'
 
 
 def test_v225_shell_options_do_not_become_read_paths():

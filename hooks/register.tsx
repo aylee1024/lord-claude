@@ -28,7 +28,6 @@ let mainTurns = 0
 const agentState = { plugin: 'lord', key: 'agent' } as const
 const startState = { plugin: 'lord', key: 'start' } as const
 const dirState = { plugin: 'lord', key: 'dir' } as const
-const launchState = { plugin: 'lord', key: 'launch' } as const
 
 // The version of each record this copy of the code last wrote or read: a newer one was written by the other copy (the
 // one before a reload, finishing its step) and replaces this copy's.
@@ -602,11 +601,6 @@ export const register: Register = on => {
       // A description that already names the model, by id or short name, is kept as written.
       const named = !!model && [model, shortName(model)].some(name => new RegExp(`(?<![a-z0-9])${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![a-z0-9])`, 'i').test(description))
       input = { ...e, description: named ? description : description ? `${label} · ${description}` : label, ...(model ? { model } : {}) }
-      const parent = e.parentAgentId ? await lordAgent($, e.parentAgentId) : undefined
-      if (parent?.call === e.tool_use_id) {
-        await $.state.set({ ...launchState, id: e.tool_use_id }, { daemon: await daemonOf($, parent) })
-        input = { ...input, prompt: `[lord-launch ${e.tool_use_id}]\n${input.prompt}` }
-      }
     }
     callEfforts.delete(e.tool_use_id)
     const r = await next(input)
@@ -634,15 +628,10 @@ export const register: Register = on => {
   on('turn.start', async ($, e, next) => {
     // A new agent's start can precede the spawn result that identifies its type.
     if (e.agentId) {
-      const header = /^\[lord-launch ([0-9a-f]{32})\]\n/.exec(e.text)
-      const known = header ? (await $.state.get({ ...launchState, id: header[1] })).value : undefined
-      const launch = known && header && (!known.agentId || known.agentId === e.agentId) ? { id: header[1], daemon: known.daemon } : undefined
-      const text = launch ? e.text.slice(header![0].length) : e.text
       // A run woken only by a background task's notification, as Claude Code words it.
-      const notice = /^\[SYSTEM NOTIFICATION[^\]]*\]/.test(text) && text.includes('<task-notification>')
-      starts.set(e.turnId, { ...task(text), ...(notice ? { notice } : {}), ...(launch ? { launch } : {}) })
+      const notice = /^\[SYSTEM NOTIFICATION[^\]]*\]/.test(e.text) && e.text.includes('<task-notification>')
+      starts.set(e.turnId, { ...task(e.text), ...(notice ? { notice } : {}) })
       await $.state.set({ ...startState, id: e.turnId }, starts.get(e.turnId)!)
-      if (launch) await $.state.set({ ...launchState, id: launch.id }, { daemon: launch.daemon, agentId: e.agentId })
     } else mainTurns++
     return next(e)
   })
@@ -668,10 +657,7 @@ export const register: Register = on => {
         // Directives from this task and from messages steered into the last turn apply only once /open accepts them.
         const input = merge(agent.pending ?? { text: '' }, started)
         input.text = started.text
-        if (!agent.opened && input.launch) {
-          agent.pending = { ...input, text: '' }
-          await keep($, agentId)
-        } else delete agent.pending
+        delete agent.pending
         agent.notice = started.notice
         // Seen now, before a long turn's compaction can drop the reminder.
         await handbackActive($, agentId, agent)
@@ -695,15 +681,9 @@ export const register: Register = on => {
         // A relative @dir is under the agent's working folder too.
         if (input.dirs) input.dirs = input.dirs.map(dir => /^[/~]/.test(dir) ? dir : `${input.cwd ?? (agent.opened ? agent.cwd : undefined) ?? base}/${dir}`)
         const cwd = input.cwd ?? (agent.opened ? agent.cwd : undefined) ?? directories.get(agentId) ?? agent.cwd ?? await $.session.cwd()
-        const launch = !agent.opened ? input.launch : undefined
-        const at = launch?.daemon ?? await socket($)
-        if (launch) {
-          agent.pending = { ...chosen, ...input, text: '', cwd, launch }
-          await keep($, agentId)
-        }
-        await request($, '/open', { agentId, family: agent.family, cwd, launch: launch?.id, resume: agent.opened || undefined, pin_cwd: !!input.cwd, path: await $.env.get('PATH'), version: await version($), session: await $.session.id().catch(() => undefined), model: chosen.model, effort: chosen.effort ?? e.effort, readonly: chosen.readonly, net: chosen.net, nosearch: chosen.nosearch, nosandbox: chosen.nosandbox, tests: chosen.tests, dirs: chosen.dirs, ...chosen.limits }, at)
+        const at = await socket($)
+        await request($, '/open', { agentId, family: agent.family, cwd, resume: agent.opened || undefined, pin_cwd: !!input.cwd, path: await $.env.get('PATH'), version: await version($), session: await $.session.id().catch(() => undefined), model: chosen.model, effort: chosen.effort ?? e.effort, readonly: chosen.readonly, net: chosen.net, nosearch: chosen.nosearch, nosandbox: chosen.nosandbox, tests: chosen.tests, dirs: chosen.dirs, ...chosen.limits }, at)
         delete agent.pending
-        if (launch) await $.state.set({ ...launchState, id: launch.id }, null)
         Object.assign(agent, { model: chosen.model, effort: chosen.effort, readonly: chosen.readonly, net: chosen.net, nosearch: chosen.nosearch, nosandbox: chosen.nosandbox, tests: chosen.tests, dirs: chosen.dirs, limits: chosen.limits })
         agent.opened = true
         agent.cwd = cwd

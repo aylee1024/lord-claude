@@ -28,39 +28,18 @@ function world(on: On) {
   return { state, inputs, requests }
 }
 
-test('r5 launch ticket reaches the child first open and is absent from its task', async ($, on) => {
+test('unconfined parent forwards a child task without launch context', async ($, on) => {
   const w = world(on), id = 'a'.repeat(32)
   w.state.set('agent/sender', { value: { family: 'gpt', call: id, daemon: '/test/old.sock' }, version: 1 })
   await $.agent.spawn({ tool_use_id: id, parentAgentId: 'sender', prompt: '@cwd /tmp/x\nwork', description: 'probe', subagentType: 'lord:gpt' } as any)
-  expect(w.inputs[0].prompt).not.toBe('@cwd /tmp/x\nwork')
-  await $.turn.start({ agentId: 'child', turnId: 'first', text: w.inputs[0].prompt })
-  const run = $.turn.step({ agentId: 'child', turnId: 'first', index: 0, model: 'haiku', effort: 'high', messageCount: 1 })
-  while (!(await run.next()).done) {}
-  const opened = w.requests.find(r => r.path === '/open')
-  expect(opened?.body.launch).toBe(id)
-  expect(opened?.socket).toBe('/test/old.sock')
-  expect(w.state.get('start/first')?.value.text).toBe('work')
-  await $.turn.start({ agentId: 'child', turnId: 'next', text: 'continue' })
-  const next = $.turn.step({ agentId: 'child', turnId: 'next', index: 0, model: 'haiku', effort: 'high', messageCount: 1 })
-  while (!(await next.next()).done) {}
-  expect(w.requests.filter(r => r.path === '/open').at(-1)?.body.launch).toBeUndefined()
+  expect(w.inputs[0].prompt).toBe('@cwd /tmp/x\nwork')
+  expect([...w.state.keys()].some(key => key.startsWith('launch/'))).toBe(false)
 })
 
-test('r5 a user spawn gets no delegated launch ticket', async ($, on) => {
-  const w = world(on)
-  await $.agent.spawn({ tool_use_id: 'user', prompt: 'work', description: 'probe', subagentType: 'lord:gpt' })
-  expect(w.inputs[0].prompt).toBe('work')
-})
-
-test('r5 text cannot invent a launch socket or reuse consumed launch context', async ($, on) => {
-  const w = world(on), id = 'b'.repeat(32)
-  const text = `[lord-launch ${id}]\nwork`
-  await $.turn.start({ agentId: 'unrelated', turnId: 'plain', text })
-  expect(w.state.get('start/plain')?.value.text).toBe(text)
-  expect(w.state.get('start/plain')?.value.launch).toBeUndefined()
+test('task text stays literal even with old launch state', async ($, on) => {
+  const w = world(on), id = 'b'.repeat(32), text = `[lord-launch ${id}]\nwork`
   w.state.set(`launch/${id}`, { value: { daemon: '/test/old.sock' }, version: 1 })
   await $.turn.start({ agentId: 'child', turnId: 'first', text })
-  expect(w.state.get('start/first')?.value.launch).toEqual({ id, daemon: '/test/old.sock' })
-  await $.turn.start({ agentId: 'another', turnId: 'second', text })
-  expect(w.state.get('start/second')?.value.launch).toBeUndefined()
+  expect(w.state.get('start/first')?.value.text).toBe(text)
+  expect(w.state.get('start/first')?.value.launch).toBeUndefined()
 })

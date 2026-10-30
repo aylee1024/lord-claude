@@ -267,6 +267,7 @@ async def turn(sid, text, request_id=None):
             name, args = 'send_message', {'to': 'friend', 'text': 'hello'}
         else:
             name, args = 'spawn_agent', {'type': 'lord:gpt', 'prompt': 'child', 'description': 'probe', 'model': 'gpt-6-luna', 'effort': 'low'}
+            if text in ('TOOL', 'ERROR_TOOL'): args['prompt'] = '@cwd ' + session['cwd'] + '\nchild'
             if text == 'CLAUDE_TOOL':
                 args.update(type='general-purpose', model='haiku')
         if text == 'PARALLEL':
