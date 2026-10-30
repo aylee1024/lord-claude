@@ -114,7 +114,9 @@ CODEX_SHARED = ('auth.json', 'config.toml', 'AGENTS.md', 'AGENTS.override.md', '
                 'mcp-oauth-locks')
 
 def codex_home_ready(home, source, identity=None):
-    if home == HOME or HOME in home.parents:
+    location, root = home.resolve(strict=False), HOME.resolve(strict=False)
+    if location == root or root in location.parents:
+        home = HOME / location.relative_to(root)
         if not home_folder(home, identity or home_identity()): raise FileNotFoundError('Lord home disappeared or was replaced')
     else: home.mkdir(mode=0o700, parents=True, exist_ok=True)
     (source / 'mcp-oauth-locks').mkdir(exist_ok=True)
@@ -2755,7 +2757,10 @@ async def answering(path=None):
 async def others_answering():
     # Whether a daemon of another plugin version is serving from this folder.
     for path in HOME.glob('lordd*.sock'):
-        if path != SOCKET and await answering(path): return True
+        try:
+            if path.samefile(SOCKET): continue
+        except OSError: pass
+        if await answering(path): return True
     return False
 
 async def relay(path, body=None):

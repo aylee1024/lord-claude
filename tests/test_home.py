@@ -1,6 +1,7 @@
 """Home identity, persistence and shutdown cleanup."""
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import json
 import os
 import shutil
 import signal
@@ -11,7 +12,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from test_lordd import grok_home, rig, load
+from test_lordd import DAEMON, PYTHON, grok_home, rig, load, tests_backend
 
 
 @pytest.mark.parametrize('failure', ['dangling', 'emit', 'logger'])
@@ -109,6 +110,7 @@ def test_home_loss_stops_vendor_and_jobs_without_recreating_home(rig, loss, step
             assert (rig.home / 'lordd.sock').read_text() == 'replacement socket'
         else: assert not rig.home.exists()
     finally:
+        if rig.home.is_symlink(): rig.home.unlink()
         rig.stop()
         for pid, birth in births.items():
             if birth is not None and m.process_start(pid) == birth:
@@ -117,3 +119,66 @@ def test_home_loss_stops_vendor_and_jobs_without_recreating_home(rig, loss, step
                 try: os.kill(pid, signal.SIGKILL)
                 except ProcessLookupError: pass
         pool.shutdown(wait=True)
+
+
+@pytest.mark.parametrize('state', ['live', 'gone', 'replaced'])
+def test_codex_home_uses_the_real_location_of_a_linked_home(tmp_path, state):
+    m = load('home_codex_alias')
+    physical = tmp_path / 'physical'; physical.mkdir()
+    m.HOME = tmp_path / 'linked'; m.HOME.symlink_to(physical, target_is_directory=True)
+    identity = m.home_identity()
+    saved = physical / 'codex'
+    source = tmp_path / 'setup'; source.mkdir()
+    if state != 'live': physical.rename(tmp_path / 'retired')
+    if state == 'replaced':
+        physical.mkdir(); (physical / 'keep').write_text('untouched')
+    if state == 'live':
+        m.codex_home_ready(saved, source, identity)
+        assert saved.is_dir() and (saved / 'mcp-oauth-locks').is_symlink()
+    else:
+        with pytest.raises(FileNotFoundError, match='disappeared or was replaced'):
+            m.codex_home_ready(saved, source, identity)
+        assert not (tmp_path / 'retired/codex').exists()
+        if state == 'gone': assert not physical.exists()
+        else: assert sorted(p.name for p in physical.iterdir()) == ['keep']
+
+
+def test_mcp_helper_with_a_missing_home_creates_nothing(tmp_path):
+    user = tmp_path / 'user'; user.mkdir()
+    home = user / 'missing/lord'
+    reply = subprocess.run([PYTHON, str(DAEMON), '--mcp', 'a'],
+        input='{"jsonrpc":"2.0","id":1,"method":"tools/list"}\n', capture_output=True, text=True, timeout=5,
+        env={**os.environ, 'HOME': str(user), 'LORD_HOME': str(home), 'LORD_DAEMON_SOCKET': str(tmp_path / 'absent.sock'),
+             'LORD_SANDBOXED': '1', 'LORD_READONLY': '0'})
+    assert reply.returncode == 0, reply.stderr
+    assert {tool['name'] for tool in json.loads(reply.stdout)['result']['tools']} == {'list_agents'}
+    assert list(user.iterdir()) == []
+
+
+def test_gpt_vendor_does_not_recreate_its_deleted_codex_home(tests_backend, rig):
+    d, m, launched = tests_backend
+    source = d.user_codex_home; source.mkdir(parents=True)
+    (source / 'auth.json').write_text('{}')
+    a = m['Agent']({'agentId': 'a', 'family': 'gpt', 'model': 'fake', 'cwd': str(rig.home / 'work'),
+                    'codexHome': str(m['HOME'] / 'codex')}, d.home_id)
+    v = m['Vendor'](d, 'gpt', a)
+    d.agents, d.vendors = {'a': a}, {'a': v}
+    shutil.rmtree(m['HOME'])
+    async def check():
+        try:
+            with pytest.raises(FileNotFoundError, match='disappeared or was replaced'): await v.ensure()
+            assert not m['HOME'].exists()
+            assert not launched
+        finally: await d.close()
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize('stepping', [False, True])
+def test_dangling_home_cleanup_removes_only_its_own_link(rig, tmp_path, stepping):
+    other = tmp_path / 'other'; other.symlink_to(tmp_path / 'absent', target_is_directory=True)
+    try:
+        test_home_loss_stops_vendor_and_jobs_without_recreating_home(rig, 'dangling', stepping)
+        assert not rig.home.is_symlink()
+        assert other.is_symlink()
+    finally:
+        if rig.home.is_symlink(): rig.home.unlink()

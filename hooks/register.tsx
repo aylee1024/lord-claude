@@ -861,7 +861,7 @@ export const register: Register = on => {
         try { await request($, '/tool_result', { agentId: e.agentId, callId: e.tool_use_id, text: refusal, isError: true }, await daemonOf($, agent)) }
         catch (error) { agent.error = errorLine(error) }
         await keep($, e.agentId!)
-        return { result: refusal, text: refusal, isError: true } as any
+        return { deny: refusal }
       }
     }
     // A named Agent call starts an agent-team teammate in its own Claude process, whose turns no Lord hook answers.

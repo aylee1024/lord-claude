@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from test_lordd import grok_home, rig, tests_backend
+from test_lordd import grok_home, rig, load, tests_backend
 
 
 @pytest.mark.parametrize('another', [False, True])
@@ -22,6 +22,31 @@ def test_legacy_folders_wait_for_other_daemons(tests_backend, monkeypatch, anoth
                 assert (m['HOME'] / name).exists() is another
                 if another: assert (m['HOME'] / name / 'ticket').read_text() == 'keep'
         finally: await d.close()
+    asyncio.run(check())
+
+
+@pytest.mark.parametrize('another', [False, True])
+def test_prune_excludes_its_socket_through_a_home_alias(tmp_path, another):
+    m = load('maintenance_alias')
+    physical = tmp_path / 'physical'; physical.mkdir()
+    m.HOME = tmp_path / 'linked'; m.HOME.symlink_to(physical, target_is_directory=True)
+    m.SOCKET = physical / 'lordd-current.sock'
+    for name in ('launches', 'messages'): (m.HOME / name).mkdir()
+    async def check():
+        async def accept(reader, writer):
+            writer.close(); await writer.wait_closed()
+        servers = [await asyncio.start_unix_server(accept, str(m.SOCKET))]
+        try:
+            if another: servers.append(await asyncio.start_unix_server(accept, str(m.HOME / 'lordd-other.sock')))
+            d = object.__new__(m.Daemon); d.home_id = m.home_identity()
+            d.refresh_jobs = AsyncMock(); d.agents, d.open_locks, d.pruned = {}, {}, set()
+            d.compact, d.sweep = lambda *args: None, lambda *args: None
+            assert await m.others_answering() is another
+            assert await d.prune_locked(14) == {'ok': True, 'pruned': []}
+            for name in ('launches', 'messages'): assert (m.HOME / name).exists() is another
+        finally:
+            for server in servers: server.close()
+            for server in servers: await server.wait_closed()
     asyncio.run(check())
 
 
