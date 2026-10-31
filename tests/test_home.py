@@ -121,16 +121,19 @@ def test_home_loss_stops_vendor_and_jobs_without_recreating_home(rig, loss, step
         pool.shutdown(wait=True)
 
 
-@pytest.mark.parametrize('state', ['live', 'gone', 'replaced'])
+@pytest.mark.parametrize('state', ['live', 'gone', 'replaced', 'reverse'])
 def test_codex_home_uses_the_real_location_of_a_linked_home(tmp_path, state):
     m = load('home_codex_alias')
     physical = tmp_path / 'physical'; physical.mkdir()
     m.HOME = tmp_path / 'linked'; m.HOME.symlink_to(physical, target_is_directory=True)
     identity = m.home_identity()
     saved = physical / 'codex'
+    if state == 'reverse':
+        saved = m.HOME / 'codex'
+        m.HOME = physical
     source = tmp_path / 'setup'; source.mkdir()
     if state != 'live': physical.rename(tmp_path / 'retired')
-    if state == 'replaced':
+    if state in ('replaced', 'reverse'):
         physical.mkdir(); (physical / 'keep').write_text('untouched')
     if state == 'live':
         m.codex_home_ready(saved, source, identity)
@@ -141,6 +144,63 @@ def test_codex_home_uses_the_real_location_of_a_linked_home(tmp_path, state):
         assert not (tmp_path / 'retired/codex').exists()
         if state == 'gone': assert not physical.exists()
         else: assert sorted(p.name for p in physical.iterdir()) == ['keep']
+
+
+def test_codex_home_link_out_refuses_a_replaced_home(tmp_path):
+    m = load('codex_home_link_out'); m.HOME = tmp_path / 'lord'; m.HOME.mkdir()
+    source = tmp_path / 'setup'; source.mkdir(); (source / 'auth.json').write_text('{}')
+    store = tmp_path / 'store/codex'; store.mkdir(parents=True)
+    (m.HOME / 'codex').symlink_to(store, target_is_directory=True)
+    identity = m.home_identity()
+    m.HOME.rename(tmp_path / 'retired'); m.HOME.mkdir()
+    (m.HOME / 'codex').symlink_to(store, target_is_directory=True)
+    (m.HOME / 'keep').write_text('untouched')
+    with pytest.raises(FileNotFoundError, match='disappeared or was replaced'):
+        m.codex_home_ready(m.HOME / 'codex', source, identity)
+    assert sorted(p.name for p in m.HOME.iterdir()) == ['codex', 'keep']
+    assert (m.HOME / 'keep').read_text() == 'untouched'
+    assert (m.HOME / 'codex').readlink() == store
+    assert list(store.iterdir()) == []
+    assert sorted(p.name for p in source.iterdir()) == ['auth.json']
+
+
+@pytest.mark.parametrize('mode', ['removed', 'retargeted', 'retargeted-renamed'])
+def test_codex_home_refuses_a_removed_or_retargeted_home_link(tmp_path, mode):
+    m = load('codex_home_link_lost')
+    physical = tmp_path / 'physical'; physical.mkdir()
+    m.HOME = tmp_path / 'linked'; m.HOME.symlink_to(physical, target_is_directory=True)
+    identity = m.home_identity()
+    saved = physical / 'codex'
+    source = tmp_path / 'setup'; source.mkdir(); (source / 'auth.json').write_text('{}')
+    if mode == 'retargeted-renamed': physical.rename(tmp_path / 'retired')
+    else: shutil.rmtree(physical)
+    m.HOME.unlink()
+    replacement = tmp_path / 'replacement'
+    if mode != 'removed':
+        replacement.mkdir(); (replacement / 'keep').write_text('untouched')
+        m.HOME.symlink_to(replacement, target_is_directory=True)
+    with pytest.raises(FileNotFoundError, match='disappeared or was replaced'):
+        m.codex_home_ready(saved, source, identity)
+    assert not physical.exists()
+    assert sorted(p.name for p in source.iterdir()) == ['auth.json']
+    if mode == 'removed': assert not m.HOME.exists()
+    else:
+        assert sorted(p.name for p in replacement.iterdir()) == ['keep']
+        assert (replacement / 'keep').read_text() == 'untouched'
+        assert m.HOME.readlink() == replacement
+    if mode == 'retargeted-renamed': assert list((tmp_path / 'retired').iterdir()) == []
+
+
+def test_codex_home_outside_lord_without_an_identity_is_still_created(tmp_path):
+    m = load('codex_home_external'); m.HOME = tmp_path / 'absent-lord'
+    source = tmp_path / 'setup'; source.mkdir(); (source / 'auth.json').write_text('{}')
+    home = tmp_path / 'outside/nested/codex'
+    m.codex_home_ready(home, source)
+    assert home.is_dir() and not m.HOME.exists()
+    assert (home / 'auth.json').is_symlink() and (home / 'auth.json').readlink() == source / 'auth.json'
+    assert (source / 'auth.json').read_text() == '{}'
+    assert (source / 'mcp-oauth-locks').is_dir()
+    assert (home / 'mcp-oauth-locks').is_symlink()
 
 
 def test_mcp_helper_with_a_missing_home_creates_nothing(tmp_path):

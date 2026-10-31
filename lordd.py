@@ -114,6 +114,7 @@ CODEX_SHARED = ('auth.json', 'config.toml', 'AGENTS.md', 'AGENTS.override.md', '
                 'mcp-oauth-locks')
 
 def codex_home_ready(home, source, identity=None):
+    if identity is not None and home_identity() != identity: raise FileNotFoundError('Lord home disappeared or was replaced')
     location, root = home.resolve(strict=False), HOME.resolve(strict=False)
     if location == root or root in location.parents:
         home = HOME / location.relative_to(root)
