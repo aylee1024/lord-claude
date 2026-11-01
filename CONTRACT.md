@@ -157,7 +157,7 @@ waits undelivered, for up to `keep_undelivered_s` (a day).
   `helper_note: "ultra: no helpers ran"` when none were active, plus that turn's model and effort in the stored turn.
   JSON answers keep their existing footer exemption; their turn records still carry the note. Helpers count once in each
   turn with a parent-reported start or interaction, a collab spawn/input/message/follow-up/resume call naming the helper,
-  or any event on its own thread. Close, wait, interrupt and list calls alone do not count as helper work; helper identities
+  or an item, turn or token-use event on its own thread (thread lifecycle notices do not count). Close, wait, interrupt and list calls alone do not count as helper work; helper identities
   are still tracked so later activity on those threads can count.
   Existing helpers retain their recorded model when an interaction omits it; helpers with no activity in a turn do not
   count, even when two turns share a timestamp. Joined answers keep a short helper-status line beside each earlier ultra
