@@ -549,16 +549,17 @@ def gpt_permissions(a):
     return {'default_permissions': name, 'permissions': {name: {'filesystem': filesystem,
             'network': {'enabled': bool(r.get('net'))}}}}
 
+def gpt_helper_mismatch(a):
+    return a.family == 'gpt' and a.record.get('readonly') and a.codex_helpers is not None and a.codex_helpers != (a.effort == 'ultra')
+
 def helper_seen(a, item):
-    # A codex helper agent starting, from its parent's (or a helper's) item: subAgentActivity in codex's current helper
-    # mode, a spawnAgent call (its new thread in receiverThreadIds) in the older one. Its later events arrive under its
-    # own thread id.
+    # Parent activity names helpers in both helper modes. Known threads retain their model when interactions omit it.
     if item.get('type') == 'subAgentActivity': threads, path = [item.get('agentThreadId')], item.get('agentPath')
-    elif item.get('type') == 'collabAgentToolCall' and item.get('tool') == 'spawnAgent': threads, path = item.get('receiverThreadIds') or [], None
+    elif item.get('type') == 'collabAgentToolCall': threads, path = item.get('receiverThreadIds') or [], None
     else: return
     for thread in threads:
         if not isinstance(thread, str) or not thread or thread == a.vendorSession: continue
-        if thread not in a.helpers: a.turn_helpers.add(thread)
+        a.turn_helpers.add(thread)
         known = a.helpers.setdefault(thread, {'thread': thread, 'path': str(path or thread), 'model': None, 'effort': None,
                                               'started': datetime.now(timezone.utc).isoformat(timespec='seconds'), 'commands': 0})
         known['model'] = known['model'] or item.get('model')
@@ -909,7 +910,7 @@ class Agent:
         self.record_path, self.answers_path = self.log_path.with_suffix('.json'), self.log_path.with_suffix('.answers')
         self.reads_path, self.reads = self.log_path.with_suffix('.reads.txt'), None
         # codex helper threads this agent started: thread id -> {path, model, effort}.
-        self.helpers, self.turn_helpers = {}, set()
+        self.helpers, self.turn_helpers, self.codex_helpers = {}, set(), None
 
     def files(self):
         return [self.log_path, self.log_path.with_suffix('.log.1'), self.answer_path, self.record_path, self.reads_path,
@@ -1001,8 +1002,9 @@ class Agent:
             if isinstance(helper, dict) and isinstance(helper.get('thread'), str) and isinstance(helper.get('started'), str):
                 fields = {k: helper.get(k) if isinstance(helper.get(k), str) else None for k in ('path', 'model', 'effort')}
                 commands = helper.get('commands')
-                self.helpers.setdefault(helper['thread'], {**fields, 'thread': helper['thread'], 'path': fields['path'] or helper['thread'],
+                known = self.helpers.setdefault(helper['thread'], {**fields, 'thread': helper['thread'], 'path': fields['path'] or helper['thread'],
                                                            'started': helper['started'], 'commands': commands if type(commands) is int else 0})
+                for field in ('model', 'effort'): known[field] = known.get(field) or fields[field]
         # A record edited by hand or cut short is read for what it still holds, never a reason the turn cannot end.
         turns = [turn for turn in turns if isinstance(turn, dict)] if isinstance(turns, list) else []
         last = turns[-1].get('turn') if turns else 0
@@ -1479,6 +1481,7 @@ class Vendor:
 
     def helper_event(self, a, helper, method, p):
         # A codex helper's steps go to its parent's log and read list only: no row, so nothing reaches a model.
+        if a.state in ('running', 'waiting_tool'): a.turn_helpers.add(helper['thread'])
         item = p.get('item') or {}
         if method == 'item/started': helper_seen(a, item)
         if method != 'item/completed' or not (line := codex_activity(item)): return
@@ -1497,6 +1500,7 @@ class Vendor:
                 if future and not future.done(): future.set_exception(RuntimeError(error))
             if self.process is process: self.process = None
             if self.exec_process is ex: self.exec_process = None
+            if self.agent and self.family == 'gpt': self.agent.codex_helpers = None
 
 class Daemon:
     def __init__(self):
@@ -1760,11 +1764,11 @@ class Daemon:
                 # Skills come from more places than the plugins listed in config.toml (a remote plugin cache, the
                 # skills folder); with these off, codex lists none and each request is about 3,700 tokens shorter.
                 if not a.record.get('tools'): lean['skills'] = {'include_instructions': False, 'bundled': {'enabled': False}}
-                # Read-only ultra turns allow helpers under the parent's permission profile. Codex picks its mode from agents.enabled,
+                # Ultra attachments allow helpers under the parent's permission profile. Codex picks its mode from agents.enabled,
                 # then multi_agent_v2, then the model catalog (which turns helpers on for current models), and only
                 # then from the multi_agent feature, so all three are set.
-                if a.record.get('readonly'):
-                    enabled = a.effort == 'ultra'
+                enabled = a.effort == 'ultra'
+                if enabled or a.record.get('readonly'):
                     lean['features'] = {'multi_agent': enabled, 'multi_agent_v2': enabled}
                     lean['agents'] = {'enabled': enabled}
                 params = {'cwd': a.cwd, 'model': a.model, 'approvalPolicy': 'never',
@@ -1778,7 +1782,10 @@ class Daemon:
                     params['config'].update(gpt_permissions(a))
                 if a.vendorSession: params['threadId'] = a.vendorSession
                 try: result = await vendor.rpc('thread/resume' if a.vendorSession else 'thread/start', params)
-                except Exception as error:
+                except BaseException as error:
+                    # A missing reply can leave a loaded thread whose accepted configuration is unknown.
+                    await vendor.close()
+                    a.generation = 0
                     if a.vendorSession and re.search(r'line.*(?:limit|too large)|too large.*line|Separator is not found', str(error), re.I):
                         path = transcript_path(a.family, a.vendorSession, a.cwd, a.record.get('codexHome') or self.user_codex_home)
                         try: size = f'{Path(path).stat().st_size / 1048576:.0f}' if path else 'unknown'
@@ -1786,6 +1793,7 @@ class Daemon:
                         raise RuntimeError(f'session too large to resume ({size} MB); start a fresh agent with a takeover brief') from None
                     raise
                 a.vendorSession = result['thread']['id']
+                a.codex_helpers = enabled if 'agents' in lean else None
             elif a.family == 'grok':
                 server = self.server(a)
                 server['env'] = [{'name': k, 'value': v} for k, v in server['env'].items()]
@@ -1968,7 +1976,7 @@ class Daemon:
         a.record.update(cwd_paths=cwd_paths, dir_paths=dir_paths)
         for key in ('readonly', 'net', 'nosandbox', 'tests', 'nosearch'):
             if body.get(key) and not a.record.get(key):
-                # A sandbox change needs a new process (grok) or a reattached thread (codex).
+                # Thread configuration and process sandboxes take effect on a fresh vendor.
                 a.record[key] = True
                 a.restart = True
         # Per-agent overrides of the guards and of the lean vendor setup; any later /open may change them.
@@ -1986,7 +1994,9 @@ class Daemon:
         if set(dirs) - set(a.record.get('dirs', [])):
             a.record['dirs'] = sorted(set(a.record.get('dirs', [])) | set(dirs))
             a.generation = 0
-            if a.record.get('tests'): a.restart = True
+            if a.family == 'gpt': a.restart = True
+        defer_attach = resuming and a.family == 'gpt' and (body.get('effort') or body.get('model'))
+        if not defer_attach and gpt_helper_mismatch(a): a.restart = True
         if a.restart and a.state not in ('running', 'waiting_tool'):
             a.restart = False
             before = len(a.killed_jobs)
@@ -1995,7 +2005,7 @@ class Daemon:
             a.generation = 0
         # A result held for this agent is handed over by /turn without the vendor, and a vendor that failed to start here
         # would strand it; the next turn's start attaches the vendor instead.
-        if not a.undelivered():
+        if not a.undelivered() and not defer_attach:
             try: await self.attach(a)
             except Exception as error:
                 if resuming and a.vendorSession and re.search(r'\b(?:conversation|thread|session|rollout)(?:\s+[a-f0-9-]{8,})?\s+(?:(?:is|was)\s+)?(?:not found|does not exist|missing)\b|\bno (?:conversation|thread|session|rollout) found\b|\bmissing (?:conversation|thread|session|rollout)\s*$', str(error), re.I):
@@ -2058,8 +2068,8 @@ class Daemon:
         a.model = body.get('model') or a.model
         try:
             await self.effort(a, body.get('effort'))
-            # Helper switches belong to the thread config in Codex 0.164, so crossing ultra needs a fresh vendor.
-            if a.family == 'gpt' and a.record.get('readonly') and (previous[1] == 'ultra') != (a.effort == 'ultra'):
+            # Compare the live thread's setting, which can outlast a failed attach and effort rollback.
+            if gpt_helper_mismatch(a):
                 a.restart = True
             if a.restart:
                 a.restart = False
@@ -2477,6 +2487,12 @@ class Daemon:
                             if event['type'] in ('done', 'error') and a.followup:
                                 body, a.followup = a.followup, None
                                 result = event['text'] if event['type'] == 'done' else 'It failed: ' + event['message']
+                                record = event.get('record') or {}
+                                if record.get('effort') == 'ultra':
+                                    helpers = record.get('helpers') or []
+                                    status = (f"{len(helpers)} helper{'s' if len(helpers) != 1 else ''} ({', '.join(dict.fromkeys(helpers))})"
+                                              if helpers else 'ultra: no helpers ran')
+                                    result += f"\n\n[lord: {record.get('model')} ultra · {status}]"
                                 # Each queued message's result joins those held before it, for the one answer at the end;
                                 # any answer among them keeps the delivery an answer.
                                 a.earlier_done = event['type'] == 'done' or (bool(a.earlier) and a.earlier_done)

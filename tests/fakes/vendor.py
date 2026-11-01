@@ -325,7 +325,7 @@ async def turn(sid, text, request_id=None):
         item = {'type': 'commandExecution', 'id': 'k1', 'command': '/bin/zsh -lc "cat notes.md"', 'cwd': '/w', 'commandActions': [], 'aggregatedOutput': 'x', 'exitCode': 0}
         send({'method': 'item/completed', 'params': {'threadId': child, 'item': item}})
         answer = text
-    elif text in ('HELPER', 'SEARCH') and FAMILY == 'gpt':
+    elif text in ('HELPER', 'HELPER_WAIT', 'SEARCH') and FAMILY == 'gpt':
         if text == 'SEARCH':
             # codex names a web search's query only when it is done.
             send({'method': 'item/started', 'params': {'threadId': sid, 'item': {'type': 'webSearch', 'id': 'w1', 'query': ''}}})
@@ -341,6 +341,8 @@ async def turn(sid, text, request_id=None):
                 send({'method': 'item/started', 'params': {'threadId': child, 'item': item}})
                 send({'method': 'item/completed', 'params': {'threadId': child, 'item': item}})
             send({'method': 'turn/completed', 'params': {'threadId': child, 'turn': {'id': 'ct', 'status': 'completed'}}})
+            if text == 'HELPER_WAIT':
+                while not (DATA / 'helper-finish').exists(): await asyncio.sleep(.01)
         answer = text
     elif text.startswith('WAIT1'):
         await asyncio.sleep(1)

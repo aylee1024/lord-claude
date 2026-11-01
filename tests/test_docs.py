@@ -17,6 +17,30 @@ def test_gpt_description_mentions_ultra_helpers_within_its_cap():
     assert len(description.split(': ', 1)[1].strip('"')) <= 975
 
 
+def test_saved_turn_and_terminal_record_shapes_name_helper_telemetry():
+    readme = (ROOT / 'README.md').read_text()
+    disk = next(line for line in readme.splitlines() if line.startswith('- **On disk**'))
+    assert all('`' + name + '`' in disk for name in ('model', 'effort', 'helper_note'))
+    contract = (ROOT / 'CONTRACT.md').read_text()
+    shape = contract.split('`record` (`{', 1)[1].split('}`', 1)[0]
+    assert 'helper_note?' in shape
+
+
+@pytest.mark.parametrize('name', ['README.md', 'CONTRACT.md'])
+def test_helper_and_permission_restart_policies_are_explicit(name):
+    text = (ROOT / name).read_text().lower()
+    for phrase in ('writable effort changes', 'until the next start', 'thread configuration changes', 'kill running jobs'):
+        assert phrase in text
+
+
+def test_gpt_description_distinguishes_effort_and_thread_option_restarts():
+    description = next(line for line in (ROOT / 'agents/gpt.md').read_text().splitlines() if line.startswith('description:'))
+    assert 'ultra enables codex helpers on start/resume' in description
+    assert 'writable effort changes keep jobs' in description
+    assert 'thread options restart and kill jobs' in description
+    assert len(description.split(': ', 1)[1].strip('"')) <= 975
+
+
 def test_r3_docs_state_delegation_boundary_and_keep_description_cap():
     description = next(line for line in (ROOT / 'agents/gpt.md').read_text().splitlines() if line.startswith('description:'))
     assert len(description.split(': ', 1)[1].strip('"')) <= 975

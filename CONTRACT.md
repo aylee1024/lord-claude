@@ -100,8 +100,8 @@ ends and the vendor keeps working; any other stream gets the step as one `activi
 SendMessage, input}`; the stream ends, the vendor waits), `done` (`{text, usage, model}`; `text` is the final answer
 only: codex's last agent message, grok's text after its last tool call, agy's text after its last tool step, else its
 whole response), `error` (`{message, retryable, cause?}`, `cause` codex's `codexErrorInfo` kind). `done` and `error` carry
-`record` (`{ended_how, model, effort, started, ended, commands, retries, policy_continues, jobs, killed_jobs, memory_warning?, helpers, session}`, `helpers` the models of the
-turn's codex helpers), which the plugin renders as the answer's closing line. The footer lists at most five live or killed jobs in total, then `and N more`; records retain every job.
+`record` (`{ended_how, model, effort, started, ended, commands, retries, policy_continues, jobs, killed_jobs, memory_warning?, helpers, helper_note?, session}`, `helpers` the models of the
+turn's active codex helpers, `helper_note` the no-helper status for ultra), which the plugin renders as the answer's closing line. Saved turns also carry their own `model`, `effort` and optional `helper_note`. The footer lists at most five live or killed jobs in total, then `and N more`; records retain every job.
 
 Rows: the plugin draws a `row` as a `Bash` tool call (`shell`) or a call of its step tool `mcp__lord__<family>`
 (`{step}`), both listed in the agent files, and answers that call itself from `/row`, so nothing runs and no
@@ -138,23 +138,38 @@ waits undelivered, for up to `keep_undelivered_s` (a day).
   the lord MCP server, and the
   `shell_environment_policy.set: {LORD_AGENT_ID, LORD_DAEMON_SOCKET}` with this agent's id and daemon socket, applied after the user's inherited-environment filters on start and resume (other user-set values remain), and the user's codex MCP servers, codex plugins and notifier disabled unless `tools`; without `tools` also
   `skills: {include_instructions: false, bundled: {enabled: false}}` (codex lists skills from its skills folder and plugin
-  caches, the remote ones included, which the plugin switch-off misses). Ultra always enables codex helpers, including for
-  `readonly`: `features: {multi_agent: true, multi_agent_v2: true}` and `agents: {enabled: true}`; other read-only efforts
-  set all three false. The helpers inherit the parent's sandbox: Codex reapplies the live parent's permission snapshot
-  after child role settings, so read-only helpers cannot write. Writable agents keep their existing helper configuration.
-  Codex 0.164 `turn/start` has no helper switch. Before a read-only turn whose effective effort moves into or out of ultra,
-  Lord restarts the vendor and resumes the same thread with the matching helper configuration. Effort is clamped to the
-  model's supported levels before deciding. Codex picks its helper mode from `agents.enabled`, then `multi_agent_v2`, then
+  caches, the remote ones included, which the plugin switch-off misses). Every effective-ultra gpt thread start or resume
+  sends `features: {multi_agent: true, multi_agent_v2: true}` and `agents: {enabled: true}`, writable agents included;
+  other read-only efforts set all three false. Writable non-ultra starts send none of these switches.
+  The helpers inherit the parent's sandbox: Codex reapplies the live parent's permission snapshot after child role
+  settings, so read-only helpers cannot write. Writable effort changes keep the live vendor and jobs, so its helper
+  setting stays in effect until the next start, even when the new effort is ultra.
+  Codex 0.164 `turn/start` has no helper switch. The agent tracks the live thread's helper setting immediately after each
+  successful start or resume, before journal saves and process lookups, and clears it when the vendor closes. Before a
+  read-only turn, a different wanted setting restarts the vendor and resumes the same thread. Effort is clamped to the
+  model's supported levels before deciding. A failed RPC closes the vendor because its accepted configuration is unknown.
+  An existing gpt agent's `/open` carrying a model or effort defers attachment until `/turn` applies and clamps it,
+  so reopening an idle-closed agent does not attach twice. Codex picks its helper mode from `agents.enabled`, then `multi_agent_v2`, then
   the model catalog, then `multi_agent`; a thread's `config` is merged key by key over the user's `config.toml`.
   Each ultra turn's footer counts helpers or says `ultra: no helpers ran`. Its stored turn and terminal event carry
-  `helper_note: "ultra: no helpers ran"` when none started, plus that turn's model and effort in the stored turn.
-  JSON answers keep their existing footer exemption; their turn records still carry the note. Helper ownership is tracked
-  per turn, so an earlier turn's helper cannot hide a later ultra turn without delegation.
+  `helper_note: "ultra: no helpers ran"` when none were active, plus that turn's model and effort in the stored turn.
+  JSON answers keep their existing footer exemption; their turn records still carry the note. Helpers count once in each
+  turn with a parent-reported start or interaction, any collab call naming the helper, or any event on its own thread.
+  Existing helpers retain their recorded model when an interaction omits it; helpers with no activity in a turn do not
+  count, even when two turns share a timestamp. Joined answers keep a short helper-status line beside each earlier ultra
+  result; the final closing footer describes only the last turn.
   A codex helper (`subAgentActivity` with `agentThreadId`, `agentPath`, `model`, `reasoningEffort`, or in
   codex's older helper mode a `collabAgentToolCall` `spawnAgent` with `receiverThreadIds`, from the agent's thread or
   another helper's) is mapped to its agent: the helper's completed steps go to the agent's log as
   `[<agentPath>] <line>` (the helper's thread id in codex's older helper mode, which names no path) and to its read list, never to rows or events. `webSearch` lines name `action`'s query, queries,
   url or pattern; a search with none yet gets its row when it completes.
+  Thread configuration changes restart codex, resume the same conversation and kill running jobs: added `dirs`, enabling
+  `readonly`, `net`, `nosearch`, `nosandbox`, `tests` or `tools`, and changing `nice`. Any exec-server restarts with it.
+  Repeating unchanged options does not restart. A resume on an already loaded codex thread rejoins it without applying
+  the new config or permission profile, so zeroing Lord's attachment generation alone is insufficient. Model and writable
+  effort changes use turn parameters; memory, hang and wall limits are daemon settings and need no restart. `cwd` stays
+  pinned to the first turn. Grok's read-only process profile already requires a restart; `session/load` alone does not
+  replace a process sandbox.
 - grok: `/usr/bin/sandbox-exec -p <profile> -D<NAME>=<path> ... grok --sandbox off agent --always-approve stdio`
   per agent, with `/usr/bin/nice` outside sandbox-exec when requested. Both process cwd and ACP `session/new|load`
   cwd are the agent's folder in both modes. Lord combines Codex's base and preferences policies with `sandbox/grok.sbpl`;

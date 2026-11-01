@@ -38,23 +38,34 @@ def test_readonly_ultra_enables_helpers_on_start_resume_and_crash(rig, options):
 def test_helper_configuration_follows_each_effective_turn_effort(rig, readonly):
     opened = rig.open('gpt', readonly=readonly)
     session = opened['vendorSession']
-    for effort, model, effective in [('ultra', 'gpt-6.1-sol', 'ultra'), ('max', 'gpt-6.1-sol', 'max'),
+    assert rig.turn('persistent-word')[-1]['type'] == 'done'
+    previous_effort = opened['effort']
+    for effort, model, effective in [('ultra', 'gpt-6.1-sol', 'ultra'), ('ultra', 'gpt-6.1-sol', 'ultra'),
+                                     ('max', 'gpt-6.1-sol', 'max'), ('xhigh', 'gpt-6.1-sol', 'xhigh'),
                                      ('ultra', 'gpt-6.1-sol', 'ultra'), ('ultra', 'gpt-6-luna', 'high'),
                                      ('high', 'gpt-6.1-sol', 'high')]:
         before = len([e for e in rig.audit() if e.get('launch')])
+        threads_before = len(thread_params(rig))
         previous = thread_params(rig)[-1]
-        result = rig.turn('PING', effort=effort, model=model)[-1]
+        result = rig.turn('REMEMBER', effort=effort, model=model)[-1]
         assert result['type'] == 'done' and result['record']['effort'] == effective
+        assert result['text'] == 'persistent-word' and result['record']['session'] == session
         params = thread_params(rig)[-1]
+        relaunched = readonly and (previous_effort == 'ultra') != (effective == 'ultra')
+        assert len([e for e in rig.audit() if e.get('launch')]) == before + int(relaunched)
+        assert len(thread_params(rig)) == threads_before + int(relaunched)
         if readonly:
             assert_helpers(params, effective == 'ultra')
-            assert params.get('threadId', session) == session
-            if params != previous:
-                assert len([e for e in rig.audit() if e.get('launch')]) == before + 1
+            if relaunched:
+                assert [e['method'] for e in rig.audit() if e.get('method') in ('thread/start', 'thread/resume')][-1] == 'thread/resume'
+                assert params['threadId'] == session
+            else:
+                assert params == previous
         else:
             assert params == previous
             assert 'features' not in params['config'] and 'agents' not in params['config']
             assert len([e for e in rig.audit() if e.get('launch')]) == before
+        previous_effort = effective
 
 
 @pytest.mark.parametrize('outcome', ['PING', 'FAIL'])
@@ -100,7 +111,7 @@ def test_helpers_from_an_earlier_turn_in_the_same_second_do_not_hide_missing_del
     asyncio.run(run())
 
 
-def test_readonly_ultra_profile_denies_native_writes_with_helpers_enabled(rig, tmp_path):
+def test_parent_readonly_profile_denies_native_writes_with_helper_switches_present(rig, tmp_path):
     codex = shutil.which('codex')
     if not codex: pytest.skip('native codex is not installed')
     rig.open('gpt', readonly=True, effort='ultra', tools=True)
