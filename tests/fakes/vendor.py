@@ -317,6 +317,13 @@ async def turn(sid, text, request_id=None):
             answer = json.dumps(await asyncio.gather(mcp(session['server'], name, args), mcp(session['server'], name, args)))
         else:
             answer = json.dumps(await mcp(session['server'], name, args))
+    elif text in ('HELPER_CLOSE', 'HELPER_WAIT_ONLY') and FAMILY == 'gpt':
+        child = 'child-' + sid[:8]
+        tool = 'closeAgent' if text == 'HELPER_CLOSE' else 'wait'
+        item = {'type': 'collabAgentToolCall', 'id': 'manage-helper', 'tool': tool, 'status': 'completed',
+                'senderThreadId': sid, 'receiverThreadIds': [child], 'model': None}
+        send({'method': 'item/completed', 'params': {'threadId': sid, 'item': item}})
+        answer = text
     elif text == 'HELPER1' and FAMILY == 'gpt':
         # codex's older helper mode announces a helper only by its spawnAgent call.
         child = 'v1child-' + sid[:8]

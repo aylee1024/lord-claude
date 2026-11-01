@@ -148,13 +148,17 @@ waits undelivered, for up to `keep_undelivered_s` (a day).
   successful start or resume, before journal saves and process lookups, and clears it when the vendor closes. Before a
   read-only turn, a different wanted setting restarts the vendor and resumes the same thread. Effort is clamped to the
   model's supported levels before deciding. A failed RPC closes the vendor because its accepted configuration is unknown.
-  An existing gpt agent's `/open` carrying a model or effort defers attachment until `/turn` applies and clamps it,
-  so reopening an idle-closed agent does not attach twice. Codex picks its helper mode from `agents.enabled`, then `multi_agent_v2`, then
+  With no result waiting for delivery, an existing gpt agent's `/open` carrying a model or effort prepares the vendor and model catalog, so unknown models
+  are refused there, but defers thread attachment until `/turn` applies and clamps it. Reopening an idle-closed agent
+  still uses one vendor start and one thread resume. A missing thread gets the same cannot-resume/fresh-agent diagnostic
+  whether attachment happens at `/open` or turn start. Codex picks its helper mode from `agents.enabled`, then `multi_agent_v2`, then
   the model catalog, then `multi_agent`; a thread's `config` is merged key by key over the user's `config.toml`.
   Each ultra turn's footer counts helpers or says `ultra: no helpers ran`. Its stored turn and terminal event carry
   `helper_note: "ultra: no helpers ran"` when none were active, plus that turn's model and effort in the stored turn.
   JSON answers keep their existing footer exemption; their turn records still carry the note. Helpers count once in each
-  turn with a parent-reported start or interaction, any collab call naming the helper, or any event on its own thread.
+  turn with a parent-reported start or interaction, a collab spawn/input/message/follow-up/resume call naming the helper,
+  or any event on its own thread. Close, wait, interrupt and list calls alone do not count as helper work; helper identities
+  are still tracked so later activity on those threads can count.
   Existing helpers retain their recorded model when an interaction omits it; helpers with no activity in a turn do not
   count, even when two turns share a timestamp. Joined answers keep a short helper-status line beside each earlier ultra
   result; the final closing footer describes only the last turn.

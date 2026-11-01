@@ -557,9 +557,10 @@ def helper_seen(a, item):
     if item.get('type') == 'subAgentActivity': threads, path = [item.get('agentThreadId')], item.get('agentPath')
     elif item.get('type') == 'collabAgentToolCall': threads, path = item.get('receiverThreadIds') or [], None
     else: return
+    work = item.get('type') == 'subAgentActivity' or item.get('tool') in ('spawnAgent', 'sendInput', 'resumeAgent', 'sendMessage', 'followupTask')
     for thread in threads:
         if not isinstance(thread, str) or not thread or thread == a.vendorSession: continue
-        a.turn_helpers.add(thread)
+        if work: a.turn_helpers.add(thread)
         known = a.helpers.setdefault(thread, {'thread': thread, 'path': str(path or thread), 'model': None, 'effort': None,
                                               'started': datetime.now(timezone.utc).isoformat(timespec='seconds'), 'commands': 0})
         known['model'] = known['model'] or item.get('model')
@@ -1737,7 +1738,7 @@ class Daemon:
         env['LORD_SANDBOXED'] = '1' if agent_access(a)['sandbox'] != 'none' else '0'
         return {'name': 'lord', 'command': sys.executable, 'args': [str(HERE), '--mcp', a.agentId], 'env': env}
 
-    async def attach(self, a):
+    async def attach(self, a, *, prepare_only=False):
         async with a.lock:
             vendor = self.backend(a)
             try: await vendor.ensure()
@@ -1748,6 +1749,7 @@ class Daemon:
                 self.log(f'{a.agentId}: {a.family} failed to start ({self.redact(error)}); retrying once')
                 await asyncio.sleep(self.config.get('retry_delay_s', 3))
                 await vendor.ensure()
+            if prepare_only: return
             if a.generation == vendor.generation: return
             if a.family == 'gpt':
                 await self.effort(a)
@@ -2005,11 +2007,12 @@ class Daemon:
             a.generation = 0
         # A result held for this agent is handed over by /turn without the vendor, and a vendor that failed to start here
         # would strand it; the next turn's start attaches the vendor instead.
-        if not a.undelivered() and not defer_attach:
-            try: await self.attach(a)
+        if not a.undelivered():
+            try:
+                if defer_attach: await self.attach(a, prepare_only=True)
+                else: await self.attach(a)
             except Exception as error:
-                if resuming and a.vendorSession and re.search(r'\b(?:conversation|thread|session|rollout)(?:\s+[a-f0-9-]{8,})?\s+(?:(?:is|was)\s+)?(?:not found|does not exist|missing)\b|\bno (?:conversation|thread|session|rollout) found\b|\bmissing (?:conversation|thread|session|rollout)\s*$', str(error), re.I):
-                    raise RuntimeError(f'agent {aid} cannot be resumed ({self.redact(error)}); launch a fresh agent') from None
+                if resuming and (missing := self.resume_error(a, error)): raise missing from None
                 raise
         # A model change applies at the next turn; refusing it here keeps the mod from adopting it. With a result held,
         # the turn's start checks it instead, after that result is handed over.
@@ -2030,6 +2033,10 @@ class Daemon:
         if a.family == 'gpt': return [m['id'] for m in vendor.models]
         if a.family == 'grok': return getattr(vendor, 'grok_models', [])
         return sorted(self.agy_models)
+
+    def resume_error(self, a, error):
+        if a.vendorSession and re.search(r'\b(?:conversation|thread|session|rollout)(?:\s+[a-f0-9-]{8,})?\s+(?:(?:is|was)\s+)?(?:not found|does not exist|missing)\b|\bno (?:conversation|thread|session|rollout) found\b|\bmissing (?:conversation|thread|session|rollout)\s*$', str(error), re.I):
+            return RuntimeError(f'agent {a.agentId} cannot be resumed ({self.redact(error)}); launch a fresh agent')
 
     async def begin(self, a, body):
         async with a.stream_lock: await self.begin_locked(a, body)
@@ -2078,7 +2085,10 @@ class Daemon:
             if a.family in ('grok', 'gemini') and previous != (a.model, a.effort):
                 if a.family == 'gemini': await self.backend(a).close()
                 a.generation = 0
-            await self.attach(a)
+            try: await self.attach(a)
+            except Exception as error:
+                if missing := self.resume_error(a, error): raise missing from None
+                raise
         except BaseException:
             if (a.model, a.effort) != previous:
                 a.model, a.effort = previous
