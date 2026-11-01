@@ -467,7 +467,7 @@ async def handle(value):
     elif method in ('turn/start', 'session/prompt'):
         sid = p.get('threadId') or p['sessionId']
         if FAMILY == 'gpt':
-            assert p['model'] and p['effort'] in ('low', 'medium', 'high', 'xhigh', 'max')
+            assert p['model'] and p['effort'] in ('low', 'medium', 'high', 'xhigh', 'max', 'ultra')
         await turn(sid, (p.get('input') or p['prompt'])[0]['text'], rid)
         return
     elif method == 'turn/interrupt':

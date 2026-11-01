@@ -6,7 +6,7 @@ import type { LordAgent as Agent, LordTask as Task } from '../types'
 // record: the daemon's account of the finished turn, for the answer's footer.
 type Stream = { next: number; live: number; answer: string; shown: string; failed?: boolean; model?: string; record?: TurnRecord }
 type Job = { pid: number; command: string; age_s: number }
-type TurnRecord = { ended_how: string; model: string; effort: string; started: string; ended: string; commands: number; retries: number; helpers: string[]; session?: string; jobs?: Job[]; killed_jobs?: Job[]; memory_warning?: string; policy_continues?: number }
+type TurnRecord = { ended_how: string; model: string; effort: string; started: string; ended: string; commands: number; retries: number; helpers: string[]; helper_note?: string; session?: string; jobs?: Job[]; killed_jobs?: Job[]; memory_warning?: string; policy_continues?: number }
 type Outcome = { tool?: { callId: string; name: string; input: Record<string, unknown> }; row?: { rowId: string; shell: boolean; title: string } }
 // A vendor's tool steps are drawn as rows: a shell command as a Bash row, any other step under the plugin's own tool for
 // that vendor, which Claude Code labels "lord - <family>". Neither runs anything; the plugin answers each with the
@@ -127,7 +127,7 @@ function signed(text: string, record: TurnRecord | undefined): string {
   if (!record || typeof record !== 'object') return text
   try { JSON.parse(text.trim()); return text } catch {}
   const time = (iso: unknown) => typeof iso === 'string' ? iso.slice(11, 19) + 'Z' : '?'
-  const helpers = record.helpers?.length ? ` · ${record.helpers.length} helper${record.helpers.length > 1 ? 's' : ''} (${[...new Set(record.helpers)].join(', ')})` : ''
+  const helpers = record.helpers?.length ? ` · ${record.helpers.length} helper${record.helpers.length > 1 ? 's' : ''} (${[...new Set(record.helpers)].join(', ')})` : record.helper_note ? ` · ${record.helper_note}` : ''
   const killedLimit = Math.max(0, 5 - (record.jobs?.length ?? 0))
   return `${text}\n\n[lord: ${record.ended_how} · ${record.model} ${record.effort} · ${time(record.started)} to ${time(record.ended)} · ${record.commands} command${record.commands === 1 ? '' : 's'}${helpers}${record.retries ? ` · ${record.retries} retr${record.retries > 1 ? 'ies' : 'y'} at capacity` : ''}${record.policy_continues ? ` · ${record.policy_continues} policy continue` : ''}${record.jobs?.length ? ` · jobs: ${jobLine(record.jobs, 5)}` : ''}${record.killed_jobs?.length ? ` · killed jobs: ${jobLine(record.killed_jobs, killedLimit)}` : ''}${record.memory_warning ? ` · ${record.memory_warning}` : ''}${record.session ? ` · session ${record.session}` : ''}]`
 }

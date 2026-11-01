@@ -1,6 +1,6 @@
 import { test, expect, mock } from 'claude-code/testing'
 
-for (const family of ['gpt', 'gemini']) for (const tool of ['Agent', 'SendMessage']) for (const daemon of ['2.2.5', '2.2.7', 'unknown', 'offline', '2.2.6'])
+for (const family of ['gpt', 'gemini']) for (const tool of ['Agent', 'SendMessage']) for (const daemon of ['2.2.5', '2.2.6', '2.2.8', 'unknown', 'offline', '2.2.7'])
 test(`${family} ${tool} restored after reload checks daemon ${daemon}`, async ($, on) => {
   const state = new Map<string, { value: any; version: number }>()
   state.set('agent/a', { value: { family, opened: true, daemon: '/test/old.sock', call: 'pending' }, version: 1 })
@@ -11,7 +11,7 @@ test(`${family} ${tool} restored after reload checks daemon ${daemon}`, async ($
     const version = (state.get(`${e.key}/${e.id}`)?.version ?? 0) + 1
     state.set(`${e.key}/${e.id}`, { value: e.value, version }); return { value: { isSet: true, version } } as any
   })
-  on('fs.read', (_, e) => e.path.endsWith('/.claude-plugin/plugin.json') ? { value: JSON.stringify({ version: '2.2.6' }) } : { deny: 'absent' })
+  on('fs.read', (_, e) => e.path.endsWith('/.claude-plugin/plugin.json') ? { value: JSON.stringify({ version: '2.2.7' }) } : { deny: 'absent' })
   on('agent.list', () => ({ value: [] }))
   on('session.cwd', () => ({ value: '/repo' }))
   on('session.messages', () => ({ value: [] }))
@@ -29,7 +29,7 @@ test(`${family} ${tool} restored after reload checks daemon ${daemon}`, async ($
   expect(accepted.socket).toBe('/test/old.sock')
   expect(accepted.body.agentId).toBe('a')
   expect(accepted.body.callId).toBe('pending')
-  if (daemon === '2.2.6') {
+  if (daemon === '2.2.7') {
     expect(calls).toHaveLength(1)
     expect(!!result.isError).toBe(false)
     expect(accepted.body).toMatchObject({ text: 'PONG', isError: false })
@@ -38,7 +38,7 @@ test(`${family} ${tool} restored after reload checks daemon ${daemon}`, async ($
     expect(result).toEqual({ deny: accepted.body.text })
     expect(accepted.body.isError).toBe(true)
     expect(accepted.body.text).toContain('daemon')
-    expect(accepted.body.text).toContain('2.2.6')
+    expect(accepted.body.text).toContain('2.2.7')
     if (!['unknown', 'offline'].includes(daemon)) expect(accepted.body.text).toContain(daemon)
     expect(requests.some(r => r.path === '/open' || r.path === '/steer' || r.path === '/queue')).toBe(false)
   }
@@ -56,7 +56,7 @@ test(`${family} continues its vendor turn after a documented ${tool} refusal`, a
     const version = (state.get(`${e.key}/${e.id}`)?.version ?? 0) + 1
     state.set(`${e.key}/${e.id}`, { value: e.value, version }); return { value: { isSet: true, version } } as any
   })
-  on('fs.read', (_, e) => e.path.endsWith('/.claude-plugin/plugin.json') ? { value: '{"version":"2.2.6"}' } : { deny: 'absent' })
+  on('fs.read', (_, e) => e.path.endsWith('/.claude-plugin/plugin.json') ? { value: '{"version":"2.2.7"}' } : { deny: 'absent' })
   on('agent.list', () => ({ value: [] }))
   on('session.messages', () => ({ value: [] }))
   on('session.cwd', () => ({ value: '/repo' }))

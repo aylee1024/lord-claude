@@ -69,7 +69,7 @@ function world(on: On, events: unknown[] = [{ type: 'done', text: 'fake answer',
     const result = path === '/restore' ? replies.restore ?? { found: false } : path === '/agents' ? replies.agents ?? (!fresh ? [{ agentId: 'a1', family: 'gpt', state: 'running', effort: 'ultra', model: 'fake-gpt', cwd: '/pinned' }]
         : requests.some(x => x.path === '/open') ? [{ agentId: 'a1', family: 'gpt', state: 'running' }] : [])
       : path === '/close' ? replies.closed ?? { ok: true, closed: true, stopped_jobs: 0 }
-      : path === '/health' ? { ok: true, version: '2.2.6' }
+      : path === '/health' ? { ok: true, version: '2.2.7' }
       : path === '/open' ? { vendorSession: 'v1', model: 'fake-gpt', effort: 'high' }
       // codex takes a message into its running turn; grok takes none, and the daemon queues it.
       : path === '/steer' ? { ok: true, steered: replies.steered ?? spawned !== 'lord:grok' }
@@ -275,7 +275,7 @@ test('first-line directives in a resumed SendMessage survive the coordinator env
 test('vendor tools run through native chunks and their results return before continue', async ($, on) => {
   const input = { subagent_type: 'lord:gemini', prompt: 'child', description: 'child', run_in_background: false }
   const w = world(on, [{ type: 'activity', text: 'working' }, { type: 'tool', callId: 'call1', name: 'Agent', input }])
-  on('fs.read', (_, e) => e.path.endsWith('/.claude-plugin/plugin.json') ? { value: JSON.stringify({ version: '2.2.6' }) } : { deny: 'absent' })
+  on('fs.read', (_, e) => e.path.endsWith('/.claude-plugin/plugin.json') ? { value: JSON.stringify({ version: '2.2.7' }) } : { deny: 'absent' })
   await spawn($)
   const { result, chunks } = await step($, 'parent')
   expect(result.stopReason).toBe('tool_use')
@@ -756,7 +756,7 @@ test('/lord model with a model the daemon refuses is not kept for later turns', 
 
 test('a turn in flight when this code is reloaded continues from the record the earlier copy kept', async ($, on) => {
   const w = world(on, [{ type: 'done', text: 'after the tool' }])
-  on('fs.read', (_, e) => e.path.endsWith('/.claude-plugin/plugin.json') ? { value: JSON.stringify({ version: '2.2.6' }) } : { deny: 'absent' })
+  on('fs.read', (_, e) => e.path.endsWith('/.claude-plugin/plugin.json') ? { value: JSON.stringify({ version: '2.2.7' }) } : { deny: 'absent' })
   const state = sessionState(on)
   // The earlier copy yielded a tool call for a1 and kept its record; this copy has never seen a1.
   state.put('agent', 'a1', { family: 'gpt', opened: true, cwd: '/work', running: true, continuing: true, call: 'call7' })
@@ -1174,6 +1174,19 @@ test('@nice reaches the daemon with the other limits', async ($, on) => {
 })
 
 const RECORD = { ended_how: 'done', model: 'gpt-6.1-sol', effort: 'high', started: '2026-10-24T01:02:03+00:00', ended: '2026-10-24T01:04:05+00:00', commands: 3, retries: 0, helpers: ['gpt-6-luna', 'gpt-6-luna'], session: 's1' }
+
+test('every ultra answer and error without delegation names it in the footer', async ($, on) => {
+  const record = { ...RECORD, effort: 'ultra', helpers: [], helper_note: 'ultra: no helpers ran' }
+  const w = world(on, [{ type: 'done', text: 'answer', record }])
+  await spawn($)
+  expect((await step($, 'work')).result.answer).toContain(' · ultra: no helpers ran · ')
+  w.events.splice(0, w.events.length, { type: 'error', message: 'failed', record: { ...record, ended_how: 'error (vendor)' } })
+  expect((await step($, 'again')).result.answer).toContain(' · ultra: no helpers ran · ')
+  w.events.splice(0, w.events.length, { type: 'done', text: 'delegated', record: { ...RECORD, effort: 'ultra' } })
+  const delegated = (await step($, 'again')).result.answer
+  expect(delegated).toContain('2 helpers (gpt-6-luna)')
+  expect(delegated).not.toContain('no helpers ran')
+})
 
 test('an answer ends with one footer line naming how the turn ended and what ran; a JSON answer gets none', async ($, on) => {
   world(on, [{ type: 'done', text: 'the answer', record: RECORD }])

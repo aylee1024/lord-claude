@@ -138,9 +138,19 @@ waits undelivered, for up to `keep_undelivered_s` (a day).
   the lord MCP server, and the
   `shell_environment_policy.set: {LORD_AGENT_ID, LORD_DAEMON_SOCKET}` with this agent's id and daemon socket, applied after the user's inherited-environment filters on start and resume (other user-set values remain), and the user's codex MCP servers, codex plugins and notifier disabled unless `tools`; without `tools` also
   `skills: {include_instructions: false, bundled: {enabled: false}}` (codex lists skills from its skills folder and plugin
-  caches, the remote ones included, which the plugin switch-off misses), and for `readonly` `features: {multi_agent: false, multi_agent_v2: false}` and `agents: {enabled: false}`
-  (no helper agents: codex picks its helper mode from `agents.enabled`, then `multi_agent_v2`, then the model catalog,
-  then `multi_agent`; a thread's `config` is merged key by key over the user's `config.toml`). A codex helper (`subAgentActivity` with `agentThreadId`, `agentPath`, `model`, `reasoningEffort`, or in
+  caches, the remote ones included, which the plugin switch-off misses). Ultra always enables codex helpers, including for
+  `readonly`: `features: {multi_agent: true, multi_agent_v2: true}` and `agents: {enabled: true}`; other read-only efforts
+  set all three false. The helpers inherit the parent's sandbox: Codex reapplies the live parent's permission snapshot
+  after child role settings, so read-only helpers cannot write. Writable agents keep their existing helper configuration.
+  Codex 0.164 `turn/start` has no helper switch. Before a read-only turn whose effective effort moves into or out of ultra,
+  Lord restarts the vendor and resumes the same thread with the matching helper configuration. Effort is clamped to the
+  model's supported levels before deciding. Codex picks its helper mode from `agents.enabled`, then `multi_agent_v2`, then
+  the model catalog, then `multi_agent`; a thread's `config` is merged key by key over the user's `config.toml`.
+  Each ultra turn's footer counts helpers or says `ultra: no helpers ran`. Its stored turn and terminal event carry
+  `helper_note: "ultra: no helpers ran"` when none started, plus that turn's model and effort in the stored turn.
+  JSON answers keep their existing footer exemption; their turn records still carry the note. Helper ownership is tracked
+  per turn, so an earlier turn's helper cannot hide a later ultra turn without delegation.
+  A codex helper (`subAgentActivity` with `agentThreadId`, `agentPath`, `model`, `reasoningEffort`, or in
   codex's older helper mode a `collabAgentToolCall` `spawnAgent` with `receiverThreadIds`, from the agent's thread or
   another helper's) is mapped to its agent: the helper's completed steps go to the agent's log as
   `[<agentPath>] <line>` (the helper's thread id in codex's older helper mode, which names no path) and to its read list, never to rows or events. `webSearch` lines name `action`'s query, queries,

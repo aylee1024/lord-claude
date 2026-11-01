@@ -558,6 +558,7 @@ def helper_seen(a, item):
     else: return
     for thread in threads:
         if not isinstance(thread, str) or not thread or thread == a.vendorSession: continue
+        if thread not in a.helpers: a.turn_helpers.add(thread)
         known = a.helpers.setdefault(thread, {'thread': thread, 'path': str(path or thread), 'model': None, 'effort': None,
                                               'started': datetime.now(timezone.utc).isoformat(timespec='seconds'), 'commands': 0})
         known['model'] = known['model'] or item.get('model')
@@ -908,7 +909,7 @@ class Agent:
         self.record_path, self.answers_path = self.log_path.with_suffix('.json'), self.log_path.with_suffix('.answers')
         self.reads_path, self.reads = self.log_path.with_suffix('.reads.txt'), None
         # codex helper threads this agent started: thread id -> {path, model, effort}.
-        self.helpers = {}
+        self.helpers, self.turn_helpers = {}, set()
 
     def files(self):
         return [self.log_path, self.log_path.with_suffix('.log.1'), self.answer_path, self.record_path, self.reads_path,
@@ -1009,8 +1010,10 @@ class Agent:
         answer = self.answers_path / f'{number}.md'
         text = value.get('text') if kind == 'done' else 'lord: error: ' + str(value.get('message'))
         started = getattr(self, 'turn_started', None) or ended
-        mine = [h for h in self.helpers.values() if h['started'] >= started]
+        mine = [h for h in self.helpers.values() if h['thread'] in self.turn_helpers]
+        helper_note = {'helper_note': 'ultra: no helpers ran'} if self.effort == 'ultra' and not mine else {}
         turn = {'turn': number, 'started': started, 'ended': ended, 'ended_how': how,
+                'model': self.model, 'effort': self.effort, **helper_note,
                 'commands': getattr(self, 'commands', 0), 'retries': getattr(self, 'retries', 0),
                 'policy_continues': self.policy_continues, 'jobs': self.jobs,
                 'killed_jobs': list(self.killed_jobs),
@@ -1034,7 +1037,7 @@ class Agent:
         return {'ended_how': how, 'model': self.model, 'effort': self.effort, 'started': turn['started'], 'ended': ended,
                 'commands': turn['commands'], 'retries': turn['retries'], 'policy_continues': self.policy_continues, 'jobs': self.jobs,
                 'killed_jobs': turn['killed_jobs'], **({'memory_warning': self.memory_warning} if self.memory_warning else {}),
-                'helpers': helpers, 'session': self.vendorSession}
+                'helpers': helpers, **helper_note, 'session': self.vendorSession}
 
     def undelivered(self):
         return bool(self.carry) or not self.events.empty()
@@ -1757,12 +1760,13 @@ class Daemon:
                 # Skills come from more places than the plugins listed in config.toml (a remote plugin cache, the
                 # skills folder); with these off, codex lists none and each request is about 3,700 tokens shorter.
                 if not a.record.get('tools'): lean['skills'] = {'include_instructions': False, 'bundled': {'enabled': False}}
-                # A read-only agent starts no codex helper agents. codex picks its helper mode from agents.enabled,
+                # Read-only ultra turns allow helpers under the parent's permission profile. Codex picks its mode from agents.enabled,
                 # then multi_agent_v2, then the model catalog (which turns helpers on for current models), and only
                 # then from the multi_agent feature, so all three are set.
                 if a.record.get('readonly'):
-                    lean['features'] = {'multi_agent': False, 'multi_agent_v2': False}
-                    lean['agents'] = {'enabled': False}
+                    enabled = a.effort == 'ultra'
+                    lean['features'] = {'multi_agent': enabled, 'multi_agent_v2': enabled}
+                    lean['agents'] = {'enabled': enabled}
                 params = {'cwd': a.cwd, 'model': a.model, 'approvalPolicy': 'never',
                           'config': {**lean, 'mcp_servers': {**lean['mcp_servers'], 'lord': server}, **({'web_search': 'disabled'} if a.record.get('nosearch') else {'web_search': 'live'} if live_search(home) else {}),
                                      'shell_environment_policy': {'set': {'LORD_AGENT_ID': a.agentId, 'LORD_DAEMON_SOCKET': str(SOCKET)}}}}
@@ -2054,6 +2058,9 @@ class Daemon:
         a.model = body.get('model') or a.model
         try:
             await self.effort(a, body.get('effort'))
+            # Helper switches belong to the thread config in Codex 0.164, so crossing ultra needs a fresh vendor.
+            if a.family == 'gpt' and a.record.get('readonly') and (previous[1] == 'ultra') != (a.effort == 'ultra'):
+                a.restart = True
             if a.restart:
                 a.restart = False
                 await self.backend(a).close()
@@ -2074,6 +2081,7 @@ class Daemon:
         a.dispatched, a.agy_step, a.rows = False, None, {}
         a.commands, a.retries, a.edited, a.last_command, a.turn_error, a.turn_body, a.retry_waiting = 0, 0, False, None, None, body, False
         a.policy_continues, a.memory_warned, a.stop_cause = 0, False, None
+        a.turn_helpers = set()
         a.memory_warning = None
         a.turn_started = datetime.now(timezone.utc).isoformat(timespec='seconds')
         a.settings = self.settings(a)

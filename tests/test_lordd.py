@@ -4315,7 +4315,7 @@ def test_default_memory_and_release_version():
     a = m.Agent({'agentId': 'a', 'family': 'gpt', 'cwd': '/tmp/x', 'model': 'gpt-6.1-sol'})
     assert d.settings(a)['memory_gb'] == 24
     assert json.loads((ROOT / 'config.json').read_text())['memory_ceiling_kb'] == 24 * 1048576
-    assert json.loads((ROOT / '.claude-plugin/plugin.json').read_text())['version'] == '2.2.6'
+    assert json.loads((ROOT / '.claude-plugin/plugin.json').read_text())['version'] == '2.2.7'
 
 
 @pytest.mark.parametrize('phase', ['launch', 'resume'])
@@ -4427,7 +4427,7 @@ def test_v225_tests_priority_and_pgrep(tmp_path):
 def test_public_directives_and_release_version():
     for name in ('README.md', 'CONTRACT.md', 'PRIVACY.md', 'agents/gpt.md'):
         assert '@nosearch' in (ROOT / name).read_text(), name
-    assert json.loads((ROOT / '.claude-plugin/plugin.json').read_text())['version'] == '2.2.6'
+    assert json.loads((ROOT / '.claude-plugin/plugin.json').read_text())['version'] == '2.2.7'
 
 
 @pytest.mark.parametrize('options', [{}, {'readonly': True}, {'net': True}, {'nosandbox': True}, {'tests': True}])
@@ -4496,8 +4496,8 @@ def test_v225_helper_processes_are_excluded_but_jobs_remain(tmp_path, monkeypatc
     assert asyncio.run(m.job_details({102, 103, 104})) == [{'pid': 103, 'command': 'sleep 300', 'age_s': 8}]
 
 
-def test_release_version_is_226():
-    assert json.loads((ROOT / '.claude-plugin/plugin.json').read_text())['version'] == '2.2.6'
+def test_release_version_is_227():
+    assert json.loads((ROOT / '.claude-plugin/plugin.json').read_text())['version'] == '2.2.7'
 
 
 def test_v225_shell_options_do_not_become_read_paths():

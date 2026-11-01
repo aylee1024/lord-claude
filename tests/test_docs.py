@@ -3,6 +3,20 @@ import pytest
 from test_lordd import ROOT, grok_home
 
 
+@pytest.mark.parametrize('name', ['README.md', 'CONTRACT.md'])
+def test_ultra_docs_describe_helpers_sandbox_and_absent_delegation(name):
+    text = (ROOT / name).read_text()
+    assert 'ultra: no helpers ran' in text
+    assert 'helpers inherit' in text and 'sandbox' in text
+    assert 'ultra' in text and 'other read-only efforts' in text
+
+
+def test_gpt_description_mentions_ultra_helpers_within_its_cap():
+    description = next(line for line in (ROOT / 'agents/gpt.md').read_text().splitlines() if line.startswith('description:'))
+    assert 'ultra enables codex helpers' in description
+    assert len(description.split(': ', 1)[1].strip('"')) <= 975
+
+
 def test_r3_docs_state_delegation_boundary_and_keep_description_cap():
     description = next(line for line in (ROOT / 'agents/gpt.md').read_text().splitlines() if line.startswith('description:'))
     assert len(description.split(': ', 1)[1].strip('"')) <= 975
