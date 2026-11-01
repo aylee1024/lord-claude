@@ -563,6 +563,7 @@ def helper_seen(a, item):
         if work: a.turn_helpers.add(thread)
         known = a.helpers.setdefault(thread, {'thread': thread, 'path': str(path or thread), 'model': None, 'effort': None,
                                               'started': datetime.now(timezone.utc).isoformat(timespec='seconds'), 'commands': 0})
+        if path and known['path'] == thread: known['path'] = str(path)
         known['model'] = known['model'] or item.get('model')
         known['effort'] = known['effort'] or item.get('reasoningEffort')
 
@@ -912,6 +913,22 @@ class Agent:
         self.reads_path, self.reads = self.log_path.with_suffix('.reads.txt'), None
         # codex helper threads this agent started: thread id -> {path, model, effort}.
         self.helpers, self.turn_helpers, self.codex_helpers = {}, set(), None
+        self.restore_helpers()
+
+    def restore_helpers(self, saved=None):
+        if saved is None:
+            try: saved = json.loads(self.record_path.read_text(encoding='utf-8'))
+            except (OSError, ValueError): return
+        if not isinstance(saved, dict): return
+        # Restore names before helper events arrive; older turns still need their helpers' models, too.
+        for helper in saved.get('helpers') if isinstance(saved.get('helpers'), list) else []:
+            if isinstance(helper, dict) and isinstance(helper.get('thread'), str) and isinstance(helper.get('started'), str):
+                fields = {k: helper.get(k) if isinstance(helper.get(k), str) else None for k in ('path', 'model', 'effort')}
+                commands = helper.get('commands')
+                known = self.helpers.setdefault(helper['thread'], {**fields, 'thread': helper['thread'], 'path': fields['path'] or helper['thread'],
+                                                           'started': helper['started'], 'commands': commands if type(commands) is int else 0})
+                if known['path'] == helper['thread'] and fields['path']: known['path'] = fields['path']
+                for field in ('model', 'effort'): known[field] = known.get(field) or fields[field]
 
     def files(self):
         return [self.log_path, self.log_path.with_suffix('.log.1'), self.answer_path, self.record_path, self.reads_path,
@@ -997,15 +1014,7 @@ class Agent:
         except (OSError, ValueError): saved = {}
         saved = saved if isinstance(saved, dict) else {}
         turns = saved.get('turns', [])
-        # Helpers the record named before a daemon restart stay, so earlier turns' helper ids keep their models. Each
-        # field is taken only in the type helper_seen writes, else its default, since later steps read every field.
-        for helper in saved.get('helpers') if isinstance(saved.get('helpers'), list) else []:
-            if isinstance(helper, dict) and isinstance(helper.get('thread'), str) and isinstance(helper.get('started'), str):
-                fields = {k: helper.get(k) if isinstance(helper.get(k), str) else None for k in ('path', 'model', 'effort')}
-                commands = helper.get('commands')
-                known = self.helpers.setdefault(helper['thread'], {**fields, 'thread': helper['thread'], 'path': fields['path'] or helper['thread'],
-                                                           'started': helper['started'], 'commands': commands if type(commands) is int else 0})
-                for field in ('model', 'effort'): known[field] = known.get(field) or fields[field]
+        self.restore_helpers(saved)
         # A record edited by hand or cut short is read for what it still holds, never a reason the turn cannot end.
         turns = [turn for turn in turns if isinstance(turn, dict)] if isinstance(turns, list) else []
         last = turns[-1].get('turn') if turns else 0
@@ -1482,7 +1491,8 @@ class Vendor:
 
     def helper_event(self, a, helper, method, p):
         # A codex helper's steps go to its parent's log and read list only: no row, so nothing reaches a model.
-        if a.state in ('running', 'waiting_tool'): a.turn_helpers.add(helper['thread'])
+        if a.state in ('running', 'waiting_tool') and (method.startswith(('item/', 'turn/')) or method == 'thread/tokenUsage/updated'):
+            a.turn_helpers.add(helper['thread'])
         item = p.get('item') or {}
         if method == 'item/started': helper_seen(a, item)
         if method != 'item/completed' or not (line := codex_activity(item)): return
@@ -1975,6 +1985,11 @@ class Daemon:
         dirs = list(dict.fromkeys(dir_paths.values()))
         if any(inside(canon(str(Path.home())), (canon(x),)) or (sys.platform == 'darwin' and inside('/System/Volumes/Data', (x, canon(x)))) for x in dirs):
             raise ValueError('refusing / or a folder holding your home folder as an @dir')
+        # The catalog survives a vendor close. Refuse a named model before changing options or killing jobs.
+        if resuming and a.family == 'gpt' and body.get('model') and not a.undelivered() and not self.known_models(a):
+            await self.attach(a, prepare_only=True)
+        if body.get('model') and not a.undelivered() and (models := self.known_models(a)) and body['model'] not in models:
+            raise ValueError(f'unknown {a.family} model {body["model"]}; {a.family} lists {", ".join(models)}')
         a.record.update(cwd_paths=cwd_paths, dir_paths=dir_paths)
         for key in ('readonly', 'net', 'nosandbox', 'tests', 'nosearch'):
             if body.get(key) and not a.record.get(key):
