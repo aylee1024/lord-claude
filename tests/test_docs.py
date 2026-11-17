@@ -14,7 +14,7 @@ def test_ultra_docs_describe_helpers_sandbox_and_absent_delegation(name):
 def test_gpt_description_mentions_ultra_helpers_within_its_cap():
     description = next(line for line in (ROOT / 'agents/gpt.md').read_text().splitlines() if line.startswith('description:'))
     assert 'enables codex helpers, read-only too' in description
-    assert 'gpt-6-astra' in description
+    assert 'gpt-6.2-astra' in description
     assert len(description.split(': ', 1)[1].strip('"')) <= 975
 
 

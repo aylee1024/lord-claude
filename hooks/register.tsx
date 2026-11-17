@@ -278,7 +278,7 @@ function capped(family: string, effort: string): string {
 }
 
 function shortName(model: string): string {
-  // gpt-6-astra -> Astra, gpt-6.1-sol -> Sol 6.1, gemini-4-argon -> Argon, grok-4.7 -> Grok 4.7.
+  // gpt-6-astra -> Astra, gpt-6.2-sol -> Sol 6.2, gemini-4-argon -> Argon, grok-4.7 -> Grok 4.7.
   const capital = (word: string) => word[0]!.toUpperCase() + word.slice(1)
   const named = /^[a-z]+-(\d+(?:\.\d+)*)-([a-z][a-z0-9]*)$/i.exec(model)
   if (named) return capital(named[2]!) + (named[1]!.includes('.') ? ` ${named[1]}` : '')

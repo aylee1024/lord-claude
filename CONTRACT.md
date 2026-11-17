@@ -328,7 +328,7 @@ The mod alone parses leading option lines and message envelopes. Notification bl
 ## Mod behaviour
 - A new Lord agent's `agent.spawn` description becomes `<model>, <effort> · <description>` and its `model` the vendor model:
   `@model`, else `~/.claude/lord/config.json`, else the bundled `config.json`. Short names: the model's word capitalized, with
-  its version when that has a minor number (gpt-6-astra Astra, gpt-6.1-sol Sol 6.1); an id with no word is the family plus
+  its version when that has a minor number (gpt-6.2-astra Astra 6.2, gpt-6-astra Astra); an id with no word is the family plus
   version (grok-4.7 Grok 4.7). Effort: `@effort`, else the Agent call's, else high, capped at xhigh for grok and high for
   gemini; the Agent call's `effort` is set to that level when Claude Code accepts it (ultra is not). The vendor model also
   makes Claude Code's progress-summary requests fail (404), so summaries never replace the label.
